@@ -4,6 +4,8 @@ Tiny Spotify TUI: playlists, Liked Songs, search, albums and artists, with audio
 [librespot](https://github.com/librespot-org/librespot), so no Spotify app is needed.
 Needs Spotify Premium. macOS and Linux.
 
+![spot playing an album in Ghostty](assets/screenshot.png)
+
 ## Install
 
 Prebuilt binaries for Apple Silicon macOS and x86_64 Linux:
@@ -84,7 +86,8 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | `f` | on an artist's releases: all → albums (incl. EPs) → singles (remembered) |
 | `esc`, `backspace` | back to the previous list |
 | `tab`, `h`/`l`, `←`/`→` | switch pane |
-| `j`/`k`, `↑`/`↓`, `g`/`G`, `ctrl+d`/`ctrl+u` | move |
+| `j`/`k`, `↑`/`↓`, `ctrl+d`/`ctrl+u` | move |
+| `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
 | `?` | key help (any key closes it) |
 | `q` | quit |
 
@@ -132,7 +135,7 @@ Media keys and the macOS Now Playing widget work too.
 
 Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), commit, then tag and push:
 
-    git tag v1.0.1 && git push origin master v1.0.1
+    git tag v1.1.0 && git push origin master v1.1.0
 
 GitHub Actions builds Apple Silicon macOS and x86_64 Linux binaries and publishes the release
 with generated notes; `install.sh` always fetches the latest one. Pushes to master also build

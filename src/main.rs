@@ -43,6 +43,9 @@ const SCOPES: &[&str] = &[
 const SESSION_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 const SESSION_REDIRECT: &str = "http://127.0.0.1:8898/login";
 const API: &str = "https://api.spotify.com/v1";
+/// n/p only loads the track once skipping has paused this long, so mashing next doesn't fetch
+/// (and ask Spotify for an audio key for) every track passed over; too many gets keys refused.
+const SKIP_SETTLE: Duration = Duration::from_millis(500);
 
 // ---------- data ----------
 
@@ -1364,6 +1367,7 @@ struct App {
     queue: Option<Queue>,
     cur: Option<SpotifyUri>,
     loaded: bool, // `cur` is loaded into the player (it waits for the session)
+    load_at: Option<Instant>, // manual skip in progress: hold off loading `cur` until then
     playing: bool,
     pos_ms: u64,
     pos_at: Option<Instant>,
@@ -1597,9 +1601,10 @@ impl App {
 
     /// Load `cur` into the player at the current position, playing if that's wanted.
     fn load_cur(&mut self) {
-        if self.loaded || self.session().is_none() {
+        if self.loaded || self.session().is_none() || self.load_at.is_some_and(|t| Instant::now() < t) {
             return;
         }
+        self.load_at = None;
         let Some(uri) = self.cur.clone() else { return };
         log::debug!("load {uri:?} play {} at {}ms", self.want_play, self.pos_ms);
         self.player.load(uri, self.want_play, self.pos_ms as u32);
@@ -1754,7 +1759,7 @@ impl App {
             E::Toggle => self.toggle(),
             E::Play if !self.want_play => self.toggle(),
             E::Pause if self.want_play => self.toggle(),
-            E::Next => self.skip(1),
+            E::Next => self.skip_soon(1),
             E::Previous => self.prev(),
             E::Seek(d) => self.seek_by(d, step),
             E::SeekBy(d, by) => self.seek_by(d, by),
@@ -1776,8 +1781,16 @@ impl App {
         if self.position() > 3000 {
             self.seek_to(0);
         } else {
-            self.skip(-1);
+            self.skip_soon(-1);
         }
+    }
+
+    /// Manual next/prev: show the new track right away (and silence the old one), but only load
+    /// it once skipping settles; see SKIP_SETTLE.
+    fn skip_soon(&mut self, d: isize) {
+        self.player.stop();
+        self.load_at = Some(Instant::now() + SKIP_SETTLE);
+        self.skip(d);
     }
 
     /// Queue the whole open list. `start` = chosen track; None = from the top (or a random track if shuffling).
@@ -1795,6 +1808,7 @@ impl App {
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
         self.retried = false;
+        self.load_at = None;
         self.play_current();
     }
 
@@ -2083,7 +2097,7 @@ impl App {
             KeyCode::Char('v') => self.toggle_artist_mode(),
             KeyCode::Char('f') => self.cycle_releases(),
             KeyCode::Esc | KeyCode::Backspace => self.back(),
-            KeyCode::Char('n') => self.skip(1),
+            KeyCode::Char('n') => self.skip_soon(1),
             KeyCode::Char('p') => self.prev(),
             KeyCode::Char('.') => self.seek_by(SeekDirection::Forward, Duration::from_secs(10)),
             KeyCode::Char(',') => self.seek_by(SeekDirection::Backward, Duration::from_secs(10)),
@@ -2120,6 +2134,7 @@ impl App {
             KeyCode::PageUp | KeyCode::Char('u') if k.code == KeyCode::PageUp || ctrl => self.move_sel(-15),
             KeyCode::Char('g') | KeyCode::Home => self.move_sel(isize::MIN / 2),
             KeyCode::Char('G') | KeyCode::End => self.move_sel(isize::MAX / 2),
+            KeyCode::Char('M') => self.move_to_middle(),
             _ => {}
         }
     }
@@ -2132,11 +2147,21 @@ impl App {
         if len == 0 {
             return;
         }
-        let n = (cur.unwrap_or(0) as isize).saturating_add(d).clamp(0, len as isize - 1) as usize;
+        let to = (cur.unwrap_or(0) as isize).saturating_add(d);
+        // single steps wrap around the ends; bigger jumps (page, top/bottom) stop at them
+        let n = if d.abs() == 1 { to.rem_euclid(len as isize) } else { to.clamp(0, len as isize - 1) } as usize;
         match self.focus {
             Focus::Playlists => self.pl_state.select(Some(n)),
             Focus::Tracks => self.tr_state.select(Some(n)),
         }
+    }
+
+    fn move_to_middle(&mut self) {
+        let (len, cur) = match self.focus {
+            Focus::Playlists => (self.playlists.len(), self.pl_state.selected()),
+            Focus::Tracks => (self.shown().len(), self.tr_state.selected()),
+        };
+        self.move_sel((len / 2) as isize - cur.unwrap_or(0) as isize);
     }
 }
 
@@ -2437,7 +2462,7 @@ fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("esc", "back"),
         ("tab", "switch pane"),
         ("ctrl+t", "theme"),
-        ("g  G", "top / bottom"),
+        ("g  M  G", "top / middle / bottom"),
         ("q", "quit"),
     ];
     const COL: usize = 36;
@@ -2580,7 +2605,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             off += 1;
         }
     }
-    let num_w = app.view.len().max(1).to_string().len() as u16;
+    let num_w = num(app.view.len().max(1)).len() as u16;
     let wide = table_area.width >= 90; // room for an album column
     let (cols, labels): (Vec<Constraint>, &[&str]) = match (tracks, wide) {
         (true, true) => (
@@ -2960,7 +2985,7 @@ unsafe extern "C" {
 /// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log, since the TUI
 /// owns the terminal. The previous run's log is kept as log.1.
 fn init_log() {
-    let spec = "info,spot=debug,librespot=debug";
+    let spec = "info,spot=debug,librespot=debug,symphonia_bundle_mp3=error";
     let path = cache_dir().join("log");
     let _ = fs::create_dir_all(cache_dir());
     let _ = fs::rename(&path, path.with_extension("1"));
@@ -3189,6 +3214,7 @@ fn run() -> Result<(), String> {
         queue: None,
         cur: None,
         loaded: false,
+        load_at: None,
         playing: false,
         pos_ms: 0,
         pos_at: None,
@@ -3221,7 +3247,7 @@ fn run() -> Result<(), String> {
         // Only wake up once a second while playing (progress clock); otherwise sleep until input.
         let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
         // wake up in time to take the popup / volume meter down
-        for until in [app.note.as_ref().map(|n| n.1), app.vol_until].into_iter().flatten() {
+        for until in [app.note.as_ref().map(|n| n.1), app.vol_until, app.load_at].into_iter().flatten() {
             timeout = timeout.min(until.saturating_duration_since(Instant::now()));
         }
         let first = match rx.recv_timeout(timeout) {
@@ -3234,6 +3260,10 @@ fn run() -> Result<(), String> {
         }
         if app.vol_until.is_some_and(|until| Instant::now() >= until) {
             app.vol_until = None;
+        }
+        if app.load_at.is_some_and(|until| Instant::now() >= until) {
+            app.load_at = None;
+            app.load_cur();
         }
         for m in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match m {
