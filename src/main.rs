@@ -51,9 +51,12 @@ struct Track {
     uri: String,
     name: String,
     artists: String,
+    lead: usize, // byte length of the first artist's name in `artists` (names can contain ", ")
     album: String,
     cover: Option<String>,
     ms: u64,
+    album_id: u128, // SpotifyIds for goto album / artist (first artist); 0 = unknown
+    artist_id: u128,
 }
 
 /// An album or artist search result.
@@ -62,6 +65,39 @@ struct Link {
     uri: String,
     name: String,
     sub: String,
+    single: bool, // a single release (EPs and compilations count as albums)
+}
+
+/// Which of an artist's releases their page lists, cycled with `f`.
+#[derive(Clone, Copy, PartialEq)]
+enum Releases {
+    All,
+    Albums,
+    Singles,
+}
+
+impl Releases {
+    fn next(self) -> Self {
+        match self {
+            Releases::All => Releases::Albums,
+            Releases::Albums => Releases::Singles,
+            Releases::Singles => Releases::All,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Releases::All => "albums & singles",
+            Releases::Albums => "albums",
+            Releases::Singles => "singles",
+        }
+    }
+    fn keeps(self, l: &Link) -> bool {
+        match self {
+            Releases::All => true,
+            Releases::Albums => !l.single,
+            Releases::Singles => l.single,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -111,12 +147,25 @@ enum Msg {
     Key(KeyEvent),
     Redraw,
     Scheme(bool), // terminal switched color scheme; true = light
+    Background(u32), // terminal's background color (OSC 11 reply)
     Player(PlayerEvent),
     Playlists(Vec<Playlist>),
     Tracks { view: u64, tracks: Vec<Track>, done: bool },
+    Replace { view: u64, tracks: Arc<Vec<Track>> }, // fresh copy of a list that was shown from cache
     Links { view: u64, links: Vec<Link>, done: bool },
     Error(String),
     Media(MediaControlEvent),
+    Relogin(bool), // true: waiting on browser login; false: it finished
+    Connected(Result<Session, String>),
+    Status(String),
+}
+
+/// The audio session, None until it has connected (in the background, so startup doesn't wait).
+type Sess = tokio::sync::watch::Receiver<Option<Session>>;
+
+async fn ready(mut s: Sess) -> Result<Session, String> {
+    let s = s.wait_for(Option::is_some).await.map_err(|_| "not connected")?;
+    Ok(s.clone().expect("checked by wait_for"))
 }
 
 // ---------- Web API ----------
@@ -125,24 +174,38 @@ struct Tok {
     access: String,
     refresh: String,
     exp: Instant,
+    failed_login: Option<Instant>,
 }
 
 struct Api {
     http: reqwest::Client,
-    oauth: OAuthClient,
+    oauth: Arc<OAuthClient>,
+    redirect: String,
     tok: tokio::sync::Mutex<Tok>,
     path: PathBuf,
+    tx: mpsc::Sender<Msg>,
 }
 
 impl Api {
     async fn token(&self, force: bool) -> Result<String, String> {
         let mut t = self.tok.lock().await;
         if force || Instant::now() + Duration::from_secs(60) >= t.exp {
-            let n = self
-                .oauth
-                .refresh_token_async(&t.refresh)
-                .await
-                .map_err(|e| format!("token refresh: {e}"))?;
+            let n = match self.oauth.refresh_token_async(&t.refresh).await {
+                Ok(n) => n,
+                // Spotify no longer accepts the refresh token (revoked, or rotated by another
+                // instance): log in through the browser again. Holding the lock keeps it to one.
+                Err(e) if e.to_string().contains("invalid_") => {
+                    if t.failed_login.is_some_and(|at| at.elapsed() < Duration::from_secs(60)) {
+                        return Err("Spotify login expired; restart spot to log in".into());
+                    }
+                    let _ = self.tx.send(Msg::Relogin(true));
+                    let r = self.relogin().await;
+                    let _ = self.tx.send(Msg::Relogin(false));
+                    t.failed_login = r.is_err().then(Instant::now);
+                    r?
+                }
+                Err(e) => return Err(format!("token refresh: {e}")),
+            };
             if !n.refresh_token.is_empty() && n.refresh_token != t.refresh {
                 t.refresh = n.refresh_token;
                 save_refresh(&self.path, &t.refresh);
@@ -151,6 +214,10 @@ impl Api {
             t.exp = n.expires_at;
         }
         Ok(t.access.clone())
+    }
+
+    async fn relogin(&self) -> Result<librespot_oauth::OAuthToken, String> {
+        browser_login(self.oauth.clone(), &self.redirect).await
     }
 
     async fn get(&self, url: &str) -> Result<Value, String> {
@@ -193,27 +260,58 @@ impl Api {
     }
 }
 
+/// Browser login, off the runtime: librespot's callback listener blocks its thread.
+async fn browser_login(oauth: Arc<OAuthClient>, redirect: &str) -> Result<librespot_oauth::OAuthToken, String> {
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let r = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .and_then(|rt| rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}")));
+        let _ = otx.send(r);
+    });
+    match tokio::time::timeout(Duration::from_secs(300), orx).await {
+        Ok(r) => r.map_err(|_| "login: aborted".to_string())?,
+        Err(_) => {
+            // nobody came back from the browser; poke the listener so it frees the port
+            if let Some(addrs) = reqwest::Url::parse(redirect).ok().and_then(|u| u.socket_addrs(|| None).ok()) {
+                for a in addrs {
+                    let _ = std::net::TcpStream::connect_timeout(&a, Duration::from_secs(1));
+                }
+            }
+            Err("login timed out".into())
+        }
+    }
+}
+
 fn parse_track(v: &Value) -> Option<Track> {
     let uri = v["uri"].as_str()?;
     if !uri.starts_with("spotify:track:") {
         return None;
     }
-    let artists = v["artists"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", "))
-        .unwrap_or_default();
+    let artists: Vec<&str> =
+        v["artists"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect()).unwrap_or_default();
+    let id = |v: &Value| v["id"].as_str().and_then(|s| librespot_core::SpotifyId::from_base62(s).ok()).map_or(0, |i| i.id);
     Some(Track {
         uri: uri.into(),
         name: v["name"].as_str().unwrap_or("?").into(),
-        artists,
+        artists: artists.join(", "),
+        lead: artists.first().map_or(0, |a| a.len()),
         album: v["album"]["name"].as_str().unwrap_or("").into(),
         cover: v["album"]["images"].as_array().and_then(|i| i.first()?["url"].as_str()).map(String::from),
         ms: v["duration_ms"].as_u64().unwrap_or(0),
+        album_id: id(&v["album"]),
+        artist_id: id(&v["artists"][0]),
     })
 }
 
+fn liked() -> Playlist {
+    Playlist { id: None, name: "♥  Liked Songs".into() } // the heart overhangs its cell in many fonts
+}
+
 async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
-    let mut out = vec![Playlist { id: None, name: "♥ Liked Songs".into() }];
+    let mut out = vec![liked()];
     let mut url = Some(format!("{API}/me/playlists?limit=50"));
     while let Some(u) = url {
         match api.get(&u).await {
@@ -228,34 +326,81 @@ async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
                 url = v["next"].as_str().map(String::from);
             }
             Err(e) => {
+                // keep showing the cached list
                 let _ = tx.send(Msg::Error(format!("playlists: {e}")));
-                break;
+                return;
             }
         }
     }
+    save_playlists(&out);
     let _ = tx.send(Msg::Playlists(out));
 }
 
-async fn load_tracks(api: Arc<Api>, session: Session, tx: mpsc::Sender<Msg>, view: u64, pl: Playlist) {
+/// Refresh a playlist / Liked Songs. With nothing cached the tracks stream in as they load;
+/// otherwise the cached copy is already showing and gets replaced only if it changed.
+async fn load_tracks(api: Arc<Api>, sess: Sess, tx: mpsc::Sender<Msg>, view: u64, pl: Playlist, cached: Arc<Vec<Track>>) {
     let res = match &pl.id {
-        Some(id) => playlist_tracks(&session, id, &tx, view).await,
-        None => liked_tracks(&api, &tx, view).await,
+        Some(id) => playlist_tracks(sess, id, &cached, &tx, view).await,
+        None => liked_tracks(api, &cached, &tx, view).await,
     };
-    if let Err(e) = res {
-        let _ = tx.send(Msg::Error(e));
+    match res {
+        Ok(Some(tracks)) => {
+            save_tracks(&tracks_path(&pl.key()), &tracks);
+            if !cached.is_empty() {
+                let _ = tx.send(Msg::Replace { view, tracks: Arc::new(tracks) });
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            let _ = tx.send(Msg::Error(e));
+        }
     }
     let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
 }
 
-async fn liked_tracks(api: &Api, tx: &mpsc::Sender<Msg>, view: u64) -> Result<(), String> {
-    let mut url = Some(format!("{API}/me/tracks?limit=50"));
-    while let Some(u) = url {
-        let v = api.get(&u).await?;
-        let tracks = v["items"].as_array().into_iter().flatten().filter_map(|it| parse_track(&it["track"])).collect();
-        url = v["next"].as_str().map(String::from);
-        let _ = tx.send(Msg::Tracks { view, tracks, done: false });
+async fn liked_page(api: Arc<Api>, offset: usize) -> Result<(Vec<Track>, usize), String> {
+    let v = api.get(&format!("{API}/me/tracks?limit=50&offset={offset}")).await?;
+    let page = v["items"].as_array().into_iter().flatten().filter_map(|it| parse_track(&it["track"])).collect();
+    Ok((page, v["total"].as_u64().unwrap_or(0) as usize))
+}
+
+/// The full Liked Songs list, or None if `cached` is still current.
+async fn liked_tracks(api: Arc<Api>, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
+    let (mut got, total) = liked_page(api.clone(), 0).await?;
+    if cached.is_empty() {
+        let _ = tx.send(Msg::Tracks { view, tracks: got.clone(), done: false });
+    } else if let Some(j) = (cached.len() + got.len()).checked_sub(total)
+        && j > 0
+        && j <= cached.len()
+        && got.last().is_some_and(|t| t.uri == cached[j - 1].uri)
+    {
+        // Likes come newest first: new ones push the cache down, unlikes pull what's after them
+        // up. If the first page's last song sits where the cache has it, shifted by exactly the
+        // change in count, everything after it is unchanged.
+        if j == got.len() && got.iter().zip(cached).all(|(a, b)| a.uri == b.uri) {
+            return Ok(None);
+        }
+        got.extend_from_slice(&cached[j..]);
+        return Ok(Some(got));
     }
-    Ok(())
+    // Each page takes about a second, so fetch the rest a few at a time, keeping their order.
+    const PARALLEL: usize = 16;
+    let mut offsets = (got.len().max(50)..total).step_by(50);
+    let mut pending = std::collections::VecDeque::new();
+    loop {
+        while pending.len() < PARALLEL
+            && let Some(o) = offsets.next()
+        {
+            pending.push_back(tokio::spawn(liked_page(api.clone(), o)));
+        }
+        let Some(next) = pending.pop_front() else { break };
+        let (page, _) = next.await.map_err(|e| e.to_string())??;
+        if cached.is_empty() {
+            let _ = tx.send(Msg::Tracks { view, tracks: page.clone(), done: false });
+        }
+        got.extend(page);
+    }
+    Ok(Some(got))
 }
 
 // Playlists, albums and artists are read from Spotify's internal playlist + extended-metadata
@@ -306,46 +451,76 @@ fn gid_uri(kind: &str, gid: &[u8]) -> Option<String> {
     Some(format!("spotify:{kind}:{b62}"))
 }
 
+/// spotify:<kind>:<base62> for a stored SpotifyId (0 = unknown).
+fn id_uri(kind: &str, id: u128) -> Option<String> {
+    if id == 0 {
+        return None;
+    }
+    Some(format!("spotify:{kind}:{}", librespot_core::SpotifyId { id }.to_base62().ok()?))
+}
+
 fn pb_track(uri: &str, t: &PbTrack) -> Track {
+    let id = |gid: &[u8]| librespot_core::SpotifyId::from_raw(gid).map_or(0, |i| i.id);
     Track {
         uri: uri.into(),
         name: t.name().to_string(),
         artists: t.artist.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "),
+        lead: t.artist.first().map_or(0, |a| a.name().len()),
         album: t.album.name().to_string(),
         cover: t.album.cover_group.image.iter().max_by_key(|i| i.width()).map(|i| {
             let hex: String = i.file_id().iter().map(|b| format!("{b:02x}")).collect();
             format!("https://i.scdn.co/image/{hex}")
         }),
         ms: t.duration() as u64,
+        album_id: id(t.album.gid()),
+        artist_id: t.artist.first().map_or(0, |a| id(a.gid())),
     }
 }
 
-/// Resolve track uris to names in batches, streaming them to the view in order.
+/// Resolve track uris to names in batches, streaming them to the view in order; returns them all.
 /// `dedupe` drops repeats of the same song (single + album versions in a discography).
-async fn send_tracks(session: &Session, uris: &[String], dedupe: bool, tx: &mpsc::Sender<Msg>, view: u64) -> Result<(), String> {
+async fn send_tracks(session: &Session, uris: &[String], dedupe: bool, tx: &mpsc::Sender<Msg>, view: u64) -> Result<Vec<Track>, String> {
     let mut seen = std::collections::HashSet::new();
+    let mut all = vec![];
     for chunk in uris.chunks(200) {
         let mut found = batch_meta::<PbTrack>(session, chunk, ExtensionKind::TRACK_V4).await?;
-        let tracks = chunk
+        let tracks: Vec<Track> = chunk
             .iter()
             .filter_map(|u| found.remove(u).map(|t| pb_track(u, &t)))
             .filter(|t| !dedupe || seen.insert((t.name.to_lowercase(), t.artists.to_lowercase())))
             .collect();
+        all.extend_from_slice(&tracks);
         let _ = tx.send(Msg::Tracks { view, tracks, done: false });
     }
-    Ok(())
+    Ok(all)
 }
 
-async fn playlist_tracks(session: &Session, id: &str, tx: &mpsc::Sender<Msg>, view: u64) -> Result<(), String> {
+/// The playlist's tracks, or None if `cached` is still current. Only songs the cache
+/// doesn't have get looked up.
+async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
     use librespot_metadata::Metadata;
+    let session = ready(sess).await?;
     let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
-    let pl = librespot_metadata::Playlist::get(session, &uri).await.map_err(|e| format!("playlist: {e}"))?;
+    let pl = librespot_metadata::Playlist::get(&session, &uri).await.map_err(|e| format!("playlist: {e}"))?;
     let uris: Vec<String> = pl
         .tracks()
         .filter(|u| matches!(u, SpotifyUri::Track { .. }))
         .filter_map(|u| u.to_uri().ok())
         .collect();
-    send_tracks(session, &uris, false, tx, view).await
+    if cached.is_empty() {
+        return send_tracks(&session, &uris, false, tx, view).await.map(Some);
+    }
+    if uris.len() == cached.len() && uris.iter().zip(cached).all(|(u, t)| *u == t.uri) {
+        return Ok(None);
+    }
+    let known: HashMap<&str, &Track> = cached.iter().map(|t| (t.uri.as_str(), t)).collect();
+    let missing: Vec<String> = uris.iter().filter(|u| !known.contains_key(u.as_str())).cloned().collect();
+    let found = batch_meta::<PbTrack>(&session, &missing, ExtensionKind::TRACK_V4).await?;
+    Ok(Some(
+        uris.iter()
+            .filter_map(|u| known.get(u.as_str()).map(|t| (*t).clone()).or_else(|| found.get(u).map(|t| pb_track(u, t))))
+            .collect(),
+    ))
 }
 
 async fn album_track_uris(session: &Session, albums: &[String]) -> Result<Vec<String>, String> {
@@ -358,34 +533,76 @@ async fn album_track_uris(session: &Session, albums: &[String]) -> Result<Vec<St
         .collect())
 }
 
+/// An artist's albums, then singles/EPs, each newest first.
+async fn artist_albums(session: &Session, uri: &str) -> Result<Vec<String>, String> {
+    let a = batch_meta::<PbArtist>(session, &[uri.to_string()], ExtensionKind::ARTIST_V4)
+        .await?
+        .remove(uri)
+        .ok_or("artist not found")?;
+    // each group lists regional/edition variants of one release; the first is the canonical one
+    Ok(a.album_group
+        .iter()
+        .chain(&a.single_group)
+        .filter_map(|g| g.album.first())
+        .filter_map(|al| gid_uri("album", al.gid()))
+        .collect())
+}
+
 /// Album or artist (albums + singles/EPs, newest first) as a flat track list.
-async fn link_tracks(session: Session, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
+async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
     let res = async {
+        let session = ready(sess).await?;
         let (albums, dedupe) = if uri.starts_with("spotify:artist:") {
-            let a = batch_meta::<PbArtist>(&session, std::slice::from_ref(&uri), ExtensionKind::ARTIST_V4)
-                .await?
-                .remove(&uri)
-                .ok_or("artist not found")?;
-            // each group lists regional/edition variants of one release; the first is the canonical one
-            let albums: Vec<String> = a
-                .album_group
-                .iter()
-                .chain(&a.single_group)
-                .filter_map(|g| g.album.first())
-                .filter_map(|al| gid_uri("album", al.gid()))
-                .collect();
-            (albums, true)
+            (artist_albums(&session, &uri).await?, true)
         } else {
             (vec![uri.clone()], false)
         };
         let tracks = album_track_uris(&session, &albums).await?;
-        send_tracks(&session, &tracks, dedupe, &tx, view).await
+        send_tracks(&session, &tracks, dedupe, &tx, view).await.map(drop)
     }
     .await;
     if let Err(e) = res {
         let _ = tx.send(Msg::Error(e));
     }
     let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
+}
+
+/// An artist's releases as openable album links.
+async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
+    use librespot_protocol::metadata::album::Type;
+    let res = async {
+        let session = ready(sess).await?;
+        let albums = artist_albums(&session, &uri).await?;
+        let found = batch_meta::<PbAlbum>(&session, &albums, ExtensionKind::ALBUM_V4).await?;
+        let mut links: Vec<_> = albums
+            .iter()
+            .filter_map(|u| {
+                let a = found.get(u)?;
+                let kind = match a.type_() {
+                    Type::SINGLE => "single",
+                    Type::EP => "EP",
+                    Type::COMPILATION => "compilation",
+                    _ => "album",
+                };
+                let n: usize = a.disc.iter().map(|d| d.track.len()).sum();
+                let year = if a.date.year() > 0 { format!("{} ", a.date.year()) } else { String::new() };
+                let sub = format!("{year}{kind} · {n} song{}", if n == 1 { "" } else { "s" });
+                let d = &a.date;
+                let single = a.type_() == Type::SINGLE;
+                Some(((d.year(), d.month(), d.day()), Link { uri: u.clone(), name: a.name().into(), sub, single }))
+            })
+            .collect();
+        // Newest release first, mixing albums, EPs and singles.
+        links.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
+        let links = links.into_iter().map(|(_, l)| l).collect();
+        let _ = tx.send(Msg::Links { view, links, done: true });
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(e) = res {
+        let _ = tx.send(Msg::Error(e));
+        let _ = tx.send(Msg::Links { view, links: vec![], done: true });
+    }
 }
 
 fn parse_link(kind: Kind, v: &Value) -> Option<Link> {
@@ -398,7 +615,8 @@ fn parse_link(kind: Kind, v: &Value) -> Option<Link> {
         }
         _ => v["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
     };
-    Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub })
+    let single = v["album_type"] == "single";
+    Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single })
 }
 
 // Dev-mode apps get max 10 results per search call, so page through a few.
@@ -498,10 +716,445 @@ fn save_refresh(path: &PathBuf, tok: &str) {
 }
 
 async fn connect(cache: &Cache, creds: Option<Credentials>) -> Result<Session, String> {
-    let creds = creds.or_else(|| cache.credentials()).ok_or("no saved login")?;
     let s = Session::new(SessionConfig::default(), Some(cache.clone()));
-    s.connect(creds, true).await.map_err(|e| format!("login failed: {e}"))?;
+    login(&s, cache, creds).await?;
     Ok(s)
+}
+
+async fn login(s: &Session, cache: &Cache, creds: Option<Credentials>) -> Result<(), String> {
+    let creds = creds.or_else(|| cache.credentials()).ok_or("no saved login")?;
+    s.connect(creds, true).await.map_err(|e| format!("login failed: {e}"))
+}
+
+/// Streaming + internal APIs need a session from Spotify's own client id. Only needed once:
+/// librespot stores reusable credentials afterwards. Never used for the Web API.
+async fn approve_session(cache: &Cache) -> Result<Session, String> {
+    let oauth = OAuthClientBuilder::new(SESSION_CLIENT_ID, SESSION_REDIRECT, vec!["streaming"])
+        .open_in_browser()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let t = browser_login(Arc::new(oauth), SESSION_REDIRECT).await?;
+    connect(cache, Some(Credentials::with_access_token(t.access_token))).await
+}
+
+/// Log the player's (not yet connected) session in with the saved credentials, in the background.
+async fn start_session(s: Session, cache: Cache, tx: mpsc::Sender<Msg>) {
+    let r = match login(&s, &cache, None).await {
+        Ok(()) => Ok(s),
+        Err(_) => {
+            let _ = tx.send(Msg::Status("approve the audio session in your browser…".into()));
+            approve_session(&cache).await
+        }
+    };
+    let _ = tx.send(Msg::Connected(r));
+}
+
+// ---------- Last.fm ----------
+// Optional scrobbling: on when ~/.config/spot/lastfm holds an API key and shared secret (one per
+// line), or LASTFM_API_KEY / LASTFM_SECRET are set. The session key from the one-time browser
+// login is kept in ~/.cache/spot/lastfm_session. Plays are queued in ~/.cache/spot/scrobbles
+// first, so ones that couldn't be sent (offline, quit mid-request) go out later.
+
+const LASTFM_API: &str = "https://ws.audioscrobbler.com/2.0/";
+
+struct LastFm {
+    http: reqwest::Client,
+    key: String,
+    secret: String,
+    sk: String,
+    queue: PathBuf,
+    file: std::sync::Mutex<()>,          // queue file read-modify-writes
+    draining: tokio::sync::Mutex<()>,    // one drain at a time, so nothing is sent twice
+    tx: mpsc::Sender<Msg>,
+}
+
+/// A play in progress. Only time spent actually playing counts, so seeking can't fake a listen.
+struct Listen {
+    track: Track,
+    started: u64, // unix seconds, set when it first starts playing
+    listened: Duration,
+    since: Option<Instant>, // playing since
+    announced: bool,        // sent as "now playing"
+}
+
+impl Listen {
+    /// Last.fm's rule: tracks over 30s count once half of them (or 4 minutes) has been heard.
+    fn counts(&self) -> bool {
+        let heard = self.listened + self.since.map_or(Duration::ZERO, |s| s.elapsed());
+        self.track.ms > 30_000 && heard >= Duration::from_millis(self.track.ms / 2).min(Duration::from_secs(240))
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Signed POST to the Last.fm API. Errors carry Last.fm's error code (0 = network / bad reply).
+async fn lastfm_call(
+    http: &reqwest::Client,
+    key: &str,
+    secret: &str,
+    method: &str,
+    mut params: Vec<(String, String)>,
+) -> Result<Value, (i64, String)> {
+    use md5::Digest;
+    params.push(("api_key".into(), key.into()));
+    params.push(("method".into(), method.into()));
+    params.sort();
+    let base: String = params.iter().flat_map(|(k, v)| [k.as_str(), v.as_str()]).chain([secret]).collect();
+    let sig = md5::Md5::digest(base.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    params.push(("api_sig".into(), sig));
+    params.push(("format".into(), "json".into()));
+    let r = http.post(LASTFM_API).form(&params).send().await.map_err(|e| (0, e.to_string()))?;
+    let body = r.text().await.map_err(|e| (0, e.to_string()))?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| (0, format!("bad reply: {body:.200}")))?;
+    match v["error"].as_i64() {
+        Some(code) => Err((code, v["message"].as_str().unwrap_or("?").into())),
+        None => Ok(v),
+    }
+}
+
+fn lastfm_creds() -> Option<(String, String)> {
+    if std::env::var("SPOT_LASTFM").is_ok_and(|v| v == "off") {
+        return None;
+    }
+    if let (Ok(k), Ok(s)) = (std::env::var("LASTFM_API_KEY"), std::env::var("LASTFM_SECRET")) {
+        return Some((k, s));
+    }
+    let f = fs::read_to_string(config_dir().join("lastfm")).ok()?;
+    let mut lines = f.lines().map(str::trim).filter(|l| !l.is_empty());
+    Some((lines.next()?.into(), lines.next()?.into()))
+}
+
+/// Scrobbling, if set up. Logs in through the browser the first time; a failed or skipped login
+/// just means no scrobbling this run.
+fn lastfm_setup(rt: &tokio::runtime::Runtime, http: &reqwest::Client, redirect: &str, tx: mpsc::Sender<Msg>) -> Option<Arc<LastFm>> {
+    let (key, secret) = lastfm_creds()?;
+    let path = cache_dir().join("lastfm_session");
+    let sk = match fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(sk) => sk,
+        None => {
+            let r = lastfm_token(&key, redirect).and_then(|token| {
+                let v = rt
+                    .block_on(lastfm_call(http, &key, &secret, "auth.getSession", vec![("token".into(), token)]))
+                    .map_err(|(_, e)| e)?;
+                v["session"]["key"].as_str().map(String::from).ok_or_else(|| "no session key in reply".into())
+            });
+            match r {
+                Ok(sk) => {
+                    save_refresh(&path, &sk);
+                    println!("Last.fm connected.\n");
+                    sk
+                }
+                Err(e) => {
+                    log::warn!("last.fm login: {e}");
+                    println!("Last.fm login {}; not scrobbling this time (SPOT_LASTFM=off stops asking).\n",
+                        if e == "skipped" { e } else { format!("failed ({e})") });
+                    return None;
+                }
+            }
+        }
+    };
+    Some(Arc::new(LastFm {
+        http: http.clone(),
+        key,
+        secret,
+        sk,
+        queue: cache_dir().join("scrobbles"),
+        file: Default::default(),
+        draining: Default::default(),
+        tx,
+    }))
+}
+
+/// Browser approval: Last.fm redirects to <redirect host>/lastfm?token=…, caught here.
+fn lastfm_token(key: &str, redirect: &str) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+    let mut cb = reqwest::Url::parse(redirect).map_err(|e| e.to_string())?;
+    cb.set_path("/lastfm");
+    cb.set_query(None);
+    let addr = cb.socket_addrs(|| None).ok().and_then(|a| a.first().copied()).ok_or("bad redirect address")?;
+    let listener = std::net::TcpListener::bind(addr).map_err(|e| format!("listen on {addr}: {e}"))?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let auth = reqwest::Url::parse_with_params("https://www.last.fm/api/auth/", [("api_key", key), ("cb", cb.as_str())])
+        .map_err(|e| e.to_string())?;
+    println!("Log in to Last.fm in your browser (opening now), or press enter to skip…");
+    if open::that(auth.as_str()).is_err() {
+        println!("Open {auth}");
+    }
+    // Polled through crossterm (not a stdin thread) so nothing is left reading input once the TUI starts.
+    let skipped = || {
+        use ratatui::crossterm::event::{Event, poll, read};
+        poll(Duration::from_millis(100)).unwrap_or(false)
+            && matches!(read(), Ok(Event::Key(k)) if matches!(k.code, KeyCode::Enter | KeyCode::Esc))
+    };
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline {
+        let mut c = match listener.accept() {
+            Ok((c, _)) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if skipped() {
+                    return Err("skipped".into());
+                }
+                continue;
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let _ = c.set_nonblocking(false);
+        let _ = c.set_read_timeout(Some(Duration::from_secs(5)));
+        // "GET /lastfm?token=… HTTP/1.1"
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(&c).read_line(&mut line);
+        let token = line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|p| cb.join(p).ok())
+            .and_then(|u| u.query_pairs().find(|(k, _)| k == "token").map(|(_, v)| v.into_owned()));
+        let body = if token.is_some() { "spot is connected to Last.fm. You can close this tab." } else { "Waiting for Last.fm…" };
+        let _ = write!(
+            c,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        if let Some(t) = token {
+            return Ok(t);
+        }
+    }
+    Err("timed out waiting for the browser".into())
+}
+
+impl LastFm {
+    async fn call(&self, method: &str, mut params: Vec<(String, String)>) -> Result<Value, (i64, String)> {
+        params.push(("sk".into(), self.sk.clone()));
+        lastfm_call(&self.http, &self.key, &self.secret, method, params).await
+    }
+
+    fn now_playing(self: &Arc<Self>, rt: &tokio::runtime::Runtime, t: &Track) {
+        let fm = self.clone();
+        let mut params = vec![("artist".into(), lead_artist(t).into()), ("track".into(), t.name.clone())];
+        if !t.album.is_empty() {
+            params.push(("album".into(), t.album.clone()));
+        }
+        params.push(("duration".into(), (t.ms / 1000).to_string()));
+        rt.spawn(async move {
+            if let Err((_, e)) = fm.call("track.updateNowPlaying", params).await {
+                log::warn!("last.fm now playing: {e}");
+            }
+        });
+    }
+
+    /// Queue a finished play; drain() sends it.
+    fn queue(&self, l: &Listen) {
+        use std::io::Write;
+        let t = &l.track;
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        let line = format!("{}\t{}\t{}\t{}\t{}\n", l.started, clean(lead_artist(t)), clean(&t.name), clean(&t.album), t.ms / 1000);
+        log::info!("scrobble {} - {}", lead_artist(t), t.name);
+        let _g = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let r = fs::OpenOptions::new().create(true).append(true).open(&self.queue).and_then(|mut f| f.write_all(line.as_bytes()));
+        if let Err(e) = r {
+            log::warn!("last.fm queue: {e}");
+        }
+    }
+
+    /// Send queued plays, 50 at a time (Last.fm's batch limit).
+    async fn drain(&self) {
+        let _d = self.draining.lock().await;
+        loop {
+            let text = {
+                let _g = self.file.lock().unwrap_or_else(|e| e.into_inner());
+                fs::read_to_string(&self.queue).unwrap_or_default()
+            };
+            let batch: Vec<&str> = text.lines().take(50).collect();
+            if batch.is_empty() {
+                return;
+            }
+            let mut params = vec![];
+            for (i, f) in batch.iter().map(|l| l.split('\t').collect::<Vec<_>>()).filter(|f| f.len() == 5).enumerate() {
+                for (k, v) in ["timestamp", "artist", "track", "album", "duration"].into_iter().zip(f) {
+                    if !v.is_empty() {
+                        params.push((format!("{k}[{i}]"), v.to_string()));
+                    }
+                }
+            }
+            if !params.is_empty() {
+                match self.call("track.scrobble", params).await {
+                    Ok(v) => {
+                        let a = &v["scrobbles"]["@attr"];
+                        log::info!("last.fm: {} scrobbled, {} ignored", a["accepted"], a["ignored"]);
+                    }
+                    Err((9, e)) => {
+                        // session revoked on last.fm: log in again next start, keep the queue
+                        log::warn!("last.fm session rejected: {e}");
+                        let _ = fs::remove_file(cache_dir().join("lastfm_session"));
+                        let _ = self.tx.send(Msg::Status("Last.fm login was revoked; restart spot to log in again".into()));
+                        return;
+                    }
+                    // offline, Last.fm down or rate limiting: keep them for later
+                    Err((code @ (0 | 11 | 16 | 29), e)) => {
+                        log::warn!("last.fm scrobble failed ({code}), will retry: {e}");
+                        return;
+                    }
+                    Err((code, e)) => log::warn!("last.fm rejected {} scrobbles ({code}): {e}", batch.len()),
+                }
+            }
+            // drop what was sent; plays queued meanwhile were appended after it
+            let _g = self.file.lock().unwrap_or_else(|e| e.into_inner());
+            let now = fs::read_to_string(&self.queue).unwrap_or_default();
+            let rest: String = now.lines().skip(batch.len()).flat_map(|l| [l, "\n"]).collect();
+            let _ = if rest.is_empty() { fs::remove_file(&self.queue) } else { fs::write(&self.queue, rest) };
+        }
+    }
+}
+
+/// First artist only: Last.fm matches "A" much better than "A, B, C".
+fn lead_artist(t: &Track) -> &str {
+    t.artists.get(..t.lead).filter(|a| !a.is_empty()).unwrap_or(&t.artists)
+}
+
+// ---------- disk cache ----------
+// Track lists are plain text, one tab-separated track per line, so even a big library loads in
+// a few ms at startup. Writes go through a temp file so a crash can't leave half a list.
+
+fn tracks_path(key: &str) -> PathBuf {
+    cache_dir().join("lists").join(key)
+}
+
+fn last_path() -> PathBuf {
+    cache_dir().join("last")
+}
+
+fn write_atomic(path: &std::path::Path, data: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, data).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// Tabs / newlines would break the line format; same byte length, so `lead` stays valid.
+fn clean(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\t', '\n', '\r']) { s.replace(['\t', '\n', '\r'], " ").into() } else { s.into() }
+}
+
+fn push_tracks(out: &mut String, tracks: &[Track]) {
+    use std::fmt::Write;
+    for t in tracks {
+        let _ = writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}",
+            t.uri,
+            clean(&t.name),
+            clean(&t.artists),
+            t.lead,
+            clean(&t.album),
+            t.cover.as_deref().unwrap_or(""),
+            t.ms,
+            t.album_id,
+            t.artist_id
+        );
+    }
+}
+
+fn parse_line(l: &str) -> Option<Track> {
+    let mut f = l.split('\t');
+    let (uri, name, artists) = (f.next()?, f.next()?, f.next()?);
+    let lead = f.next()?.parse().ok().filter(|&n| artists.is_char_boundary(n)).unwrap_or(0);
+    let (album, cover, ms) = (f.next()?, f.next()?, f.next()?.parse().ok()?);
+    let mut id = || f.next().and_then(|x| u128::from_str_radix(x, 16).ok()).unwrap_or(0);
+    Some(Track {
+        uri: uri.into(),
+        name: name.into(),
+        artists: artists.into(),
+        lead,
+        album: album.into(),
+        cover: (!cover.is_empty()).then(|| cover.into()),
+        ms,
+        album_id: id(),
+        artist_id: id(),
+    })
+}
+
+fn read_tracks(path: &std::path::Path) -> Vec<Track> {
+    fs::read_to_string(path).map(|s| s.lines().filter_map(parse_line).collect()).unwrap_or_default()
+}
+
+fn save_tracks(path: &std::path::Path, tracks: &[Track]) {
+    let mut s = String::with_capacity(tracks.len() * 200);
+    push_tracks(&mut s, tracks);
+    write_atomic(path, &s);
+}
+
+/// Saved playlist list (Liked Songs first, which is never stored).
+fn read_playlists() -> Vec<Playlist> {
+    let s = fs::read_to_string(cache_dir().join("playlists")).unwrap_or_default();
+    let saved = s.lines().filter_map(|l| {
+        let (id, name) = l.split_once('\t')?;
+        Some(Playlist { id: Some(id.into()), name: name.into() })
+    });
+    std::iter::once(liked()).chain(saved).collect()
+}
+
+fn save_playlists(pls: &[Playlist]) {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for p in pls {
+        if let Some(id) = &p.id {
+            let _ = writeln!(s, "{id}\t{}", clean(&p.name));
+        }
+    }
+    write_atomic(&cache_dir().join("playlists"), &s);
+}
+
+/// The queue as it was at quit, with the playing song's position.
+struct Last {
+    queue: Queue,
+    pos_ms: u64,
+    shuffle: bool,
+    repeat: Repeat,
+}
+
+fn read_last() -> Option<Last> {
+    let s = fs::read_to_string(last_path()).ok()?;
+    let mut lines = s.lines();
+    let (key, name) = (lines.next()?.to_string(), lines.next()?.to_string());
+    let mut nums = lines.next()?.split(' ').map(|n| n.parse::<u64>().ok());
+    let (pos, pos_ms, shuffle, repeat) = (nums.next()??, nums.next()??, nums.next()??, nums.next()??);
+    let order: Vec<usize> = lines.next()?.split(',').filter_map(|n| n.parse().ok()).collect();
+    let tracks: Vec<Track> = lines.filter_map(parse_line).collect();
+    let mut queue = Queue { key, name, tracks: Arc::new(tracks), order, pos: pos as usize };
+    let n = queue.tracks.len();
+    if n == 0 {
+        return None;
+    }
+    if queue.order.len() != n || queue.order.iter().any(|&i| i >= n) || queue.pos >= n {
+        queue.order = (0..n).collect();
+        queue.pos = 0;
+    }
+    let repeat = match repeat {
+        1 => Repeat::All,
+        2 => Repeat::One,
+        _ => Repeat::Off,
+    };
+    Some(Last { queue, pos_ms, shuffle: shuffle == 1, repeat })
+}
+
+fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
+    let order: Vec<String> = q.order.iter().map(|i| i.to_string()).collect();
+    let mut s = String::with_capacity(q.tracks.len() * 200);
+    s += &format!(
+        "{}\n{}\n{} {pos_ms} {} {}\n{}\n",
+        clean(&q.key),
+        clean(&q.name),
+        q.pos,
+        shuffle as u8,
+        repeat as u8,
+        order.join(",")
+    );
+    push_tracks(&mut s, &q.tracks);
+    write_atomic(&last_path(), &s);
 }
 
 #[cfg(target_os = "macos")]
@@ -534,11 +1187,15 @@ struct View {
     tracks: Arc<Vec<Track>>, // shared with the queue, so playing a big list doesn't copy it
     links: Vec<Link>,
     loading: bool,
+    artist: Option<String>, // artist page (key = artist uri): name, for switching songs/releases
+    releases: Vec<Link>,    // artist page: every release, of which `links` is the `filter`ed part
+    filter: Releases,
+    want: Option<String>,   // track uri to select once it loads (goto album)
 }
 
 impl View {
     fn new(id: u64, key: String, title: String, kind: Kind) -> Self {
-        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true }
+        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None }
     }
     fn len(&self) -> usize {
         if self.kind == Kind::Tracks { self.tracks.len() } else { self.links.len() }
@@ -612,7 +1269,7 @@ struct App {
     api: Arc<Api>,
     tx: mpsc::Sender<Msg>,
     cache: Cache,
-    session: Session,
+    sess: tokio::sync::watch::Sender<Option<Session>>, // None while connecting
     player: Arc<Player>,
     mixer: Arc<dyn Mixer>,
     media: Option<MediaControls>,
@@ -620,6 +1277,10 @@ struct App {
     playlists: Vec<Playlist>,
     pl_state: ListState,
     view: View,
+    view_seq: u64,                  // last view id handed out
+    history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row
+    artist_songs: bool,             // artist pages list every song (else albums & singles)
+    releases: Releases,             // which releases new artist pages list (remembered)
     tr_state: TableState,
     focus: Focus,
     input: Option<String>,
@@ -631,6 +1292,7 @@ struct App {
     fails: usize, // consecutive unplayable tracks, so repeat-all can't spin forever
     queue: Option<Queue>,
     cur: Option<SpotifyUri>,
+    loaded: bool, // `cur` is loaded into the player (it waits for the session)
     playing: bool,
     pos_ms: u64,
     pos_at: Option<Instant>,
@@ -640,36 +1302,171 @@ struct App {
     vol: u16,               // user volume; the mixer dips below it during fades
     want_play: bool,        // intent, flips immediately (playing lags until the player confirms)
     fade_gen: Arc<std::sync::atomic::AtomicU64>, // bumps cancel an in-flight fade
+    vol_until: Option<Instant>, // volume meter shows until then, after a change
+    help: bool,                 // key help on the bottom line
+    lastfm: Option<Arc<LastFm>>,
+    listen: Option<Listen>, // current play, for scrobbling (only with lastfm)
     quit: bool,
 }
 
 impl App {
+    fn new_view(&mut self, key: String, title: String, kind: Kind) -> View {
+        self.view_seq += 1;
+        View::new(self.view_seq, key, title, kind)
+    }
+
+    /// Put `v` in the right pane. `back` keeps the current view for esc to return to.
+    fn show(&mut self, v: View, back: bool) {
+        let sel = self.selected_track().unwrap_or(0);
+        self.find = None;
+        let old = std::mem::replace(&mut self.view, v);
+        if back && !old.key.is_empty() {
+            self.history.push((old, sel));
+            if self.history.len() > 50 {
+                self.history.remove(0);
+            }
+        }
+        self.tr_state = TableState::default().with_selected(0);
+    }
+
+    fn back(&mut self) {
+        let Some((v, sel)) = self.history.pop() else { return };
+        self.view = v;
+        self.find = None;
+        self.tr_state = TableState::default().with_selected(sel);
+        self.focus = Focus::Tracks;
+    }
+
+    /// The view a message is for: the open one, or one waiting in the history (still loading).
+    fn view_mut(&mut self, id: u64) -> Option<&mut View> {
+        if self.view.id == id {
+            return Some(&mut self.view);
+        }
+        self.history.iter_mut().map(|(v, _)| v).find(|v| v.id == id)
+    }
+
+    fn session(&self) -> Option<Session> {
+        self.sess.borrow().clone()
+    }
+
+    /// Opens instantly from the disk cache (or the playing queue), then refreshes in the background.
     fn open_playlist(&mut self, i: usize) {
         let Some(pl) = self.playlists.get(i).cloned() else { return };
-        self.view = View::new(self.view.id + 1, pl.key(), pl.name.clone(), Kind::Tracks);
-        self.tr_state = TableState::default().with_selected(0);
-        self.find = None;
-        self.rt.spawn(load_tracks(self.api.clone(), self.session.clone(), self.tx.clone(), self.view.id, pl));
+        let key = pl.key();
+        let mut v = self.new_view(key.clone(), pl.name.clone(), Kind::Tracks);
+        v.tracks = match &self.queue {
+            Some(q) if q.key == key => q.tracks.clone(),
+            _ => Arc::new(read_tracks(&tracks_path(&key))),
+        };
+        v.loading = v.tracks.is_empty();
+        let cached = v.tracks.clone();
+        self.rt.spawn(load_tracks(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, pl, cached));
+        self.show(v, true);
     }
 
     fn open_search(&mut self, q: String) {
         let kind = self.search_kind;
         let title = format!("Search {}: {q}", kind.label());
-        self.view = View::new(self.view.id + 1, format!("search:{}:{q}", kind.label()), title, kind);
-        self.tr_state = TableState::default().with_selected(0);
-        self.find = None;
+        let v = self.new_view(format!("search:{}:{q}", kind.label()), title, kind);
+        self.rt.spawn(search(self.api.clone(), self.tx.clone(), v.id, q, kind));
+        self.show(v, true);
         self.focus = Focus::Tracks;
-        self.rt.spawn(search(self.api.clone(), self.tx.clone(), self.view.id, q, kind));
     }
 
-    /// Open an album (track list) or artist (whole discography) from a search result.
+    fn open_album(&mut self, uri: String, title: String, want: Option<String>) {
+        let mut v = self.new_view(uri.clone(), title, Kind::Tracks);
+        v.want = want;
+        self.rt.spawn(link_tracks(self.sess.subscribe(), self.tx.clone(), v.id, uri));
+        self.show(v, true);
+        self.focus = Focus::Tracks;
+    }
+
+    /// Artist page in the current mode: every song (newest release first), or albums & singles.
+    fn artist_view(&mut self, uri: String, name: String) -> View {
+        let (title, kind) = if self.artist_songs {
+            (format!("{name} · all songs"), Kind::Tracks)
+        } else {
+            (format!("{name} · {}", self.releases.label()), Kind::Albums)
+        };
+        let mut v = self.new_view(uri.clone(), title, kind);
+        v.artist = Some(name);
+        v.filter = self.releases;
+        let (s, tx, id) = (self.sess.subscribe(), self.tx.clone(), v.id);
+        if self.artist_songs {
+            self.rt.spawn(link_tracks(s, tx, id, uri));
+        } else {
+            self.rt.spawn(artist_releases(s, tx, id, uri));
+        }
+        v
+    }
+
+    fn open_artist(&mut self, uri: String, name: String) {
+        let v = self.artist_view(uri, name);
+        self.show(v, true);
+        self.focus = Focus::Tracks;
+    }
+
+    /// `v` on an artist page: switch between all songs and albums & singles (remembered).
+    fn toggle_artist_mode(&mut self) {
+        let Some(name) = self.view.artist.clone() else {
+            self.note = Some(("v works on artist pages".into(), Instant::now() + Duration::from_millis(1500)));
+            return;
+        };
+        self.artist_songs = !self.artist_songs;
+        let v = self.artist_view(self.view.key.clone(), name);
+        self.show(v, false);
+    }
+
+    /// `f` on an artist's releases: cycle all / albums / singles (remembered).
+    fn cycle_releases(&mut self) {
+        let Some(name) = self.view.artist.clone().filter(|_| self.view.kind == Kind::Albums) else {
+            let msg = if self.view.artist.is_some() { "f works on releases (v)" } else { "f works on artist pages" };
+            self.note = Some((msg.into(), Instant::now() + Duration::from_millis(1500)));
+            return;
+        };
+        let keep = self.selected_track().and_then(|i| self.view.links.get(i)).map(|l| l.uri.clone());
+        self.releases = self.releases.next();
+        let v = &mut self.view;
+        v.filter = self.releases;
+        v.title = format!("{name} · {}", v.filter.label());
+        v.links = v.releases.iter().filter(|l| v.filter.keeps(l)).cloned().collect();
+        let sel = keep.and_then(|u| v.links.iter().position(|l| l.uri == u)).unwrap_or(0);
+        self.find = None;
+        self.matches.clear();
+        self.tr_state = TableState::default().with_selected(sel);
+    }
+
+    /// Open an album or artist from a search result or an artist's releases.
     fn open_link(&mut self, i: usize) {
         let Some(l) = self.view.links.get(i).cloned() else { return };
-        let title = if self.view.kind == Kind::Artists { format!("{} · discography", l.name) } else { format!("{} — {}", l.name, l.sub) };
-        self.view = View::new(self.view.id + 1, l.uri.clone(), title, Kind::Tracks);
-        self.tr_state = TableState::default().with_selected(0);
-        self.find = None;
-        self.rt.spawn(link_tracks(self.session.clone(), self.tx.clone(), self.view.id, l.uri));
+        if self.view.kind == Kind::Artists {
+            return self.open_artist(l.uri, l.name);
+        }
+        let by = self.view.artist.as_ref().unwrap_or(&l.sub);
+        self.open_album(l.uri.clone(), format!("{} — {by}", l.name), None);
+    }
+
+    /// What goto album/artist acts on: the highlighted song, else the one playing.
+    fn target_track(&self) -> Option<Track> {
+        if self.focus == Focus::Tracks
+            && self.view.kind == Kind::Tracks
+            && let Some(t) = self.selected_track().and_then(|i| self.view.tracks.get(i))
+        {
+            return Some(t.clone());
+        }
+        self.queue.as_ref().and_then(|q| q.tracks.get(q.idx()).cloned())
+    }
+
+    fn goto_album(&mut self) {
+        let Some(t) = self.target_track() else { return };
+        let Some(uri) = id_uri("album", t.album_id) else { return };
+        self.open_album(uri, format!("{} — {}", t.album, t.artists), Some(t.uri));
+    }
+
+    fn goto_artist(&mut self) {
+        let Some(t) = self.target_track() else { return };
+        let Some(uri) = id_uri("artist", t.artist_id) else { return };
+        self.open_artist(uri, t.artists[..t.lead].to_string());
     }
 
     /// Enter on a row: play a track (queueing the whole list) or open an album/artist.
@@ -685,26 +1482,56 @@ impl App {
         }
     }
 
+    /// Reconnect a session that died (sleep, network change). Still connecting: nothing to do.
     fn ensure_session(&mut self) {
-        if !self.session.is_invalid() {
+        if !self.session().is_some_and(|s| s.is_invalid()) {
             return;
         }
+        log::info!("session is invalid, reconnecting");
         self.status = "reconnecting…".into();
         match self.rt.block_on(connect(&self.cache, None)) {
             Ok(s) => {
+                log::info!("reconnected");
                 self.player.set_session(s.clone());
-                self.session = s;
+                self.sess.send_replace(Some(s));
                 self.status.clear();
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                log::error!("reconnect failed: {e}");
+                self.status = e;
+            }
         }
     }
 
-    fn play_current(&mut self) {
-        let Some(q) = &self.queue else { return };
-        let Some(t) = q.tracks.get(q.idx()).cloned() else { return };
+    fn on_connected(&mut self, s: Session) {
+        log::info!("audio session connected");
+        self.player.set_session(s.clone());
+        self.sess.send_replace(Some(s));
+        if self.status.starts_with("approve the audio session") {
+            self.status.clear();
+        }
+        // the song restored from last time (or picked while connecting): fetch it now, so
+        // space starts it without waiting on the network
+        self.load_cur();
+    }
+
+    /// Load `cur` into the player at the current position, playing if that's wanted.
+    fn load_cur(&mut self) {
+        if self.loaded || self.session().is_none() {
+            return;
+        }
+        let Some(uri) = self.cur.clone() else { return };
+        log::debug!("load {uri:?} play {} at {}ms", self.want_play, self.pos_ms);
+        self.player.load(uri, self.want_play, self.pos_ms as u32);
+        self.loaded = true;
+    }
+
+    fn set_cur(&mut self, t: &Track, pos_ms: u64) {
         let Ok(uri) = SpotifyUri::from_uri(&t.uri) else { return };
-        self.ensure_session();
+        self.end_listen();
+        if self.lastfm.is_some() {
+            self.listen = Some(Listen { track: t.clone(), started: 0, listened: Duration::ZERO, since: None, announced: false });
+        }
         if let Some(m) = &mut self.media {
             let _ = m.set_metadata(MediaMetadata {
                 title: Some(&t.name),
@@ -714,11 +1541,59 @@ impl App {
                 duration: Some(Duration::from_millis(t.ms)),
             });
         }
-        self.reset_fade();
-        self.cur = Some(uri.clone());
-        self.pos_ms = 0;
+        self.cur = Some(uri);
+        self.loaded = false;
+        self.pos_ms = pos_ms;
         self.pos_at = None;
-        self.player.load(uri, true, 0);
+    }
+
+    /// Scrobble the play that just ended, if it counts.
+    fn end_listen(&mut self) {
+        if let Some(l) = self.listen.take()
+            && l.counts()
+            && let Some(fm) = &self.lastfm
+        {
+            fm.queue(&l);
+            let fm = fm.clone();
+            self.rt.spawn(async move { fm.drain().await });
+        }
+    }
+
+    fn pause_listen(&mut self) {
+        if let Some(l) = &mut self.listen
+            && let Some(s) = l.since.take()
+        {
+            l.listened += s.elapsed();
+        }
+    }
+
+    fn play_current(&mut self) {
+        let Some(q) = &self.queue else { return };
+        let Some(t) = q.tracks.get(q.idx()).cloned() else { return };
+        log::info!("play {} ({} - {})", t.uri, t.name, t.artists);
+        self.ensure_session();
+        self.reset_fade();
+        self.set_cur(&t, 0);
+        self.load_cur();
+    }
+
+    /// Put last session's queue back, paused on the song that was playing.
+    fn restore(&mut self, last: Last) {
+        self.shuffle = last.shuffle;
+        self.repeat = last.repeat;
+        let t = last.queue.tracks[last.queue.idx()].clone();
+        self.queue = Some(last.queue);
+        self.set_cur(&t, last.pos_ms);
+        self.sync_media();
+    }
+
+    fn save_last(&self) {
+        match &self.queue {
+            Some(q) => save_last(q, self.position(), self.shuffle, self.repeat),
+            None => {
+                let _ = fs::remove_file(last_path());
+            }
+        }
     }
 
     fn sync_media(&mut self) {
@@ -736,11 +1611,19 @@ impl App {
     fn toggle(&mut self) {
         if self.want_play {
             self.want_play = false;
-            self.fade(false);
+            if self.loaded {
+                self.fade(false);
+            }
         } else if self.cur.is_some() {
             self.ensure_session();
-            self.want_play = true;
-            self.fade(true);
+            if self.loaded {
+                self.want_play = true;
+                self.fade(true);
+            } else {
+                // still connecting: on_connected starts it
+                self.reset_fade();
+                self.load_cur();
+            }
         }
     }
 
@@ -777,7 +1660,11 @@ impl App {
     }
 
     fn seek_to(&mut self, ms: u64) {
-        self.player.seek(ms as u32);
+        if self.loaded {
+            self.player.seek(ms as u32);
+        } else {
+            self.pos_ms = ms;
+        }
     }
 
     fn on_media(&mut self, ev: MediaControlEvent) {
@@ -865,6 +1752,7 @@ impl App {
 
     fn set_volume(&mut self, delta: i32) {
         self.vol = (self.vol as i32 + delta).clamp(0, 65535) as u16;
+        self.vol_until = Some(Instant::now() + Duration::from_millis(1500));
         if self.want_play {
             self.mixer.set_volume(self.vol);
         }
@@ -884,6 +1772,7 @@ impl App {
 
     fn on_player_inner(&mut self, ev: PlayerEvent) {
         let is_cur = |id: &SpotifyUri, cur: &Option<SpotifyUri>| cur.as_ref() == Some(id);
+        log::debug!("player event: {ev:?}");
         match ev {
             PlayerEvent::Playing { track_id, position_ms, .. } if is_cur(&track_id, &self.cur) => {
                 self.playing = true;
@@ -893,12 +1782,23 @@ impl App {
                 if self.status.starts_with("can't play") {
                     self.status.clear();
                 }
+                if let Some(l) = &mut self.listen {
+                    l.since.get_or_insert_with(Instant::now);
+                    if !l.announced {
+                        l.announced = true;
+                        l.started = unix_now();
+                        if let Some(fm) = &self.lastfm {
+                            fm.now_playing(&self.rt, &l.track);
+                        }
+                    }
+                }
                 trim_heap();
             }
             PlayerEvent::Paused { track_id, position_ms, .. } if is_cur(&track_id, &self.cur) => {
                 self.playing = false;
                 self.pos_ms = position_ms as u64;
                 self.pos_at = None;
+                self.pause_listen();
             }
             PlayerEvent::Seeked { track_id, position_ms, .. }
             | PlayerEvent::PositionCorrection { track_id, position_ms, .. }
@@ -929,17 +1829,36 @@ impl App {
                 }
             }
             PlayerEvent::Unavailable { track_id, .. } if is_cur(&track_id, &self.cur) => {
+                self.pause_listen();
+                // librespot logs the actual reason (key / file / CDN error) just before this
+                let track = self.queue.as_ref().and_then(|q| q.tracks.get(q.idx()));
+                let session = match self.session() {
+                    None => "not connected",
+                    Some(s) if s.is_invalid() => "invalid",
+                    Some(_) => "ok",
+                };
+                log::warn!(
+                    "playback failed: {} ({} - {}), session {session}, retried {}, fails {}",
+                    track_id.to_uri().unwrap_or_default(),
+                    track.map_or("?", |t| &t.name),
+                    track.map_or("?", |t| &t.artists),
+                    self.retried,
+                    self.fails,
+                );
                 // dead session after sleep/network change shows up as unavailable: retry once
-                if !self.retried && self.session.is_invalid() {
+                if !self.retried && self.session().is_some_and(|s| s.is_invalid()) {
+                    log::info!("session is dead, reconnecting and retrying");
                     self.retried = true;
                     self.play_current();
                 } else {
                     self.fails += 1;
                     if self.fails > self.queue.as_ref().map_or(0, |q| q.order.len()) {
+                        log::warn!("every track in the queue failed, stopping");
                         self.status = "nothing in this list is playable".into();
                         self.player.stop();
                         self.want_play = false;
                     } else {
+                        log::info!("skipping to the next track");
                         self.status = "can't play that track, skipping".into();
                         self.skip(1);
                     }
@@ -948,6 +1867,7 @@ impl App {
             PlayerEvent::Stopped { .. } => {
                 self.playing = false;
                 self.pos_at = None;
+                self.pause_listen();
             }
             _ => {}
         }
@@ -1019,6 +1939,11 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) {
+        if self.help {
+            // any key closes the key help
+            self.help = false;
+            return;
+        }
         if self.find.is_some() {
             return self.on_find_key(k);
         }
@@ -1046,6 +1971,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('/') => self.input = Some(String::new()),
+            KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Char('t') if ctrl => {
                 self.note = Some((format!("theme: {}", cycle_family()), Instant::now() + Duration::from_millis(1500)))
             }
@@ -1072,6 +1998,11 @@ impl App {
                 }
             }
             KeyCode::Char('P') => self.play_from_view(None),
+            KeyCode::Char('a') => self.goto_album(),
+            KeyCode::Char('A') => self.goto_artist(),
+            KeyCode::Char('v') => self.toggle_artist_mode(),
+            KeyCode::Char('f') => self.cycle_releases(),
+            KeyCode::Esc | KeyCode::Backspace => self.back(),
             KeyCode::Char('n') => self.skip(1),
             KeyCode::Char('p') => self.prev(),
             KeyCode::Char('.') => self.seek_by(SeekDirection::Forward, Duration::from_secs(10)),
@@ -1081,14 +2012,13 @@ impl App {
             KeyCode::Char('o') => {
                 // jump to what's playing
                 if let Some(q) = &self.queue {
-                    let idx = q.idx();
-                    let mut v = View::new(self.view.id + 1, q.key.clone(), q.name.clone(), Kind::Tracks);
-                    v.tracks = q.tracks.clone();
+                    let (idx, key, name, tracks) = (q.idx(), q.key.clone(), q.name.clone(), q.tracks.clone());
+                    let mut v = self.new_view(key, name, Kind::Tracks);
+                    v.tracks = tracks;
                     v.loading = false;
-                    self.view = v;
+                    self.show(v, true);
                     self.tr_state = TableState::default().with_selected(idx);
                     self.focus = Focus::Tracks;
-                    self.find = None;
                 }
             }
             KeyCode::Enter => match self.focus {
@@ -1136,6 +2066,28 @@ fn mmss(ms: u64) -> String {
     format!("{}:{:02}", ms / 60000, ms / 1000 % 60)
 }
 
+/// Truncate to at most `max` terminal columns, ending in "…" when cut.
+fn fit(s: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= max {
+        return s.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.trim_end().to_string() + "…"
+}
+
 /// One palette per theme family and light/dark; ANSI fallback without truecolor.
 struct Theme {
     accent: Color,  // focus, playing
@@ -1150,17 +2102,68 @@ struct Theme {
     err: Color,
 }
 
-/// Light vs dark terminal background: `SPOT_THEME=light|dark` wins, otherwise ask the terminal (OSC 11).
-/// Must run before the input thread starts reading stdin, or it eats the reply.
-fn is_light() -> bool {
-    match std::env::var("SPOT_THEME").as_deref() {
+/// Ask the terminal for its background (OSC 11): sets BG, and LIGHT unless `SPOT_THEME=light|dark`
+/// forces it. Must run before the input thread starts reading stdin, or it eats the reply.
+fn probe_terminal() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use terminal_colorsaurus::{QueryOptions, ThemeMode, color_palette};
+    let p = color_palette(QueryOptions::default()).ok();
+    if let Some(p) = &p {
+        let (r, g, b) = p.background.scale_to_8bit();
+        BG.store(u32::from_be_bytes([0, r, g, b]), Relaxed);
+    }
+    let light = match std::env::var("SPOT_THEME").as_deref() {
         Ok("light") => true,
         Ok("dark") => false,
-        _ => {
-            use terminal_colorsaurus::{QueryOptions, ThemeMode, theme_mode};
-            matches!(theme_mode(QueryOptions::default()), Ok(ThemeMode::Light))
-        }
+        _ => p.is_some_and(|p| p.theme_mode() == ThemeMode::Light),
+    };
+    LIGHT.store(light, Relaxed);
+}
+
+/// Terminal background as 0xRRGGBB; NO_BG until the terminal tells us.
+static BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(NO_BG);
+const NO_BG: u32 = u32::MAX;
+
+/// `a` moved `t` of the way toward `b` (0xRRGGBB).
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+    [16, 8, 0].iter().fold(0, |acc, &sh| acc | (((ch(a, sh) + (ch(b, sh) - ch(a, sh)) * t).round() as u32) << sh))
+}
+
+fn rgb_hex(c: Color) -> Option<u32> {
+    match c {
+        Color::Rgb(r, g, b) => Some(u32::from_be_bytes([0, r, g, b])),
+        _ => None,
     }
+}
+
+fn bg_hex() -> Option<u32> {
+    Some(BG.load(std::sync::atomic::Ordering::Relaxed)).filter(|&b| b != NO_BG)
+}
+
+fn hex_rgb(h: u32) -> Color {
+    Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
+}
+
+/// Background for the sidebar and player bar: the terminal's own background nudged a few percent
+/// toward the theme's text color. None without truecolor or a known background (no tint then).
+fn panel(th: &Theme) -> Option<u32> {
+    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    Some(mix(bg_hex()?, rgb_hex(th.text)?, if light { 0.045 } else { 0.06 }))
+}
+
+/// OSC 11 reply body, `11;rgb:RRRR/GGGG/BBBB` (1-4 hex digits per channel), as 0xRRGGBB.
+fn parse_bg_reply(body: &[u8]) -> Option<u32> {
+    let rest = std::str::from_utf8(body).ok()?.strip_prefix("11;rgb:")?;
+    let mut out = 0;
+    for part in rest.split('/') {
+        if !(1..=4).contains(&part.len()) {
+            return None;
+        }
+        let max = (1u32 << (4 * part.len())) - 1;
+        out = (out << 8) | (u32::from_str_radix(part, 16).ok()? * 255 / max);
+    }
+    Some(out)
 }
 
 /// Current light/dark mode; flipped live when the terminal reports a color scheme change.
@@ -1263,62 +2266,222 @@ fn cycle_family() -> &'static str {
     FAMILIES[i].0
 }
 
-fn draw(f: &mut Frame, app: &mut App) {
-    let th = theme();
-    // bottom line only appears for prompts and errors
-    let prompt = app.find.is_some() || app.input.is_some() || !app.status.is_empty();
-    let [main, now, bar, bottom] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(prompt as u16),
-    ])
-    .areas(f.area());
-    let [left, right] = Layout::horizontal([Constraint::Percentage(28), Constraint::Fill(1)]).areas(main);
-
-    let block = |title: String, focused: bool| {
-        let (border, title_style) = if focused {
-            (Style::new().fg(th.accent), Style::new().fg(th.accent).bold())
-        } else {
-            (Style::new().fg(th.dim), Style::new().fg(th.sub))
-        };
-        Block::bordered()
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(border)
-            .title(Span::styled(title, title_style))
-    };
-    let hl = |focused: bool| {
-        if focused {
-            Style::new().bg(th.hl).fg(th.text).bold()
-        } else {
-            Style::new().bg(th.deep).fg(th.text)
+/// 10435 -> "10,435"
+fn num(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
         }
-    };
-    let playing_key = app.queue.as_ref().map(|q| q.key.as_str());
-    let pl_focus = app.focus == Focus::Playlists;
+        out.push(c);
+    }
+    out
+}
 
+fn plural(n: usize, what: &str) -> String {
+    format!("{} {what}{}", num(n), if n == 1 { "" } else { "s" })
+}
+
+/// Total length of a list: "42 min", "3 h 5 min", "712 h".
+fn hours(ms: u64) -> String {
+    let m = (ms + 30_000) / 60_000;
+    match (m / 60, m % 60) {
+        (0, m) => format!("{m} min"),
+        (h, _) if h >= 10 => format!("{} h", num(h as usize)),
+        (h, m) => format!("{h} h {m} min"),
+    }
+}
+
+/// `w` cells of a thick filled rule followed by a thin empty one, optionally with a knob.
+fn meter(w: usize, ratio: f64, knob: bool, th: &Theme) -> Vec<Span<'static>> {
+    let filled = ((ratio.clamp(0.0, 1.0) * w as f64).round() as usize).min(w);
+    let (filled, knob) = if knob && w > 0 { (filled.min(w - 1), 1) } else { (filled, 0) };
+    vec![
+        Span::styled("━".repeat(filled), Style::new().fg(th.accent)),
+        Span::styled("●".repeat(knob), Style::new().fg(th.accent)),
+        Span::styled("─".repeat(w - filled - knob), Style::new().fg(th.dim)),
+    ]
+}
+
+/// Key hints for the status line, most useful first; trimmed from the end when space runs out.
+fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut h = vec![];
+    match app.focus {
+        Focus::Playlists => {
+            h.push(("⏎", "open"));
+            h.push(("/", "search"));
+            h.push(("space", "pause"));
+            h.push(("s", "shuffle"));
+            h.push(("r", "repeat"));
+        }
+        Focus::Tracks => {
+            h.push(("⏎", if app.view.kind == Kind::Tracks { "play" } else { "open" }));
+            h.push(("/", "search"));
+            h.push(("^f", "find"));
+            if app.view.artist.is_some() {
+                h.push(("v", if app.artist_songs { "releases" } else { "songs" }));
+                if app.view.kind == Kind::Albums {
+                    h.push(("f", ["all", "albums", "singles"][app.view.filter.next() as usize]));
+                }
+            }
+            if !app.history.is_empty() {
+                h.push(("esc", "back"));
+            }
+            h.push(("a", "album"));
+            h.push(("A", "artist"));
+            h.push(("s", "shuffle"));
+        }
+    }
+    h.push(("?", "keys"));
+    h
+}
+
+/// The `?` key block (nano-style, at the bottom): every key in as many columns as fit.
+fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
+    const KEYS: &[(&str, &str)] = &[
+        ("/", "search"),
+        ("ctrl+f", "find in list"),
+        ("enter", "play / open"),
+        ("space", "pause"),
+        ("n  p", "next / previous"),
+        (",  .", "seek 10s"),
+        ("+  -", "volume"),
+        ("s", "shuffle"),
+        ("r", "repeat"),
+        ("P", "play whole list"),
+        ("o", "go to playing"),
+        ("a  A", "album / artist"),
+        ("v", "artist: songs / releases"),
+        ("f", "releases: all / albums / singles"),
+        ("esc", "back"),
+        ("tab", "switch pane"),
+        ("ctrl+t", "theme"),
+        ("g  G", "top / bottom"),
+        ("q", "quit"),
+    ];
+    const COL: usize = 36;
+    let cols = (width.saturating_sub(1) / COL).clamp(1, 4);
+    let rows = KEYS.len().div_ceil(cols);
+    let mut out = vec![Line::from(vec![
+        Span::styled(" keys", Style::new().fg(th.text).bold()),
+        Span::styled("   any key closes", Style::new().fg(th.dim)),
+    ])];
+    for r in 0..rows {
+        let mut spans = vec![Span::raw(" ")];
+        for c in 0..cols {
+            if let Some((k, d)) = KEYS.get(c * rows + r) {
+                spans.push(Span::styled(format!("{k:>7}  "), Style::new().fg(th.accent).bold()));
+                spans.push(Span::styled(format!("{d:<COL$}", COL = COL - 9), Style::new().fg(th.sub)));
+            }
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn draw(f: &mut Frame, app: &mut App) {
+    use ratatui::{layout::Rect, widgets::HighlightSpacing};
+    let th = theme();
+    let width = |spans: &[Span]| spans.iter().map(|s| s.width()).sum::<usize>();
+    let dim = Style::new().fg(th.dim);
+    let body = f.area();
+
+    // A terminal-app frame: two panes split by a thin rule, the player under a rule across the
+    // whole width, and a vim-style status line at the bottom carrying the search / find prompts,
+    // notices and key hints. `?` swaps the status line for a nano-style key block.
+    let help = app.help.then(|| help_lines(body.width as usize, th));
+    let bottom_h = help.as_ref().map_or(1, |l| l.len() as u16);
+    let [top, rule, player, bottom] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1), Constraint::Length(3), Constraint::Length(bottom_h)]).areas(body);
+    let side_w = (body.width * 26 / 100).clamp(18, 36).min(body.width / 2);
+    let [left, sep, right] =
+        Layout::horizontal([Constraint::Length(side_w), Constraint::Length(1), Constraint::Fill(1)]).areas(top);
+    f.render_widget(Paragraph::new(vec![Line::from("│"); sep.height as usize]).style(dim), sep);
+    let join = (sep.x - rule.x) as usize;
+    f.render_widget(
+        Paragraph::new(Line::from(format!("{}┴{}", "─".repeat(join), "─".repeat((rule.width as usize).saturating_sub(join + 1))))).style(dim),
+        rule,
+    );
+    let line_at = |r: Rect, dy: u16| Rect { y: r.y + dy, height: 1.min(r.height.saturating_sub(dy)), ..r };
+    let title_style =
+        |focused: bool| if focused { Style::new().fg(th.accent).bold() } else { Style::new().fg(th.sub).bold() };
+    // Selection: the theme's highlight softened into the terminal background, plus an accent bar
+    // at the left edge while the pane has focus.
+    let hl = |focused: bool| {
+        let bg = match (bg_hex(), rgb_hex(th.hl)) {
+            (Some(s), Some(h)) => hex_rgb(mix(s, h, if focused { 0.75 } else { 0.4 })),
+            _ if focused => th.hl,
+            _ => th.deep,
+        };
+        let st = Style::new().bg(bg);
+        if focused { st.bold() } else { st }
+    };
+    let bar_sym = |focused: bool| Span::styled(if focused { "┃" } else { " " }, Style::new().fg(th.accent));
+    let pl_focus = app.focus == Focus::Playlists;
+    let mark = |playing: bool| if playing { "▶" } else { "‖" };
+
+    // sidebar: title, blank, playlists (the playing one carries the play mark)
+    f.render_widget(Paragraph::new(Span::styled("    playlists", title_style(pl_focus))), line_at(left, 0));
+    let playing_key = app.queue.as_ref().map(|q| q.key.as_str());
+    let name_w = (left.width as usize).saturating_sub(5);
     let items: Vec<ListItem> = app
         .playlists
         .iter()
         .map(|p| {
-            if Some(p.key().as_str()) == playing_key {
-                ListItem::new(format!("▶ {}", p.name)).style(Style::new().fg(th.accent).bold())
+            let playing = Some(p.key().as_str()) == playing_key;
+            let style = if playing {
+                Style::new().fg(th.accent).bold()
             } else if p.id.is_none() {
-                ListItem::new(format!("  {}", p.name)).style(Style::new().fg(th.pink))
+                Style::new().fg(th.pink)
             } else {
-                ListItem::new(format!("  {}", p.name)).style(Style::new().fg(th.text))
-            }
+                Style::new().fg(th.text)
+            };
+            let m = if playing { mark(app.playing) } else { " " };
+            ListItem::new(format!(" {m} {}", fit(&p.name, name_w))).style(style)
         })
         .collect();
-    let title = if app.playlists.is_empty() { " Playlists (loading…) ".into() } else { " Playlists ".into() };
-    let list = List::new(items).block(block(title, pl_focus)).highlight_style(hl(pl_focus));
-    f.render_stateful_widget(list, left, &mut app.pl_state);
+    let list_area = Rect { y: left.y + 2, height: left.height.saturating_sub(2), width: left.width.saturating_sub(1), ..left };
+    let pl_list = List::new(items)
+        .highlight_style(hl(pl_focus))
+        .highlight_symbol(bar_sym(pl_focus))
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(pl_list, list_area, &mut app.pl_state);
 
-    let playing_idx = app.queue.as_ref().filter(|q| q.key == app.view.key).map(|q| q.idx());
+    // the open list: title · meta, column header, numbered rows, scrollbar
+    let tracks = app.view.kind == Kind::Tracks;
+    // by uri: a list refreshed from the cache can have shifted under the queue's copy
+    let playing_uri = app.queue.as_ref().filter(|q| q.key == app.view.key).and_then(|q| q.tracks.get(q.idx())).map(|t| t.uri.as_str());
     let shown = app.shown();
     let total = shown.len();
+    let meta = if app.view.loading {
+        "loading…".into()
+    } else if app.view.key.is_empty() {
+        String::new()
+    } else if tracks {
+        let ms = app.view.tracks.iter().map(|t| t.ms).sum();
+        format!("{} · {}", plural(app.view.len(), "song"), hours(ms))
+    } else {
+        let what = match app.view.kind {
+            Kind::Artists => "artist",
+            _ if app.view.artist.is_some() => match app.view.filter {
+                Releases::All => "release",
+                Releases::Albums => "album",
+                Releases::Singles => "single",
+            },
+            _ => "album",
+        };
+        plural(app.view.len(), what)
+    };
+    let inner = Rect { x: right.x + 1, width: right.width.saturating_sub(3), ..right }; // pad, scrollbar, margin
+    let title_row = line_at(inner, 0);
+    let title_w = (title_row.width as usize).saturating_sub(Span::raw(&meta).width() + 4);
+    f.render_widget(Paragraph::new(Span::styled(format!(" {}", fit(&app.view.title, title_w)), title_style(!pl_focus))), title_row);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(meta, dim)).right_aligned()), title_row);
+
     // Build only the rows that fit: ratatui would otherwise lay out every row of a 10k-song list each frame.
-    let height = right.height.saturating_sub(2) as usize;
+    let table_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    let height = table_area.height.saturating_sub(1) as usize;
     let sel = app.tr_state.selected().map(|s| s.min(total.saturating_sub(1)));
     let mut off = app.tr_state.offset().min(total.saturating_sub(height));
     if let Some(s) = sel {
@@ -1328,132 +2491,235 @@ fn draw(f: &mut Frame, app: &mut App) {
             off = s + 1 - height;
         }
     }
+    let num_w = app.view.len().max(1).to_string().len() as u16;
+    let wide = table_area.width >= 90; // room for an album column
+    let (cols, labels): (Vec<Constraint>, &[&str]) = match (tracks, wide) {
+        (true, true) => (
+            vec![Constraint::Length(num_w), Constraint::Fill(4), Constraint::Fill(3), Constraint::Fill(3), Constraint::Length(5)],
+            &["", "title", "artist", "album", "time"],
+        ),
+        (true, false) => (
+            vec![Constraint::Length(num_w), Constraint::Fill(3), Constraint::Fill(2), Constraint::Length(5)],
+            &["", "title", "artist", "time"],
+        ),
+        (false, _) => (vec![Constraint::Length(num_w), Constraint::Fill(3), Constraint::Fill(2)], &["", "name", "details"]),
+    };
+    const GAP: u16 = 2;
+    // the selection bar takes the first cell
+    let cols_area = Rect { x: table_area.x + 1, width: table_area.width.saturating_sub(1), ..table_area };
+    let w: Vec<usize> = Layout::horizontal(cols.clone()).spacing(GAP).split(cols_area).iter().map(|r| r.width as usize).collect();
+    let cell = |s: &str, k: usize, style: Style| Cell::from(fit(s, w[k])).style(style);
+    let numcell = |i: usize, playing: bool, style: Style| {
+        let s = if playing { mark(app.playing).to_string() } else { num(i + 1) };
+        Cell::from(Line::from(s).right_aligned()).style(style)
+    };
     let rows: Vec<Row> = (off..total.min(off + height))
         .filter_map(|r| shown.get(r))
         .map(|i| {
-            if app.view.kind != Kind::Tracks {
+            if !tracks {
                 let l = &app.view.links[i];
                 return Row::new([
-                    Cell::from(" "),
-                    Cell::from(l.name.as_str()).style(Style::new().fg(th.text)),
-                    Cell::from(l.sub.as_str()).style(Style::new().fg(th.sub)),
-                    Cell::from(""),
+                    numcell(i, false, dim),
+                    cell(&l.name, 1, Style::new().fg(th.text)),
+                    cell(&l.sub, 2, Style::new().fg(th.sub)),
                 ]);
             }
             let t = &app.view.tracks[i];
-            if Some(i) == playing_idx {
-                return Row::new([
-                    Cell::from("▶"),
-                    Cell::from(t.name.as_str()),
-                    Cell::from(t.artists.as_str()),
-                    Cell::from(mmss(t.ms)),
-                ])
-                .style(Style::new().fg(th.accent).bold());
+            let playing = Some(t.uri.as_str()) == playing_uri;
+            let [n, name, artist, album, time] = if playing {
+                let a = Style::new().fg(th.accent);
+                [a.bold(), a.bold(), a, a, a]
+            } else {
+                [th.dim, th.text, th.sub, th.dim, th.dim].map(|c| Style::new().fg(c))
+            };
+            let mut cells = vec![numcell(i, playing, n), cell(&t.name, 1, name), cell(&t.artists, 2, artist)];
+            if wide {
+                cells.push(cell(&t.album, 3, album));
             }
-            Row::new([
-                Cell::from(" "),
-                Cell::from(t.name.as_str()).style(Style::new().fg(th.text)),
-                Cell::from(t.artists.as_str()).style(Style::new().fg(th.sub)),
-                Cell::from(mmss(t.ms)).style(Style::new().fg(th.dim)),
-            ])
+            cells.push(Cell::from(Line::from(mmss(t.ms)).right_aligned()).style(time));
+            Row::new(cells)
         })
         .collect();
-    let mut title = format!(" {} ", app.view.title);
-    if app.find.is_some() {
-        title.push_str(&format!("· {}/{} match ", total, app.view.len()));
-    } else if app.view.loading {
-        title.push_str("(loading…) ");
-    } else if !app.view.key.is_empty() {
-        title.push_str(&format!("· {} ", app.view.len()));
-    }
-    let table = Table::new(
-        rows,
-        [Constraint::Length(1), Constraint::Fill(3), Constraint::Fill(2), Constraint::Length(6)],
-    )
-    .block(block(title, !pl_focus))
-    .row_highlight_style(hl(!pl_focus));
+    let header = Row::new(labels.iter().map(|&l| {
+        let line = Line::from(l);
+        Cell::from(if l == "time" { line.right_aligned() } else { line })
+    }))
+    .style(dim);
+    let table = Table::new(rows, cols)
+        .header(header)
+        .column_spacing(GAP)
+        .row_highlight_style(hl(!pl_focus))
+        .highlight_symbol(Line::from(bar_sym(!pl_focus)))
+        .highlight_spacing(HighlightSpacing::Always);
     let mut window = TableState::default().with_selected(sel.map(|s| s - off));
-    f.render_stateful_widget(table, right, &mut window);
+    f.render_stateful_widget(table, table_area, &mut window);
     *app.tr_state.offset_mut() = off;
-
-    // now playing + progress bar
-    let modes = format!(
-        "{}{}",
-        if app.shuffle { "  ⤮ shuffle" } else { "" },
-        match app.repeat {
-            Repeat::Off => "",
-            Repeat::All => "  ⟳ repeat",
-            Repeat::One => "  ⟳ repeat one",
-        }
-    );
-    let shuf = Span::styled(modes, Style::new().fg(th.gold).bold());
-    let cur = app.queue.as_ref().and_then(|q| q.tracks.get(q.idx()).map(|t| (q, t)));
-    let (np, ratio) = match cur {
-        Some((q, t)) => {
-            let pos = app.position().min(t.ms);
-            let line = Line::from(vec![
-                Span::styled(if app.playing { " ▶ " } else { " ⏸ " }, Style::new().fg(th.accent).bold()),
-                Span::styled(t.name.clone(), Style::new().fg(th.text).bold()),
-                Span::styled(format!("  {}", t.artists), Style::new().fg(th.sub)),
-                Span::styled(format!("  {} / {}", mmss(pos), mmss(t.ms)), Style::new().fg(th.dim)),
-                Span::styled(format!("  · {}", q.name), Style::new().fg(th.accent2)),
-                Span::styled(
-                    format!("  · vol {}%", (app.vol as u32 * 100 + 32767) / 65535),
-                    Style::new().fg(th.dim),
-                ),
-                shuf,
-            ]);
-            (line, if t.ms > 0 { pos as f64 / t.ms as f64 } else { 0.0 })
-        }
-        None => (Line::from(vec![Span::styled(" nothing playing", Style::new().fg(th.dim)), shuf]), 0.0),
-    };
-    f.render_widget(Paragraph::new(np), now);
-    let gauge = ratatui::widgets::LineGauge::default()
-        .ratio(ratio.clamp(0.0, 1.0))
-        .label("")
-        .filled_style(Style::new().fg(th.accent))
-        .unfilled_style(Style::new().fg(th.deep))
-        .filled_symbol("━")
-        .unfilled_symbol("━");
-    f.render_widget(gauge, bar.inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 }));
-
-    // popup floating over the bottom-right corner of the track list
-    if let Some((note, _)) = &app.note {
-        let w = (note.chars().count() as u16 + 4).min(right.width);
-        let h = 3.min(right.height);
-        let area = ratatui::layout::Rect::new(right.right() - w, right.bottom() - h, w, h);
-        f.render_widget(ratatui::widgets::Clear, area);
-        f.render_widget(
-            Paragraph::new(Span::styled(format!(" {note}"), Style::new().fg(th.text).bold())).block(
-                Block::bordered()
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .border_style(Style::new().fg(th.accent)),
-            ),
-            area,
-        );
+    if total > height {
+        use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+        let area = Rect { x: table_area.right() + 1, y: table_area.y + 1, width: 1, height: height as u16 };
+        let mut st = ScrollbarState::new(total - height + 1).position(off).viewport_content_length(height);
+        // thumb only: a track line would read as a divider
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("┃")
+            .thumb_style(dim);
+        f.render_stateful_widget(sb, area, &mut st);
     }
 
-    if !prompt {
+    // player: mark + title with modes and where it's playing from, artist · album with what's next,
+    // then the progress bar
+    let pad = Rect { x: player.x + 1, width: player.width.saturating_sub(2), ..player };
+    let [now, sub, bar] = Layout::vertical([Constraint::Length(1); 3]).areas(pad);
+    let gold = Style::new().fg(th.gold).bold();
+    let sep_span = || Span::styled("  ·  ", dim);
+    let cur = app.queue.as_ref().and_then(|q| q.tracks.get(q.idx()).map(|t| (q, t)));
+    let (pos, len) = cur.map_or((0, 0), |(_, t)| (app.position().min(t.ms), t.ms));
+    let mut top_right: Vec<Span> = vec![];
+    let add = |top_right: &mut Vec<Span<'static>>, span: Span<'static>| {
+        if !top_right.is_empty() {
+            top_right.push(sep_span());
+        }
+        top_right.push(span);
+    };
+    if app.shuffle {
+        add(&mut top_right, Span::styled("shuffle", gold));
+    }
+    match app.repeat {
+        Repeat::Off => {}
+        Repeat::All => add(&mut top_right, Span::styled("repeat", gold)),
+        Repeat::One => add(&mut top_right, Span::styled("repeat 1", gold)),
+    }
+    if let Some((q, _)) = cur {
+        let ctx_w = Span::raw(&q.name).width();
+        if (now.width as usize) >= ctx_w + width(&top_right) + 32 {
+            add(&mut top_right, Span::styled(q.name.clone(), Style::new().fg(th.accent2)));
+        }
+    }
+    let avail = (now.width as usize).saturating_sub(5 + width(&top_right));
+    let top_left = match cur {
+        Some((_, t)) => vec![
+            Span::styled(format!("{} ", mark(app.playing)), Style::new().fg(th.accent).bold()),
+            Span::styled(fit(&t.name, avail), Style::new().fg(th.text).bold()),
+        ],
+        None => vec![Span::styled(fit("nothing playing", avail + 3), dim)],
+    };
+    f.render_widget(Paragraph::new(Line::from(top_left)), now);
+    f.render_widget(Paragraph::new(Line::from(top_right).right_aligned()), now);
+    if let Some((q, t)) = cur {
+        // up next (when the queue isn't on its last song; repeat one plays this again)
+        let next = (app.repeat != Repeat::One).then(|| q.order.get(q.pos + 1).and_then(|&i| q.tracks.get(i))).flatten();
+        let full = (sub.width as usize).saturating_sub(2);
+        let next_spans = next.map(|n| {
+            let room = (full / 2).saturating_sub(8);
+            let name = fit(&n.name, room);
+            let mut v = vec![Span::styled("next  ", dim), Span::styled(name.clone(), Style::new().fg(th.sub))];
+            let rest = room.saturating_sub(Span::raw(&name).width() + 3);
+            if rest >= 6 {
+                v.push(Span::styled(" · ", dim));
+                v.push(Span::styled(fit(&n.artists, rest), dim));
+            }
+            v
+        });
+        let show_next = next_spans.as_ref().is_some_and(|n| full >= width(n) + 28);
+        let avail = if show_next { full - width(next_spans.as_ref().unwrap()) - 3 } else { full };
+        let artist = fit(&t.artists, avail);
+        let mut spans = vec![Span::raw("  "), Span::styled(artist.clone(), Style::new().fg(th.sub))];
+        let rest = avail.saturating_sub(Span::raw(&artist).width() + 3);
+        if !t.album.is_empty() && rest >= 6 {
+            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled(fit(&t.album, rest), dim));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), sub);
+        if show_next {
+            f.render_widget(Paragraph::new(Line::from(next_spans.unwrap()).right_aligned()), sub);
+        }
+    }
+    let (lt, rt) = if cur.is_some() { (mmss(pos), mmss(len)) } else { (String::new(), String::new()) };
+    let (lt, rt) = (Span::styled(format!("{lt:>4} "), dim), Span::styled(format!(" {rt}"), dim));
+    let track_w = (bar.width as usize).saturating_sub(lt.width() + rt.width());
+    let ratio = if len > 0 { pos as f64 / len as f64 } else { 0.0 };
+    let mut spans = vec![lt];
+    spans.extend(meter(track_w, ratio, cur.is_some(), th));
+    spans.push(rt);
+    f.render_widget(Paragraph::new(Line::from(spans)), bar);
+
+    // bottom: on a faint tint of the terminal background (needs truecolor)
+    if let Some(p) = panel(th) {
+        f.render_widget(Block::new().style(Style::new().bg(hex_rgb(p))), bottom);
+    }
+    if let Some(lines) = help {
+        f.render_widget(Paragraph::new(lines), bottom);
         return;
     }
-    let bottom_line = if let Some(buf) = &app.find {
-        Line::from(vec![
-            Span::styled(" find: ", Style::new().fg(th.gold).bold()),
-            Span::styled(format!("{buf}█"), Style::new().fg(th.text)),
-        ])
-    } else if let Some(buf) = &app.input {
-        Line::from(vec![
-            Span::styled(" search ", Style::new().fg(th.accent).bold()),
-            Span::styled(app.search_kind.label(), Style::new().fg(th.gold).bold()),
-            Span::styled(": ", Style::new().fg(th.accent)),
-            Span::styled(format!("{buf}█"), Style::new().fg(th.text)),
-            Span::styled("   tab: songs/albums/artists", Style::new().fg(th.dim)),
-        ])
+    // status line: prompt (search / find) > error > notice > key hints; position and volume at the right
+    let bw = bottom.width as usize;
+    let (left_side, right_side): (Vec<Span>, Vec<Span>) = if let Some(buf) = &app.input {
+        let kinds = [Kind::Tracks, Kind::Albums, Kind::Artists].map(|k| {
+            let st = if k == app.search_kind { gold } else { dim };
+            Span::styled(k.label(), st)
+        });
+        let [a, b, c] = kinds;
+        let right = vec![a, Span::styled(" · ", dim), b, Span::styled(" · ", dim), c, Span::styled("   tab ", dim)];
+        (prompt(" /", th.accent, buf, bw.saturating_sub(width(&right) + 2), th), right)
+    } else if let Some(buf) = &app.find {
+        let right = vec![Span::styled(format!("{} of {} ", num(total), num(app.view.len())), dim)];
+        (prompt(" find", th.gold, buf, bw.saturating_sub(width(&right) + 2), th), right)
     } else {
-        Line::from(Span::styled(format!(" {}", app.status), Style::new().fg(th.err)))
+        let mut right = vec![];
+        if app.sess.borrow().is_none() {
+            right.push(Span::styled("connecting…   ", dim));
+        }
+        if app.focus == Focus::Tracks && total > 0 {
+            right.push(Span::styled(format!("{}/{}   ", num(sel.map_or(0, |s| s + 1)), num(total)), dim));
+        }
+        let pct = (app.vol as u32 * 100 + 32767) / 65535;
+        if app.vol_until.is_some_and(|u| Instant::now() < u) {
+            right.push(Span::styled("vol ", dim));
+            right.extend(meter(10, pct as f64 / 100.0, false, th));
+            right.push(Span::styled(format!(" {pct:>3}% "), Style::new().fg(th.text)));
+        } else {
+            right.push(Span::styled(format!("vol {pct}% "), dim));
+        }
+        let avail = bw.saturating_sub(width(&right) + 2);
+        let left = if !app.status.is_empty() {
+            vec![Span::styled(format!(" {}", fit(&app.status, avail)), Style::new().fg(th.err).bold())]
+        } else if let Some((n, _)) = &app.note {
+            vec![Span::styled(format!(" {}", fit(n, avail)), Style::new().fg(th.accent))]
+        } else {
+            let mut v = vec![];
+            let mut used = 0;
+            for (k, d) in hints(app) {
+                let need = k.chars().count() + d.len() + 3;
+                if used + need > avail {
+                    break;
+                }
+                v.push(Span::styled(format!(" {k}"), Style::new().fg(th.sub).bold()));
+                v.push(Span::styled(format!(" {d} "), dim));
+                used += need;
+            }
+            v
+        };
+        (left, right)
     };
-    f.render_widget(Paragraph::new(bottom_line), bottom);
+    f.render_widget(Paragraph::new(Line::from(left_side)), bottom);
+    f.render_widget(Paragraph::new(Line::from(right_side).right_aligned()), bottom);
+}
 
+/// A one-line text prompt: colored label, the end of the text (so the cursor stays in view), a caret.
+fn prompt(label: &str, color: Color, buf: &str, avail: usize, th: &Theme) -> Vec<Span<'static>> {
+    let avail = avail.saturating_sub(label.len() + 3);
+    let text = buf.chars().rev().scan(0, |w, c| {
+        *w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        (*w <= avail).then_some(c)
+    });
+    let text: String = text.collect::<Vec<_>>().into_iter().rev().collect();
+    vec![
+        Span::styled(format!("{label} "), Style::new().fg(color).bold()),
+        Span::styled(text, Style::new().fg(th.text)),
+        Span::styled("▏", Style::new().fg(color)),
+    ]
 }
 
 // ---------- main ----------
@@ -1525,12 +2791,14 @@ fn parse_input(b: &[u8]) -> Vec<Msg> {
                     });
                     i += 3;
                 }
-                // OSC (e.g. a late color reply): skip to BEL or ST
+                // OSC: the background color we ask for when the scheme changes; skip anything else
                 b']' => {
                     i += 2;
+                    let start = i;
                     while i < b.len() && b[i] != 0x07 && !(b[i] == 0x1b && b.get(i + 1) == Some(&b'\\')) {
                         i += 1;
                     }
+                    out.extend(parse_bg_reply(&b[start..i]).map(Msg::Background));
                     i += if b.get(i) == Some(&0x1b) { 2 } else { 1 };
                 }
                 // Alt+key: unused, drop both bytes
@@ -1583,15 +2851,36 @@ unsafe extern "C" {
     fn CFRunLoopRun();
 }
 
+/// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log, since the TUI
+/// owns the terminal. The previous run's log is kept as log.1.
+fn init_log() {
+    let spec = "info,spot=debug,librespot=debug";
+    let path = cache_dir().join("log");
+    let _ = fs::create_dir_all(cache_dir());
+    let _ = fs::rename(&path, path.with_extension("1"));
+    let file = match fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("spot: can't open {}: {e}", path.display()),
+    };
+    env_logger::Builder::new()
+        .parse_filters(spec)
+        .target(env_logger::Target::Pipe(Box::new(file)))
+        .write_style(env_logger::WriteStyle::Never)
+        .format_timestamp_millis()
+        .init();
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {info}");
+        hook(info);
+    }));
+    log::info!("spot {} starting, log filter {spec:?}", env!("CARGO_PKG_VERSION"));
+}
+
 fn main() {
-    // probe light/dark before anything reads stdin
-    LIGHT.store(is_light(), std::sync::atomic::Ordering::Relaxed);
-    let saved = fs::read_to_string(cache_dir().join("theme")).unwrap_or_default();
-    if let Some(i) = FAMILIES.iter().position(|(name, ..)| *name == saved.trim()) {
-        FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
-    }
+    init_log();
     let ui = std::thread::spawn(|| {
         if let Err(e) = run() {
+            log::error!("exiting: {e}");
             restore_terminal();
             eprintln!("spot: {e}");
             std::process::exit(1);
@@ -1625,40 +2914,42 @@ fn run() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
 
-    // Web API token: reuse saved refresh token, otherwise log in through the browser once.
-    let saved = fs::read_to_string(&refresh_path).ok().filter(|s| !s.trim().is_empty());
-    let tok = match saved.map(|r| rt.block_on(oauth.refresh_token_async(r.trim()))) {
-        Some(Ok(t)) => t,
-        _ => {
+    // Web API token: refreshed lazily from the saved refresh token; browser login only the first time.
+    let saved = fs::read_to_string(&refresh_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let tok = match saved {
+        Some(refresh) => Tok { access: String::new(), refresh, exp: Instant::now(), failed_login: None },
+        None => {
             println!("Log in to Spotify in your browser (opening now)…");
-            rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}"))?
+            let t = rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}"))?;
+            if !t.refresh_token.is_empty() {
+                save_refresh(&refresh_path, &t.refresh_token);
+            }
+            Tok { access: t.access_token, refresh: t.refresh_token, exp: t.expires_at, failed_login: None }
         }
     };
-    if !tok.refresh_token.is_empty() {
-        save_refresh(&refresh_path, &tok.refresh_token);
+
+    // The audio session connects in the background unless this is the first run.
+    let first_session = if cache.credentials().is_none() {
+        println!("One more browser approval for the audio session…");
+        Some(rt.block_on(approve_session(&cache))?)
+    } else {
+        None
+    };
+    let session = first_session.clone().unwrap_or_else(|| Session::new(SessionConfig::default(), Some(cache.clone())));
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let http = reqwest::Client::new();
+    let lastfm = lastfm_setup(&rt, &http, &redirect, tx.clone());
+    if let Some(fm) = lastfm.clone() {
+        rt.spawn(async move { fm.drain().await }); // whatever didn't get sent last time
     }
-
-    println!("Connecting…");
-    let session = match rt.block_on(connect(&cache, None)) {
-        Ok(s) => s,
-        Err(_) => {
-            // Streaming + internal APIs need a session from Spotify's own client id. Only needed once:
-            // librespot stores reusable credentials afterwards. Never used for the Web API.
-            println!("One more browser approval for the audio session…");
-            let t = OAuthClientBuilder::new(SESSION_CLIENT_ID, SESSION_REDIRECT, vec!["streaming"])
-                .open_in_browser()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let t = rt.block_on(t.get_access_token_async()).map_err(|e| format!("login: {e}"))?;
-            rt.block_on(connect(&cache, Some(Credentials::with_access_token(t.access_token))))?
-        }
-    };
-
     let api = Arc::new(Api {
-        http: reqwest::Client::new(),
-        oauth,
-        tok: tokio::sync::Mutex::new(Tok { access: tok.access_token, refresh: tok.refresh_token, exp: tok.expires_at }),
+        http,
+        oauth: Arc::new(oauth),
+        redirect,
+        tok: tokio::sync::Mutex::new(tok),
         path: refresh_path,
+        tx: tx.clone(),
     });
 
     let mixer = mixer::find(None).unwrap()(MixerConfig::default()).map_err(|e| e.to_string())?;
@@ -1672,7 +2963,18 @@ fn run() -> Result<(), String> {
         move || backend(None, AudioFormat::default()),
     );
 
-    let (tx, rx) = mpsc::channel::<Msg>();
+    let (sess, _) = tokio::sync::watch::channel(first_session.clone());
+    if first_session.is_none() {
+        rt.spawn(start_session(session, cache.clone(), tx.clone()));
+    }
+    rt.spawn(load_playlists(api.clone(), tx.clone()));
+
+    // probe light/dark before anything reads stdin
+    probe_terminal();
+    let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
+    if let Some(i) = FAMILIES.iter().position(|(name, ..)| *name == theme.trim()) {
+        FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let mut events = player.get_player_event_channel();
     let ptx = tx.clone();
@@ -1702,8 +3004,6 @@ fn run() -> Result<(), String> {
         }
     });
 
-    rt.spawn(load_playlists(api.clone(), tx.clone()));
-
     let media = MediaControls::new(PlatformConfig { display_name: "spot", dbus_name: "spot", hwnd: None })
         .ok()
         .and_then(|mut m| {
@@ -1720,13 +3020,17 @@ fn run() -> Result<(), String> {
         api,
         tx,
         cache,
-        session,
+        sess,
         player,
         mixer,
         media,
-        playlists: vec![],
+        playlists: read_playlists(),
         pl_state: ListState::default().with_selected(Some(0)),
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },
+        view_seq: 0,
+        history: vec![],
+        artist_songs: true,
+        releases: Releases::All,
         tr_state: TableState::default(),
         focus: Focus::Playlists,
         input: None,
@@ -1738,6 +3042,7 @@ fn run() -> Result<(), String> {
         fails: 0,
         queue: None,
         cur: None,
+        loaded: false,
         playing: false,
         pos_ms: 0,
         pos_at: None,
@@ -1747,8 +3052,17 @@ fn run() -> Result<(), String> {
         vol,
         want_play: false,
         fade_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        vol_until: None,
+        help: false,
+        lastfm,
+        listen: None,
         quit: false,
     };
+
+    if let Some(last) = read_last() {
+        app.restore(last);
+    }
+    app.open_playlist(0);
 
     let mut term = ratatui::init();
     if std::env::var_os("SPOT_THEME").is_none() {
@@ -1760,8 +3074,8 @@ fn run() -> Result<(), String> {
         term.draw(|f| draw(f, &mut app)).map_err(|e| e.to_string())?;
         // Only wake up once a second while playing (progress clock); otherwise sleep until input.
         let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
-        if let Some((_, until)) = app.note {
-            // wake up in time to take the popup down
+        // wake up in time to take the popup / volume meter down
+        for until in [app.note.as_ref().map(|n| n.1), app.vol_until].into_iter().flatten() {
             timeout = timeout.min(until.saturating_duration_since(Instant::now()));
         }
         let first = match rx.recv_timeout(timeout) {
@@ -1772,6 +3086,9 @@ fn run() -> Result<(), String> {
         if app.note.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
             app.note = None;
         }
+        if app.vol_until.is_some_and(|until| Instant::now() >= until) {
+            app.vol_until = None;
+        }
         for m in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             match m {
                 Msg::Key(k) => {
@@ -1779,46 +3096,116 @@ fn run() -> Result<(), String> {
                     app.on_key(k);
                 }
                 Msg::Redraw => {}
-                Msg::Scheme(light) => LIGHT.store(light, std::sync::atomic::Ordering::Relaxed),
+                Msg::Scheme(light) => {
+                    LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
+                    // the background changed with it: ask for the new one (answered as Msg::Background)
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(b"\x1b]11;?\x1b\\").and_then(|_| std::io::stdout().flush());
+                }
+                Msg::Background(bg) => BG.store(bg, std::sync::atomic::Ordering::Relaxed),
                 Msg::Player(ev) => app.on_player(ev),
                 Msg::Playlists(p) => {
+                    let n = p.len();
                     app.playlists = p;
-                    if app.pl_state.selected().is_none() {
-                        app.pl_state.select(Some(0));
-                    }
-                    if app.view.key.is_empty() {
-                        app.open_playlist(0);
-                    }
+                    app.pl_state.select(Some(app.pl_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
                 }
-                Msg::Tracks { view, tracks, done } if view == app.view.id => {
-                    if !tracks.is_empty() {
-                        Arc::make_mut(&mut app.view.tracks).extend(tracks);
+                Msg::Replace { view, tracks } => {
+                    // keep the cursor on the same song (unless it's at the top, where new likes land)
+                    let keep = (view == app.view.id && app.find.is_none())
+                        .then(|| app.selected_track().filter(|&i| i > 0).and_then(|i| app.view.tracks.get(i)).map(|t| t.uri.clone()))
+                        .flatten();
+                    let Some(v) = app.view_mut(view) else { continue };
+                    v.tracks = tracks;
+                    if view != app.view.id {
+                        continue;
                     }
-                    app.view.loading = !done;
                     app.refilter();
+                    let sel = keep
+                        .and_then(|u| app.view.tracks.iter().position(|t| t.uri == u))
+                        .or(app.tr_state.selected())
+                        .map(|s| s.min(app.shown().len().saturating_sub(1)));
+                    app.tr_state.select(sel);
+                }
+                Msg::Connected(Ok(s)) => app.on_connected(s),
+                Msg::Connected(Err(e)) => {
+                    log::error!("audio session: {e}");
+                    app.status = e;
+                }
+                Msg::Status(e) => {
+                    log::info!("status: {e}");
+                    app.status = e;
+                }
+                Msg::Tracks { view, tracks, done } => {
+                    let Some(v) = app.view_mut(view) else { continue };
+                    if !tracks.is_empty() {
+                        Arc::make_mut(&mut v.tracks).extend(tracks);
+                    }
+                    v.loading = !done;
                     if done {
                         trim_heap();
                     }
+                    if view != app.view.id {
+                        continue;
+                    }
+                    app.refilter();
                     if app.tr_state.selected().is_none() && !app.view.tracks.is_empty() {
                         app.tr_state.select(Some(0));
                     }
+                    // goto album: land on the song we came from
+                    if app.find.is_none()
+                        && let Some(w) = &app.view.want
+                        && let Some(i) = app.view.tracks.iter().position(|t| &t.uri == w)
+                    {
+                        app.tr_state.select(Some(i));
+                        app.view.want = None;
+                    }
                 }
-                Msg::Links { view, links, done } if view == app.view.id => {
-                    app.view.links.extend(links);
-                    app.view.loading = !done;
+                Msg::Links { view, links, done } => {
+                    let Some(v) = app.view_mut(view) else { continue };
+                    if v.artist.is_some() {
+                        let f = v.filter;
+                        v.links.extend(links.iter().filter(|l| f.keeps(l)).cloned());
+                        v.releases.extend(links);
+                    } else {
+                        v.links.extend(links);
+                    }
+                    v.loading = !done;
+                    if view != app.view.id {
+                        continue;
+                    }
                     app.refilter();
                     // ratatui drops the selection while a list renders empty
                     if app.tr_state.selected().is_none() && !app.view.links.is_empty() {
                         app.tr_state.select(Some(0));
                     }
                 }
-                Msg::Tracks { .. } | Msg::Links { .. } => {}
-                Msg::Error(e) => app.status = e,
-                Msg::Media(ev) => app.on_media(ev),
+                Msg::Error(e) => {
+                    log::error!("{e}");
+                    app.status = e;
+                }
+                Msg::Media(ev) => {
+                    log::debug!("media control: {ev:?}");
+                    app.on_media(ev);
+                }
+                Msg::Relogin(true) => {
+                    log::warn!("Web API refresh token rejected, logging in through the browser");
+                    app.status = "Spotify login expired, approve it in your browser…".into();
+                }
+                Msg::Relogin(false) => {
+                    if app.status.starts_with("Spotify login expired") {
+                        app.status.clear();
+                    }
+                }
             }
         }
     }
     restore_terminal();
+    app.save_last();
     app.player.stop();
+    app.end_listen();
+    if let Some(fm) = app.lastfm.clone() {
+        // give the last scrobble a moment to go out; otherwise it's sent next start
+        let _ = app.rt.block_on(tokio::time::timeout(Duration::from_secs(3), async move { fm.drain().await }));
+    }
     std::process::exit(0);
 }
