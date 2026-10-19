@@ -57,6 +57,7 @@ struct Track {
     ms: u64,
     album_id: u128, // SpotifyIds for goto album / artist (first artist); 0 = unknown
     artist_id: u128,
+    disc: u32, // disc number on its album; 0 = unknown
 }
 
 /// An album or artist search result.
@@ -304,6 +305,7 @@ fn parse_track(v: &Value) -> Option<Track> {
         ms: v["duration_ms"].as_u64().unwrap_or(0),
         album_id: id(&v["album"]),
         artist_id: id(&v["artists"][0]),
+        disc: v["disc_number"].as_u64().unwrap_or(0) as u32,
     })
 }
 
@@ -475,6 +477,7 @@ fn pb_track(uri: &str, t: &PbTrack) -> Track {
         ms: t.duration() as u64,
         album_id: id(t.album.gid()),
         artist_id: t.artist.first().map_or(0, |a| id(a.gid())),
+        disc: t.disc_number().max(0) as u32,
     }
 }
 
@@ -572,7 +575,10 @@ async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, 
         let uris = album_track_uris(&session, &albums).await?;
         let tracks = send_tracks(&session, &uris, dedupe, cached.is_empty(), &tx, view).await?;
         save_tracks(&tracks_path(&uri_key(&uri)), &tracks);
-        if !cached.is_empty() && !same_uris(tracks.iter().map(|t| &t.uri), cached.iter().map(|t| &t.uri)) {
+        // disc numbers too: caches from before they were kept have none
+        let changed = !same_uris(tracks.iter().map(|t| &t.uri), cached.iter().map(|t| &t.uri))
+            || tracks.iter().zip(cached.iter()).any(|(a, b)| a.disc != b.disc);
+        if !cached.is_empty() && changed {
             let _ = tx.send(Msg::Replace { view, tracks: Arc::new(tracks) });
         }
         Ok::<_, String>(())
@@ -1107,7 +1113,7 @@ fn push_tracks(out: &mut String, tracks: &[Track]) {
     for t in tracks {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}",
             t.uri,
             clean(&t.name),
             clean(&t.artists),
@@ -1116,7 +1122,8 @@ fn push_tracks(out: &mut String, tracks: &[Track]) {
             t.cover.as_deref().unwrap_or(""),
             t.ms,
             t.album_id,
-            t.artist_id
+            t.artist_id,
+            t.disc
         );
     }
 }
@@ -1137,6 +1144,7 @@ fn parse_line(l: &str) -> Option<Track> {
         ms,
         album_id: id(),
         artist_id: id(),
+        disc: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
     })
 }
 
@@ -2556,11 +2564,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     let height = table_area.height.saturating_sub(1) as usize;
     let sel = app.tr_state.selected().map(|s| s.min(total.saturating_sub(1)));
     let mut off = app.tr_state.offset().min(total.saturating_sub(height));
+    // multi-disc albums get a "disc n" line above each disc's first song, set off by a blank
+    // line unless it's at the top; they take lines but aren't rows you can select
+    let discs = tracks && app.view.key.starts_with("spotify:album:") && app.view.tracks.iter().any(|t| t.disc > 1);
+    let disc_of = |r: usize| shown.get(r).map_or(0, |i| app.view.tracks[i].disc);
+    let starts_disc = |r: usize| discs && (r == 0 || disc_of(r) != disc_of(r - 1));
+    // lines above row r's song when the window starts at `off`
+    let above = |r: usize, off: usize| if !starts_disc(r) { 0 } else if r == off { 1 } else { 2 };
+    let lines_to = |off: usize, s: usize| (off..=s).map(|r| 1 + above(r, off)).sum::<usize>();
     if let Some(s) = sel {
         if s < off {
             off = s;
-        } else if s >= off + height {
-            off = s + 1 - height;
+        }
+        while off < s && lines_to(off, s) > height {
+            off += 1;
         }
     }
     let num_w = app.view.len().max(1).to_string().len() as u16;
@@ -2585,33 +2602,50 @@ fn draw(f: &mut Frame, app: &mut App) {
         let s = if playing { mark(app.playing).to_string() } else { num(i + 1) };
         Cell::from(Line::from(s).right_aligned()).style(style)
     };
-    let rows: Vec<Row> = (off..total.min(off + height))
-        .filter_map(|r| shown.get(r))
-        .map(|i| {
-            if !tracks {
-                let l = &app.view.links[i];
-                return Row::new([
-                    numcell(i, false, dim),
-                    cell(&l.name, 1, Style::new().fg(th.text)),
-                    cell(&l.sub, 2, Style::new().fg(th.sub)),
-                ]);
-            }
-            let t = &app.view.tracks[i];
-            let playing = Some(t.uri.as_str()) == playing_uri;
-            let [n, name, artist, album, time] = if playing {
-                let a = Style::new().fg(th.accent);
-                [a.bold(), a.bold(), a, a, a]
-            } else {
-                [th.dim, th.text, th.sub, th.dim, th.dim].map(|c| Style::new().fg(c))
-            };
-            let mut cells = vec![numcell(i, playing, n), cell(&t.name, 1, name), cell(&t.artists, 2, artist)];
-            if wide {
-                cells.push(cell(&t.album, 3, album));
-            }
-            cells.push(Cell::from(Line::from(mmss(t.ms)).right_aligned()).style(time));
-            Row::new(cells)
-        })
-        .collect();
+    let row = |i: usize| {
+        if !tracks {
+            let l = &app.view.links[i];
+            return Row::new([
+                numcell(i, false, dim),
+                cell(&l.name, 1, Style::new().fg(th.text)),
+                cell(&l.sub, 2, Style::new().fg(th.sub)),
+            ]);
+        }
+        let t = &app.view.tracks[i];
+        let playing = Some(t.uri.as_str()) == playing_uri;
+        let [n, name, artist, album, time] = if playing {
+            let a = Style::new().fg(th.accent);
+            [a.bold(), a.bold(), a, a, a]
+        } else {
+            [th.dim, th.text, th.sub, th.dim, th.dim].map(|c| Style::new().fg(c))
+        };
+        let mut cells = vec![numcell(i, playing, n), cell(&t.name, 1, name), cell(&t.artists, 2, artist)];
+        if wide {
+            cells.push(cell(&t.album, 3, album));
+        }
+        cells.push(Cell::from(Line::from(mmss(t.ms)).right_aligned()).style(time));
+        Row::new(cells)
+    };
+    let disc_style = Style::new().fg(th.accent2).bold();
+    let mut rows: Vec<Row> = Vec::with_capacity(height);
+    let mut sel_line = None;
+    for r in off..total {
+        let Some(i) = shown.get(r) else { break };
+        // a header needs its first song under it
+        if rows.len() + 1 + above(r, off) > height {
+            break;
+        }
+        if above(r, off) == 2 {
+            rows.push(Row::new([""]));
+        }
+        if above(r, off) > 0 {
+            rows.push(Row::new([Cell::from(""), Cell::from(format!("disc {}", disc_of(r)))]).style(disc_style));
+        }
+        if sel == Some(r) {
+            sel_line = Some(rows.len());
+        }
+        rows.push(row(i));
+    }
     let header = Row::new(labels.iter().map(|&l| {
         let line = Line::from(l);
         Cell::from(if l == "time" { line.right_aligned() } else { line })
@@ -2623,7 +2657,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .row_highlight_style(hl(!pl_focus))
         .highlight_symbol(Line::from(bar_sym(!pl_focus)))
         .highlight_spacing(HighlightSpacing::Always);
-    let mut window = TableState::default().with_selected(sel.map(|s| s - off));
+    let mut window = TableState::default().with_selected(sel_line);
     f.render_stateful_widget(table, table_area, &mut window);
     *app.tr_state.offset_mut() = off;
     if total > height {
