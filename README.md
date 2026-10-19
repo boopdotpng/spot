@@ -127,3 +127,13 @@ Media keys and the macOS Now Playing widget work too.
   a rule across the bottom, and a vim-style status line last: it holds the search / find prompts,
   notices, key hints for the focused pane, the cursor position and the volume. `?` swaps it for
   a key cheatsheet.
+
+## Releasing
+
+Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), commit, then tag and push:
+
+    git tag v1.0.1 && git push origin master v1.0.1
+
+GitHub Actions builds Apple Silicon macOS and x86_64 Linux binaries and publishes the release
+with generated notes; `install.sh` always fetches the latest one. Pushes to master also build
+(no release) to keep the Rust cache warm; changes to only `.md` files skip CI.
