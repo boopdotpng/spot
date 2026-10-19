@@ -153,6 +153,7 @@ enum Msg {
     Tracks { view: u64, tracks: Vec<Track>, done: bool },
     Replace { view: u64, tracks: Arc<Vec<Track>> }, // fresh copy of a list that was shown from cache
     Links { view: u64, links: Vec<Link>, done: bool },
+    ReplaceLinks { view: u64, links: Vec<Link> }, // fresh copy of an artist's releases shown from cache
     Error(String),
     Media(MediaControlEvent),
     Relogin(bool), // true: waiting on browser login; false: it finished
@@ -477,9 +478,17 @@ fn pb_track(uri: &str, t: &PbTrack) -> Track {
     }
 }
 
-/// Resolve track uris to names in batches, streaming them to the view in order; returns them all.
+/// Resolve track uris to names in batches, streaming them to the view in order (unless it's
+/// showing a cached copy, `stream` false); returns them all.
 /// `dedupe` drops repeats of the same song (single + album versions in a discography).
-async fn send_tracks(session: &Session, uris: &[String], dedupe: bool, tx: &mpsc::Sender<Msg>, view: u64) -> Result<Vec<Track>, String> {
+async fn send_tracks(
+    session: &Session,
+    uris: &[String],
+    dedupe: bool,
+    stream: bool,
+    tx: &mpsc::Sender<Msg>,
+    view: u64,
+) -> Result<Vec<Track>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut all = vec![];
     for chunk in uris.chunks(200) {
@@ -490,7 +499,9 @@ async fn send_tracks(session: &Session, uris: &[String], dedupe: bool, tx: &mpsc
             .filter(|t| !dedupe || seen.insert((t.name.to_lowercase(), t.artists.to_lowercase())))
             .collect();
         all.extend_from_slice(&tracks);
-        let _ = tx.send(Msg::Tracks { view, tracks, done: false });
+        if stream {
+            let _ = tx.send(Msg::Tracks { view, tracks, done: false });
+        }
     }
     Ok(all)
 }
@@ -508,7 +519,7 @@ async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::Send
         .filter_map(|u| u.to_uri().ok())
         .collect();
     if cached.is_empty() {
-        return send_tracks(&session, &uris, false, tx, view).await.map(Some);
+        return send_tracks(&session, &uris, false, true, tx, view).await.map(Some);
     }
     if uris.len() == cached.len() && uris.iter().zip(cached).all(|(u, t)| *u == t.uri) {
         return Ok(None);
@@ -548,8 +559,9 @@ async fn artist_albums(session: &Session, uri: &str) -> Result<Vec<String>, Stri
         .collect())
 }
 
-/// Album or artist (albums + singles/EPs, newest first) as a flat track list.
-async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
+/// Album or artist (albums + singles/EPs, newest first) as a flat track list. Like playlists,
+/// a cached copy may already be showing; it's replaced only if the fresh one differs.
+async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, cached: Arc<Vec<Track>>) {
     let res = async {
         let session = ready(sess).await?;
         let (albums, dedupe) = if uri.starts_with("spotify:artist:") {
@@ -557,8 +569,13 @@ async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) 
         } else {
             (vec![uri.clone()], false)
         };
-        let tracks = album_track_uris(&session, &albums).await?;
-        send_tracks(&session, &tracks, dedupe, &tx, view).await.map(drop)
+        let uris = album_track_uris(&session, &albums).await?;
+        let tracks = send_tracks(&session, &uris, dedupe, cached.is_empty(), &tx, view).await?;
+        save_tracks(&tracks_path(&uri_key(&uri)), &tracks);
+        if !cached.is_empty() && !same_uris(tracks.iter().map(|t| &t.uri), cached.iter().map(|t| &t.uri)) {
+            let _ = tx.send(Msg::Replace { view, tracks: Arc::new(tracks) });
+        }
+        Ok::<_, String>(())
     }
     .await;
     if let Err(e) = res {
@@ -568,7 +585,7 @@ async fn link_tracks(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) 
 }
 
 /// An artist's releases as openable album links.
-async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
+async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, cached: Vec<Link>) {
     use librespot_protocol::metadata::album::Type;
     let res = async {
         let session = ready(sess).await?;
@@ -594,8 +611,18 @@ async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: Stri
             .collect();
         // Newest release first, mixing albums, EPs and singles.
         links.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
-        let links = links.into_iter().map(|(_, l)| l).collect();
-        let _ = tx.send(Msg::Links { view, links, done: true });
+        let links: Vec<Link> = links.into_iter().map(|(_, l)| l).collect();
+        save_links(&releases_path(&uri), &links);
+        if cached.is_empty() {
+            let _ = tx.send(Msg::Links { view, links, done: true });
+        } else {
+            if !same_uris(links.iter().map(|l| &l.uri), cached.iter().map(|l| &l.uri))
+                || links.iter().zip(&cached).any(|(a, b)| a.name != b.name || a.sub != b.sub)
+            {
+                let _ = tx.send(Msg::ReplaceLinks { view, links });
+            }
+            let _ = tx.send(Msg::Links { view, links: vec![], done: true });
+        }
         Ok::<_, String>(())
     }
     .await;
@@ -660,6 +687,7 @@ async fn search(api: Arc<Api>, tx: mpsc::Sender<Msg>, view: u64, q: String, kind
 
 fn cache_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
     base.join("spot")
@@ -667,6 +695,7 @@ fn cache_dir() -> PathBuf {
 
 fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
     base.join("spot")
@@ -1018,6 +1047,40 @@ fn lead_artist(t: &Track) -> &str {
 
 fn tracks_path(key: &str) -> PathBuf {
     cache_dir().join("lists").join(key)
+}
+
+/// Cache file name for an album / artist uri (`spotify:album:…` → `album_…`).
+fn uri_key(uri: &str) -> String {
+    uri.trim_start_matches("spotify:").replace(':', "_")
+}
+
+/// An artist's releases (the albums & singles page), one `uri, single, name, sub` per line.
+fn releases_path(uri: &str) -> PathBuf {
+    cache_dir().join("releases").join(uri_key(uri))
+}
+
+fn same_uris<'a>(a: impl ExactSizeIterator<Item = &'a String>, b: impl ExactSizeIterator<Item = &'a String>) -> bool {
+    a.len() == b.len() && a.zip(b).all(|(x, y)| x == y)
+}
+
+fn read_links(path: &std::path::Path) -> Vec<Link> {
+    let s = fs::read_to_string(path).unwrap_or_default();
+    s.lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t');
+            let (uri, single, name, sub) = (f.next()?, f.next()?, f.next()?, f.next()?);
+            Some(Link { uri: uri.into(), single: single == "1", name: name.into(), sub: sub.into() })
+        })
+        .collect()
+}
+
+fn save_links(path: &std::path::Path, links: &[Link]) {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for l in links {
+        let _ = writeln!(s, "{}\t{}\t{}\t{}", l.uri, l.single as u8, clean(&l.name), clean(&l.sub));
+    }
+    write_atomic(path, &s);
 }
 
 fn last_path() -> PathBuf {
@@ -1376,7 +1439,10 @@ impl App {
     fn open_album(&mut self, uri: String, title: String, want: Option<String>) {
         let mut v = self.new_view(uri.clone(), title, Kind::Tracks);
         v.want = want;
-        self.rt.spawn(link_tracks(self.sess.subscribe(), self.tx.clone(), v.id, uri));
+        v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
+        v.loading = v.tracks.is_empty();
+        let cached = v.tracks.clone();
+        self.rt.spawn(link_tracks(self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
         self.show(v, true);
         self.focus = Focus::Tracks;
     }
@@ -1393,9 +1459,15 @@ impl App {
         v.filter = self.releases;
         let (s, tx, id) = (self.sess.subscribe(), self.tx.clone(), v.id);
         if self.artist_songs {
-            self.rt.spawn(link_tracks(s, tx, id, uri));
+            v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
+            v.loading = v.tracks.is_empty();
+            self.rt.spawn(link_tracks(s, tx, id, uri, v.tracks.clone()));
         } else {
-            self.rt.spawn(artist_releases(s, tx, id, uri));
+            let cached = read_links(&releases_path(&uri));
+            v.loading = cached.is_empty();
+            v.links = cached.iter().filter(|l| v.filter.keeps(l)).cloned().collect();
+            v.releases = cached.clone();
+            self.rt.spawn(artist_releases(s, tx, id, uri, cached));
         }
         v
     }
@@ -2877,6 +2949,16 @@ fn init_log() {
 }
 
 fn main() {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("clean") => return clean_cache(),
+        Some(a) => {
+            let ok = matches!(a, "-h" | "--help" | "help");
+            let usage = "usage: spot          start\n       spot clean    clear cached songs, lists and releases (keeps login)";
+            if ok { println!("{usage}") } else { eprintln!("spot: unknown argument '{a}'\n{usage}") }
+            std::process::exit(if ok { 0 } else { 2 });
+        }
+    }
     init_log();
     let ui = std::thread::spawn(|| {
         if let Err(e) = run() {
@@ -2894,6 +2976,31 @@ fn main() {
     let _ = ui.join();
 }
 
+/// `spot clean`: drop everything that's only a cache. Login, settings, the resume point and
+/// unsent scrobbles stay.
+fn clean_cache() {
+    fn size(p: &std::path::Path) -> u64 {
+        match fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => fs::read_dir(p).into_iter().flatten().flatten().map(|e| size(&e.path())).sum(),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
+    let dir = cache_dir();
+    let mut freed = 0;
+    for name in ["audio", "lists", "releases", "playlists"] {
+        let p = dir.join(name);
+        let n = size(&p);
+        let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
+        match r {
+            Ok(()) => freed += n,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => eprintln!("spot: couldn't remove {}: {e}", p.display()),
+        }
+    }
+    println!("Cleared {:.1} MB of cache from {}.", freed as f64 / 1e6, dir.display());
+}
+
 fn run() -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -2904,7 +3011,12 @@ fn run() -> Result<(), String> {
 
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let cache = Cache::new(Some(&dir), Some(&dir), None, None).map_err(|e| e.to_string())?;
+    // Played songs are kept (encrypted, as streamed) so replays start instantly and skip the
+    // network, least recently played dropped first past the limit: 1 GB, SPOT_AUDIO_CACHE_GB to change, 0 = off.
+    let audio_gb: f64 = std::env::var("SPOT_AUDIO_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let audio = (audio_gb > 0.0).then(|| dir.join("audio"));
+    let limit = audio.as_ref().map(|_| (audio_gb * 1e9) as u64);
+    let cache = Cache::new(Some(dir.clone()), Some(dir.clone()), audio, limit).map_err(|e| e.to_string())?;
     let refresh_path = dir.join("refresh_token");
 
     let redirect = std::env::var("SPOT_REDIRECT").unwrap_or_else(|_| REDIRECT.into());
@@ -3178,6 +3290,24 @@ fn run() -> Result<(), String> {
                     if app.tr_state.selected().is_none() && !app.view.links.is_empty() {
                         app.tr_state.select(Some(0));
                     }
+                }
+                Msg::ReplaceLinks { view, links } => {
+                    let keep = (view == app.view.id)
+                        .then(|| app.selected_track().and_then(|i| app.view.links.get(i)).map(|l| l.uri.clone()))
+                        .flatten();
+                    let Some(v) = app.view_mut(view) else { continue };
+                    let f = v.filter;
+                    v.links = links.iter().filter(|l| f.keeps(l)).cloned().collect();
+                    v.releases = links;
+                    if view != app.view.id {
+                        continue;
+                    }
+                    app.refilter();
+                    let sel = keep
+                        .and_then(|u| app.view.links.iter().position(|l| l.uri == u))
+                        .or(app.tr_state.selected())
+                        .map(|s| s.min(app.shown().len().saturating_sub(1)));
+                    app.tr_state.select(sel);
                 }
                 Msg::Error(e) => {
                     log::error!("{e}");

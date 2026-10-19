@@ -111,6 +111,13 @@ Media keys and the macOS Now Playing widget work too.
 - **Startup**: playlists, Liked Songs and playlist contents are cached in `~/.cache/spot`, so
   they show instantly and refresh in the background (usually one request to confirm Liked Songs
   is current). The audio session connects in the background too.
+- **Albums & artists** you've opened before (track lists and releases) also show instantly from
+  the cache and refresh in the background.
+- **Audio cache**: played songs are kept in `~/.cache/spot/audio` (as streamed, encrypted), so
+  replaying them starts instantly without the network. Capped at 1 GB, least recently played
+  dropped first; set `SPOT_AUDIO_CACHE_GB` to change the cap (`0` turns it off).
+- **`spot clean`** clears the caches (songs, playlist / album / artist lists) and prints how much
+  it freed. Login, settings, the resume point and unsent scrobbles are kept.
 - **Resume**: quitting saves the queue, shuffle/repeat and position; next launch shows that song
   paused and preloads it once connected, so `space` starts it right away.
 - **Theme**: picks a light or dark palette from the terminal's background color at startup
