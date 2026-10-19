@@ -6,25 +6,23 @@ Needs Spotify Premium. macOS and Linux.
 
 ## Install
 
-Needs a Rust toolchain (https://rustup.rs).
+Prebuilt binaries for macOS (Apple Silicon, Intel) and Linux (x86_64, arm64):
 
-    git clone https://github.com/boopdotpng/spot
-    cd spot
-    cargo build --release --locked
+    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh
 
-Then put `target/release/spot` on your `PATH`:
+It installs to `~/.local/bin/spot` (set `SPOT_INSTALL_DIR` to change). Run it again to update.
 
-    # macOS: rm first, overwriting a binary in place makes macOS kill it (stale code signature)
-    rm -f ~/.cargo/bin/spot && cp target/release/spot ~/.cargo/bin/
-    # Linux
-    cp target/release/spot ~/.local/bin/
+Or build from source with cargo (needs a Rust toolchain, https://rustup.rs):
+
+    cargo install --locked --git https://github.com/boopdotpng/spot
 
 Use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to build
 with vergen 9.1.
 
 ### Linux dependencies
 
-ALSA, OpenSSL and D-Bus headers (audio, HTTPS, and MPRIS media keys):
+ALSA, OpenSSL and D-Bus (audio, HTTPS, and MPRIS media keys). The prebuilt binary needs the
+runtime libraries (usually already installed); building from source needs the headers:
 
     # Debian / Ubuntu
     sudo apt install build-essential pkg-config libasound2-dev libssl-dev libdbus-1-dev
