@@ -6,13 +6,13 @@ Needs Spotify Premium. macOS and Linux.
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon, Intel) and Linux (x86_64, arm64):
+Prebuilt binaries for Apple Silicon macOS and x86_64 Linux:
 
     curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh
 
 It installs to `~/.local/bin/spot` (set `SPOT_INSTALL_DIR` to change). Run it again to update.
 
-Or build from source with cargo (needs a Rust toolchain, https://rustup.rs):
+On anything else (Intel Macs, ARM Linux), or to build from source, use cargo (needs a Rust toolchain, https://rustup.rs):
 
     cargo install --locked --git https://github.com/boopdotpng/spot
 

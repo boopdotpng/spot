@@ -3,19 +3,17 @@
 # SPOT_INSTALL_DIR overrides where it goes (default ~/.local/bin).
 set -eu
 
-case "$(uname -s)" in
-  Darwin) os=apple-darwin ;;
-  Linux) os=unknown-linux-gnu ;;
-  *) echo "spot: unsupported OS $(uname -s) (macOS and Linux only)" >&2; exit 1 ;;
-esac
-case "$(uname -m)" in
-  arm64 | aarch64) arch=aarch64 ;;
-  x86_64 | amd64) arch=x86_64 ;;
-  *) echo "spot: unsupported CPU $(uname -m)" >&2; exit 1 ;;
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Linux-x86_64 | Linux-amd64) target=x86_64-unknown-linux-gnu ;;
+  *)
+    echo "spot: no prebuilt binary for $(uname -s) $(uname -m) (only Apple Silicon macOS and x86_64 Linux)" >&2
+    echo "build it instead: cargo install --locked --git https://github.com/boopdotpng/spot" >&2
+    exit 1 ;;
 esac
 
 dir="${SPOT_INSTALL_DIR:-$HOME/.local/bin}"
-url="https://github.com/boopdotpng/spot/releases/latest/download/spot-$arch-$os.tar.gz"
+url="https://github.com/boopdotpng/spot/releases/latest/download/spot-$target.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -32,6 +30,6 @@ case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo "note: $dir is not on your PATH; add it, e.g. echo 'export PATH=\"$dir:\$PATH\"' >> ~/.zshrc" ;;
 esac
-if [ "$os" = unknown-linux-gnu ]; then
+if [ "$target" = x86_64-unknown-linux-gnu ]; then
   echo "linux: needs ALSA, OpenSSL 3 and D-Bus libraries (libasound2, libssl3, libdbus-1-3)"
 fi
