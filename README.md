@@ -93,6 +93,53 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 
 Media keys and the macOS Now Playing widget work too.
 
+## Command line
+
+Only one spot plays at a time; starting a second one says so. Instead, control the running one
+from any terminal, script or agent (an LLM can drive it from `spot help` alone):
+
+    spot search daft punk            # songs (--albums, --artists, --playlists; -n 20), numbered, with uris
+    spot play 1                      # the first result of the last search
+    spot play spotify:track:…        # plays now; the queue carries on after it
+    spot play spotify:album:…        # album / artist / playlist: replaces the queue (--from <song uri>, --show)
+    spot play liked                  # or one of your playlists by name
+    spot pause | play | toggle | next | prev
+    spot seek 1:30 | +10 | -10
+    spot vol 60 | +10 | -10
+    spot shuffle [on|off] · spot repeat [off|all|one]
+    spot queue                       # what's next; `spot queue add <uri>…` plays songs next
+    spot status · spot playlists
+
+Spotify's field filters work in searches: `spot search 'track:one more time artist:daft punk'`,
+`spot search 'artist:radiohead year:1997' --albums`.
+`play` doesn't search: `spot search` first, then play a result by its number (`spot play 3`,
+`spot queue add 2 5`) or uri. Spotify links work
+anywhere a uri does. Add `--json` for one JSON object per line. Exit code 3 means spot isn't running.
+
+`spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
+`end` (the queue ran out) and `ending`, sent 30 seconds (`--before`) before a song ends with
+what's next, so there's time to `spot queue add` something else. It works as a monitor target
+for agents. `spot wait ending` blocks until the next one and exits.
+
+### Claude Code
+
+The repo ships a skill (`.claude/skills/spot`) so Claude Code can play music for you. To use it
+in every project, copy it into your skills:
+
+    mkdir -p ~/.claude/skills && cp -r .claude/skills/spot ~/.claude/skills/
+
+### Without a window
+
+`spot start` starts the player in the background with no window and returns once it's ready,
+so a script or an agent (Claude Code's Bash tool, say) can start it and carry on. `spot quit`
+stops it, keeping the resume point like `q` does. Log in once by running `spot` in a terminal
+first. (`spot --headless` is the same player in the foreground, for running it as a launchd or
+systemd service.) Media keys and Now Playing work headless too.
+
+The CLI and the keys drive the same player, so they work at the same time: the window shows what
+the CLI changed, and `--show` also opens the list it played. It talks to spot over a Unix socket
+at `~/.cache/spot/sock`.
+
 ## Notes
 
 - **Shuffle** is a uniform Fisher–Yates shuffle of the whole list (OS-seeded ChaCha RNG):

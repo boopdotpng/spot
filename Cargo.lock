@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "spot"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "env_logger",
  "librespot-core",
@@ -3785,6 +3785,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

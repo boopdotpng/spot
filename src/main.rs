@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fs,
+    io::IsTerminal,
     path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
@@ -29,6 +30,8 @@ use ratatui::{
 use serde_json::Value;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
+mod ctl;
+
 // Each user brings their own Spotify developer app (the shared librespot client id is permanently
 // rate limited): SPOT_CLIENT_ID, else ~/.config/spot/client_id, else asked for on first run.
 // SPOT_REDIRECT overrides the redirect, which must be registered on the app.
@@ -46,6 +49,7 @@ const API: &str = "https://api.spotify.com/v1";
 /// n/p only loads the track once skipping has paused this long, so mashing next doesn't fetch
 /// (and ask Spotify for an audio key for) every track passed over; too many gets keys refused.
 const SKIP_SETTLE: Duration = Duration::from_millis(500);
+const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal to log in";
 
 // ---------- data ----------
 
@@ -163,6 +167,10 @@ enum Msg {
     Relogin(bool), // true: waiting on browser login; false: it finished
     Connected(Result<Session, String>),
     Status(String),
+    Ctl(Value, ctl::Reply), // a `spot <command>` request
+    Loaded { reply: ctl::Reply, then: ctl::Then, uri: String, res: Result<(String, Vec<Track>), String> },
+    Watch(ctl::Watcher),
+    Quit, // SIGTERM / SIGINT, or `spot quit`
 }
 
 /// The audio session, None until it has connected (in the background, so startup doesn't wait).
@@ -719,6 +727,9 @@ fn client_id(redirect: &str) -> Result<String, String> {
     if let Some(id) = fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         return Ok(id);
     }
+    if !std::io::stdin().is_terminal() {
+        return Err(NOT_SET_UP.into());
+    }
     println!("spot needs your own Spotify app (one-time setup, requires Premium):");
     println!("  1. Open https://developer.spotify.com/dashboard and create an app.");
     println!("  2. Add this redirect URI: {redirect}");
@@ -871,6 +882,10 @@ fn lastfm_setup(rt: &tokio::runtime::Runtime, http: &reqwest::Client, redirect: 
     let path = cache_dir().join("lastfm_session");
     let sk = match fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         Some(sk) => sk,
+        None if !std::io::stdin().is_terminal() => {
+            log::warn!("last.fm isn't connected yet, and there's no terminal to ask in; not scrobbling");
+            return None;
+        }
         None => {
             let r = lastfm_token(&key, redirect).and_then(|token| {
                 let v = rt
@@ -1381,6 +1396,9 @@ struct App {
     help: bool,                 // key help on the bottom line
     lastfm: Option<Arc<LastFm>>,
     listen: Option<Listen>, // current play, for scrobbling (only with lastfm)
+    plays: u64,             // bumped per song started, so `spot watch` can tell plays apart
+    finished: bool,         // the queue ran out
+    ctl: ctl::State,
     quit: bool,
 }
 
@@ -1630,6 +1648,8 @@ impl App {
         self.loaded = false;
         self.pos_ms = pos_ms;
         self.pos_at = None;
+        self.plays += 1;
+        self.finished = false;
     }
 
     /// Scrobble the play that just ended, if it counts.
@@ -1798,18 +1818,55 @@ impl App {
         if self.view.kind != Kind::Tracks || self.view.tracks.is_empty() {
             return;
         }
-        let mut q = Queue {
+        let q = Queue {
             key: self.view.key.clone(),
             name: self.view.title.clone(),
             tracks: self.view.tracks.clone(),
             order: vec![],
             pos: 0,
         };
+        self.play_queue(q, start);
+    }
+
+    /// Make `q` the queue and play it from `start` (None: the top, or a random song if shuffling).
+    fn play_queue(&mut self, mut q: Queue, start: Option<usize>) {
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
         self.retried = false;
         self.load_at = None;
         self.play_current();
+    }
+
+    /// What plays after the current song, if that's known (a shuffled wrap picks a new order later).
+    fn up_next(&self) -> Option<&Track> {
+        let q = self.queue.as_ref()?;
+        let p = match self.repeat {
+            Repeat::One => q.pos,
+            _ if q.pos + 1 < q.order.len() => q.pos + 1,
+            Repeat::All if !self.shuffle => 0,
+            _ => return None,
+        };
+        q.tracks.get(q.order[p])
+    }
+
+    /// Open the list that's playing, on the playing song.
+    fn show_queue(&mut self) {
+        let Some(q) = &self.queue else { return };
+        let (idx, key, name, tracks) = (q.idx(), q.key.clone(), q.name.clone(), q.tracks.clone());
+        let mut v = self.new_view(key, name, Kind::Tracks);
+        v.tracks = tracks;
+        v.loading = false;
+        self.show(v, true);
+        self.tr_state = TableState::default().with_selected(idx);
+        self.focus = Focus::Tracks;
+    }
+
+    fn cycle_repeat(&mut self) {
+        self.repeat = match self.repeat {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
     }
 
     fn skip(&mut self, d: isize) {
@@ -1833,6 +1890,7 @@ impl App {
             self.player.stop();
             self.playing = false;
             self.want_play = false;
+            self.finished = true;
             return;
         }
         q.pos = n as usize;
@@ -1902,14 +1960,7 @@ impl App {
                 self.pos_at = self.playing.then(Instant::now);
             }
             PlayerEvent::TimeToPreloadNextTrack { track_id, .. } if is_cur(&track_id, &self.cur) => {
-                let next = self.queue.as_ref().and_then(|q| match self.repeat {
-                    Repeat::One => Some(q.pos),
-                    _ if q.pos + 1 < q.order.len() => Some(q.pos + 1),
-                    Repeat::All if !self.shuffle => Some(0), // shuffled wrap picks a new order later
-                    _ => None,
-                });
-                if let Some(q) = &self.queue
-                    && let Some(t) = next.map(|p| &q.tracks[q.order[p]])
+                if let Some(t) = self.up_next()
                     && let Ok(u) = SpotifyUri::from_uri(&t.uri)
                 {
                     self.player.preload(u);
@@ -2084,13 +2135,7 @@ impl App {
             }
             KeyCode::Char(' ') => self.toggle(),
             KeyCode::Char('s') => self.toggle_shuffle(),
-            KeyCode::Char('r') => {
-                self.repeat = match self.repeat {
-                    Repeat::Off => Repeat::All,
-                    Repeat::All => Repeat::One,
-                    Repeat::One => Repeat::Off,
-                }
-            }
+            KeyCode::Char('r') => self.cycle_repeat(),
             KeyCode::Char('P') => self.play_from_view(None),
             KeyCode::Char('a') => self.goto_album(),
             KeyCode::Char('A') => self.goto_artist(),
@@ -2103,18 +2148,7 @@ impl App {
             KeyCode::Char(',') => self.seek_by(SeekDirection::Backward, Duration::from_secs(10)),
             KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(3277),
             KeyCode::Char('-') => self.set_volume(-3277),
-            KeyCode::Char('o') => {
-                // jump to what's playing
-                if let Some(q) = &self.queue {
-                    let (idx, key, name, tracks) = (q.idx(), q.key.clone(), q.name.clone(), q.tracks.clone());
-                    let mut v = self.new_view(key, name, Kind::Tracks);
-                    v.tracks = tracks;
-                    v.loading = false;
-                    self.show(v, true);
-                    self.tr_state = TableState::default().with_selected(idx);
-                    self.focus = Focus::Tracks;
-                }
-            }
+            KeyCode::Char('o') => self.show_queue(),
             KeyCode::Enter => match self.focus {
                 Focus::Playlists => {
                     if let Some(i) = self.pl_state.selected() {
@@ -2969,7 +3003,13 @@ fn parse_input(b: &[u8]) -> Vec<Msg> {
     out
 }
 
+/// Running without the window (`spot --headless`): nothing draws or reads the terminal.
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn restore_terminal() {
+    if HEADLESS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     use std::io::Write;
     let _ = std::io::stdout().write_all(b"\x1b[?2031l");
     ratatui::restore();
@@ -3008,19 +3048,37 @@ fn init_log() {
 }
 
 fn main() {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let headless = args.first().is_some_and(|a| a == "--headless");
+    match args.iter().find(|a| *a != "--json").map(String::as_str) {
         None => {}
+        Some("--headless") if args.len() == 1 => {}
         Some("clean") => return clean_cache(),
+        Some(c) if ctl::COMMANDS.contains(&c) => std::process::exit(ctl::client(args)),
         Some(a) => {
             let ok = matches!(a, "-h" | "--help" | "help");
-            let usage = "usage: spot          start\n       spot clean    clear cached songs, lists and releases (keeps login)";
-            if ok { println!("{usage}") } else { eprintln!("spot: unknown argument '{a}'\n{usage}") }
+            if ok { println!("{}", ctl::USAGE) } else { eprintln!("spot: unknown argument '{a}'\n\n{}", ctl::USAGE) }
             std::process::exit(if ok { 0 } else { 2 });
         }
     }
+    // One player at a time: a second would fight the first over the audio session and the
+    // resume point. The lock goes when the process does, crash or not.
+    let _ = fs::create_dir_all(cache_dir());
+    let _lock = match fs::File::create(cache_dir().join("lock")) {
+        Ok(f) => match f.try_lock() {
+            Ok(()) => Some(f),
+            Err(fs::TryLockError::WouldBlock) => {
+                eprintln!("spot is already running (in another terminal, or headless). Control it from here with `spot status`, `spot play …` (see `spot help`).");
+                std::process::exit(1);
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
     init_log();
-    let ui = std::thread::spawn(|| {
-        if let Err(e) = run() {
+    HEADLESS.store(headless, std::sync::atomic::Ordering::Relaxed);
+    let ui = std::thread::spawn(move || {
+        if let Err(e) = run(headless) {
             log::error!("exiting: {e}");
             restore_terminal();
             eprintln!("spot: {e}");
@@ -3060,7 +3118,7 @@ fn clean_cache() {
     println!("Cleared {:.1} MB of cache from {}.", freed as f64 / 1e6, dir.display());
 }
 
-fn run() -> Result<(), String> {
+fn run(headless: bool) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -3087,8 +3145,10 @@ fn run() -> Result<(), String> {
 
     // Web API token: refreshed lazily from the saved refresh token; browser login only the first time.
     let saved = fs::read_to_string(&refresh_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let interactive = std::io::stdin().is_terminal();
     let tok = match saved {
         Some(refresh) => Tok { access: String::new(), refresh, exp: Instant::now(), failed_login: None },
+        None if !interactive => return Err(NOT_SET_UP.into()),
         None => {
             println!("Log in to Spotify in your browser (opening now)…");
             let t = rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}"))?;
@@ -3101,6 +3161,9 @@ fn run() -> Result<(), String> {
 
     // The audio session connects in the background unless this is the first run.
     let first_session = if cache.credentials().is_none() {
+        if !interactive {
+            return Err(NOT_SET_UP.into());
+        }
         println!("One more browser approval for the audio session…");
         Some(rt.block_on(approve_session(&cache))?)
     } else {
@@ -3109,6 +3172,7 @@ fn run() -> Result<(), String> {
     let session = first_session.clone().unwrap_or_else(|| Session::new(SessionConfig::default(), Some(cache.clone())));
 
     let (tx, rx) = mpsc::channel::<Msg>();
+    ctl::serve(tx.clone());
     let http = reqwest::Client::new();
     let lastfm = lastfm_setup(&rt, &http, &redirect, tx.clone());
     if let Some(fm) = lastfm.clone() {
@@ -3141,7 +3205,9 @@ fn run() -> Result<(), String> {
     rt.spawn(load_playlists(api.clone(), tx.clone()));
 
     // probe light/dark before anything reads stdin
-    probe_terminal();
+    if !headless {
+        probe_terminal();
+    }
     let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
     if let Some(i) = FAMILIES.iter().position(|(name, ..)| *name == theme.trim()) {
         FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
@@ -3157,10 +3223,27 @@ fn run() -> Result<(), String> {
         }
     });
 
+    // quit cleanly (saving the resume point) when killed
+    let stx = tx.clone();
+    rt.spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else { return };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        let _ = stx.send(Msg::Quit);
+    });
+
     let ktx = tx.clone();
-    std::thread::spawn(move || read_input(ktx));
     let rtx = tx.clone();
+    if !headless {
+        std::thread::spawn(move || read_input(ktx));
+    }
     std::thread::spawn(move || {
+        if headless {
+            return;
+        }
         // we read stdin ourselves, so nothing reports SIGWINCH; poll the size instead
         let mut last = ratatui::crossterm::terminal::size().ok();
         loop {
@@ -3228,6 +3311,9 @@ fn run() -> Result<(), String> {
         help: false,
         lastfm,
         listen: None,
+        plays: 0,
+        finished: false,
+        ctl: ctl::State::default(),
         quit: false,
     };
 
@@ -3236,14 +3322,16 @@ fn run() -> Result<(), String> {
     }
     app.open_playlist(0);
 
-    let mut term = ratatui::init();
-    if std::env::var_os("SPOT_THEME").is_none() {
+    let mut term = (!headless).then(ratatui::init);
+    if !headless && std::env::var_os("SPOT_THEME").is_none() {
         // color scheme reports: subscribe to changes (2031) and ask for the current one (996)
         use std::io::Write;
         let _ = std::io::stdout().write_all(b"\x1b[?2031h\x1b[?996n").and_then(|_| std::io::stdout().flush());
     }
     while !app.quit {
-        term.draw(|f| draw(f, &mut app)).map_err(|e| e.to_string())?;
+        if let Some(term) = &mut term {
+            term.draw(|f| draw(f, &mut app)).map_err(|e| e.to_string())?;
+        }
         // Only wake up once a second while playing (progress clock); otherwise sleep until input.
         let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
         // wake up in time to take the popup / volume meter down
@@ -3390,9 +3478,15 @@ fn run() -> Result<(), String> {
                         app.status.clear();
                     }
                 }
+                Msg::Ctl(req, reply) => app.on_ctl(req, reply),
+                Msg::Loaded { reply, then, uri, res } => app.on_loaded(reply, then, uri, res),
+                Msg::Watch(w) => app.watch(w),
+                Msg::Quit => app.quit = true,
             }
         }
+        app.tick_watchers();
     }
+    ctl::unlink();
     restore_terminal();
     app.save_last();
     app.player.stop();
