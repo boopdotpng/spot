@@ -70,9 +70,9 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | key | action |
 |---|---|
 | `/` | search (`tab` in the prompt cycles songs / albums / artists) |
-| `enter` | play song (queues the rest of the list) · open album / artist |
+| `enter` | play song (the rest of the list plays after it) · open album / artist |
 | `ctrl+t` | next theme (desert, lagoon, moss, iris, blossom, mint, sorbet); remembered, light/dark still follows the terminal |
-| `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list as the queue, `esc` closes |
+| `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
 | `space` | pause / resume (with a short volume fade); right after launch, resumes what was playing at quit |
 | `s` | shuffle on/off |
 | `r` | repeat: off → repeat list → repeat one song |
@@ -81,6 +81,8 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | `,` / `.` | seek −10s / +10s |
 | `+` / `-` | volume |
 | `o` | jump to the list that's playing |
+| `e` | add the highlighted song to the queue (queued songs play before the list carries on) |
+| `Q` | show the queue: `enter` plays a song from it now, `x` removes one |
 | `a` / `A` | go to the album / artist of the highlighted song (or the playing one, from the playlist pane) |
 | `v` | on an artist page: all songs ↔ albums & singles (remembered) |
 | `f` | on an artist's releases: all → albums (incl. EPs) → singles (remembered) |
@@ -100,25 +102,31 @@ from any terminal, script or agent (an LLM can drive it from `spot help` alone):
 
     spot search daft punk            # songs (--albums, --artists, --playlists; -n 20), numbered, with uris
     spot play 1                      # the first result of the last search
-    spot play spotify:track:…        # plays now; the queue carries on after it
-    spot play spotify:album:…        # album / artist / playlist: replaces the queue (--from <song uri>, --show)
+    spot play spotify:track:…        # plays now, then the queue and the list carry on
+    spot play spotify:album:…        # album / artist / playlist: replaces the list (--from <song uri>, --show)
     spot play liked                  # or one of your playlists by name
     spot pause | play | toggle | next | prev
     spot seek 1:30 | +10 | -10
     spot vol 60 | +10 | -10
     spot shuffle [on|off] · spot repeat [off|all|one]
-    spot queue                       # what's next; `spot queue add <uri>…` plays songs next
+    spot queue                       # the queue, then the list's next songs
+    spot queue 2 5                   # add results, uris, or a whole album / playlist to the queue (= `queue add`)
+    spot queue rm 1 · spot queue clear
     spot status · spot playlists
 
 Spotify's field filters work in searches: `spot search 'track:one more time artist:daft punk'`,
 `spot search 'artist:radiohead year:1997' --albums`.
 `play` doesn't search: `spot search` first, then play a result by its number (`spot play 3`,
-`spot queue add 2 5`) or uri. Spotify links work
+`spot queue add 2 5`) or uri.
+
+The queue is spot's own, like Spotify's: songs you add play in order before the list you're
+playing carries on, and it's kept across restarts. `spot play <song>` plays a song right away
+and then goes on with the queue. Spotify links work
 anywhere a uri does. Add `--json` for one JSON object per line. Exit code 3 means spot isn't running.
 
 `spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
-`end` (the queue ran out) and `ending`, sent 30 seconds (`--before`) before a song ends with
-what's next, so there's time to `spot queue add` something else. It works as a monitor target
+`end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
+what's next, so there's time to `spot queue add` something. It works as a monitor target
 for agents. `spot wait ending` blocks until the next one and exits.
 
 ### Claude Code
@@ -166,7 +174,7 @@ at `~/.cache/spot/sock`.
   dropped first; set `SPOT_AUDIO_CACHE_GB` to change the cap (`0` turns it off).
 - **`spot clean`** clears the caches (songs, playlist / album / artist lists) and prints how much
   it freed. Login, settings, the resume point and unsent scrobbles are kept.
-- **Resume**: quitting saves the queue, shuffle/repeat and position; next launch shows that song
+- **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song
   paused and preloads it once connected, so `space` starts it right away.
 - **Theme**: picks a light or dark palette from the terminal's background color at startup
   (OSC 11; Ghostty, iTerm2, kitty, WezTerm, …) and follows live changes where the terminal

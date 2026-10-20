@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "spot"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "env_logger",
  "librespot-core",

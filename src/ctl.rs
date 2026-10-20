@@ -18,7 +18,7 @@ pub type Reply = mpsc::Sender<Value>;
 /// What a background lookup was for, carried back to the main loop with its tracks.
 pub enum Then {
     Play { from: Option<String>, show: bool },
-    Queue,
+    Queue { shown: usize },
 }
 
 /// A `spot watch` / `spot wait` connection, sent events until it hangs up.
@@ -34,6 +34,25 @@ pub struct State {
     watchers: Vec<Watcher>,
     plays: u64,
     playing: bool,
+}
+
+/// True once no player holds the lock: after a quit, the old one may still be finishing up
+/// (sending a scrobble) for a moment after its socket is gone.
+fn lock_free() -> bool {
+    let f = fs::OpenOptions::new().create(true).truncate(false).write(true).open(cache_dir().join("lock"));
+    f.is_ok_and(|f| f.try_lock().is_ok())
+}
+
+/// Wait up to `secs` for `ok`.
+fn wait_for(secs: u64, ok: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while !ok() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    true
 }
 
 fn sock_path() -> PathBuf {
@@ -226,6 +245,7 @@ async fn search(api: Arc<Api>, q: String, ty: &'static str, n: usize) -> Value {
 impl App {
     pub fn on_ctl(&mut self, req: Value, reply: Reply) {
         let s = |k: &str| req[k].as_str().map(String::from);
+        let shown = req["shown"].as_u64().unwrap_or(10) as usize;
         let none = || "nothing to play: start something with `spot play <uri>` (find one with `spot search`)".to_string();
         let res: Result<(), String> = match req["cmd"].as_str().unwrap_or("") {
             "status" => Ok(()),
@@ -248,7 +268,7 @@ impl App {
                 }
                 Ok(())
             }
-            "toggle" | "next" | "prev" if self.queue.is_none() => Err(none()),
+            "toggle" | "next" | "prev" if self.now().is_none() && self.upnext.is_empty() => Err(none()),
             "toggle" => {
                 self.toggle();
                 Ok(())
@@ -261,7 +281,7 @@ impl App {
                 self.prev();
                 Ok(())
             }
-            "seek" => match self.queue.as_ref().map(|q| q.tracks[q.idx()].ms) {
+            "seek" => match self.now().map(|t| t.ms) {
                 None => Err(none()),
                 Some(len) => {
                     let to = match (req["to_ms"].as_i64(), req["by_ms"].as_i64()) {
@@ -302,8 +322,26 @@ impl App {
                 Ok(())
             }
             "queue" => return void(reply.send(self.queue_json(req["n"].as_u64().unwrap_or(10) as usize))),
+            "queue_rm" => {
+                let mut ns: Vec<usize> = req["n"].as_array().into_iter().flatten().filter_map(Value::as_u64).map(|n| n as usize).collect();
+                let len = self.upnext.len();
+                if let Some(&bad) = ns.iter().find(|&&n| n == 0 || n > len) {
+                    return void(reply.send(err(format!("the queue has {}, so there's no {bad}", plural(len, "song")))));
+                }
+                ns.sort_unstable();
+                ns.dedup();
+                for n in ns.into_iter().rev() {
+                    self.dequeue(n - 1);
+                }
+                return void(reply.send(self.queue_json(shown)));
+            }
+            "queue_clear" => {
+                self.upnext.clear();
+                self.queue_changed();
+                return void(reply.send(self.queue_json(shown)));
+            }
             "queue_add" => match s("target") {
-                Some(t) => return self.load(t, Then::Queue, reply),
+                Some(t) => return self.load(t, Then::Queue { shown }, reply),
                 None => Err("queue add: which uri?".into()),
             },
             "search" => {
@@ -388,13 +426,17 @@ impl App {
             Ok(x) => x,
             Err(e) => return void(reply.send(err(e))),
         };
-        let res = match then {
-            // a single song plays now and the queue carries on after it
+        let shown = match then {
+            Then::Queue { shown } => shown,
+            Then::Play { .. } => 10,
+        };
+        let res: Result<(), String> = match then {
+            // a single song plays now, then the queue and the list carry on
             Then::Play { show, .. } if uri.starts_with("spotify:track:") => {
-                if !self.insert_next(&tracks) {
+                if self.queue.is_none() {
                     self.play_queue(Queue { key: uri, name, tracks: Arc::new(tracks), order: vec![], pos: 0 }, Some(0));
-                } else if let Some(q) = &mut self.queue {
-                    q.pos += 1;
+                } else {
+                    self.queued = tracks.into_iter().next();
                     self.retried = false;
                     self.load_at = None;
                     self.play_current();
@@ -419,26 +461,19 @@ impl App {
                 }
                 Ok(())
             }
-            Then::Queue if self.insert_next(&tracks) => Ok(()),
-            Then::Queue => Err(format!("nothing is queued to add to: `spot play {uri}` instead")),
+            Then::Queue { .. } => {
+                self.enqueue(tracks);
+                Ok(())
+            }
         };
         let _ = reply.send(match res {
-            Ok(()) => self.queue_json(10),
+            Ok(()) => self.queue_json(shown),
             Err(e) => err(e),
         });
     }
 
-    /// Splice `tracks` in to play right after the current song. False if there's no queue.
-    fn insert_next(&mut self, tracks: &[Track]) -> bool {
-        let Some(q) = &mut self.queue else { return false };
-        let base = q.tracks.len();
-        Arc::make_mut(&mut q.tracks).extend_from_slice(tracks);
-        q.order.splice(q.pos + 1..q.pos + 1, base..base + tracks.len());
-        true
-    }
-
     fn snapshot(&self) -> Value {
-        let cur = self.queue.as_ref().and_then(|q| q.tracks.get(q.idx()).map(|t| (q, t)));
+        let cur = self.now();
         let repeat = match self.repeat {
             Repeat::Off => "off",
             Repeat::All => "all",
@@ -446,10 +481,12 @@ impl App {
         };
         json!({
             "ok": true,
-            "track": cur.map(|(_, t)| track_json(t)),
-            "position_ms": cur.map(|(_, t)| self.position().min(t.ms)),
+            "track": cur.map(track_json),
+            "position_ms": cur.map(|t| self.position().min(t.ms)),
             "playing": self.want_play && cur.is_some(),
-            "queue": cur.map(|(q, _)| {
+            "from_queue": self.queued.is_some(),
+            "queued": self.upnext.len(),
+            "list": self.queue.as_ref().map(|q| {
                 let name = if q.key == "liked" { "Liked Songs" } else { &q.name }; // not the sidebar's heart
                 json!({ "name": name, "uri": key_uri(&q.key), "pos": q.pos + 1, "len": q.order.len() })
             }),
@@ -462,9 +499,10 @@ impl App {
         })
     }
 
-    /// Status plus the next `n` songs in play order.
+    /// Status, the queue, and the list's next `n` songs after it.
     fn queue_json(&self, n: usize) -> Value {
         let mut v = self.snapshot();
+        v["queue"] = self.upnext.iter().map(track_json).collect::<Vec<_>>().into();
         let upcoming: Vec<Value> = self
             .queue
             .iter()
@@ -491,7 +529,7 @@ impl App {
         if self.ctl.watchers.is_empty() {
             return;
         }
-        let cur = self.queue.as_ref().and_then(|q| q.tracks.get(q.idx()));
+        let cur = self.now();
         let mut events = vec![];
         let with_track = |ev: &str| {
             json!({ "event": ev, "track": cur.map(track_json), "next": self.up_next().map(track_json) })
@@ -556,10 +594,10 @@ Control the running player, from any terminal, script or agent:
                              Spotify's field filters narrow it down:
                              spot search 'track:one more time artist:daft punk'
                              spot search 'artist:radiohead year:1997' --albums
-  spot play <uri>            a song plays now and the queue carries on after it; an album,
+  spot play <uri>            a song plays now, then the queue and the list carry on; an album,
                              artist (all songs) or playlist replaces the queue
                              (--from <song uri> starts there, --show opens it in the window)
-  spot play 3                the 3rd result of the last search (queue add takes numbers too)
+  spot play 3                the 3rd result of the last search (queue add takes these too)
   spot play liked            Liked Songs; `spot play <name>` plays one of your playlists
   spot play | pause | toggle
   spot next | prev
@@ -567,11 +605,14 @@ Control the running player, from any terminal, script or agent:
   spot vol [60 | +10 | -10]  volume in percent
   spot shuffle [on | off]    no argument toggles
   spot repeat [off | all | one]   no argument cycles
-  spot queue [-n 20]         what plays next
-  spot queue add <uri>...    play these next, in order, once the current song ends
+  spot queue [-n 20]         the queue, then what the list plays after it
+  spot queue [add] <uri>...  add to the end of the queue (`spot queue 2` = result 2) (songs play before the list carries on;
+                             an album or playlist queues all its songs)
+  spot queue rm 2 3          remove songs from the queue, by their number in `spot queue`
+  spot queue clear           empty the queue
   spot playlists             your playlists, with uris
   spot watch [--before 30]   a line per event as it happens: track (new song), playing,
-                             paused, end (queue ran out), ending (the song ends in 30s; says
+                             paused, end (nothing left to play), ending (the song ends in 30s; says
                              what's next, so there's time to `queue add` something else)
   spot wait <event> [--before 30]   wait for the next such event, print it, exit
 
@@ -599,7 +640,7 @@ fn uri_arg(a: &str) -> String {
         let uris: Vec<&str> = saved.lines().collect();
         return match n.checked_sub(1).and_then(|i| uris.get(i)) {
             Some(u) => u.to_string(),
-            None => usage(&format!("the last search had {} results, so there's no {n}", uris.len())),
+            None => usage(&format!("the last search had {}, so there's no {n}", plural(uris.len(), "result"))),
         };
     }
     let Some(rest) = a.strip_prefix("https://open.spotify.com/").or_else(|| a.strip_prefix("open.spotify.com/")) else {
@@ -650,6 +691,14 @@ pub fn client(args: Vec<String>) -> i32 {
         None => default,
     };
     let rest = |args: &[String]| (!args.is_empty()).then(|| args.join(" "));
+    // every queue command shows the queue after, so they all take -n
+    // `spot queue 1 3` is `spot queue add 1 3`
+    if cmd == "queue" && args.first().is_some_and(|a| !a.starts_with('-') && !matches!(a.as_str(), "add" | "rm" | "clear")) {
+        args.insert(0, "add".into());
+    }
+    // (after a change, just a peek at the list)
+    let edit = args.first().is_some_and(|a| matches!(a.as_str(), "add" | "rm" | "clear"));
+    let shown = if cmd == "queue" { num(&mut args, "-n", if edit { 3 } else { 10 }) } else { 10 };
 
     let req = match cmd.as_str() {
         "start" => return start(),
@@ -693,10 +742,9 @@ pub fn client(args: Vec<String>) -> i32 {
             if args.is_empty() {
                 usage("queue add: which uri?");
             }
-            // each lands right after the current song, so add them last to first
             let mut last = None;
-            for a in args.iter().rev() {
-                let res = match request(&json!({ "cmd": "queue_add", "target": uri_arg(a) })) {
+            for a in &args {
+                let res = match request(&json!({ "cmd": "queue_add", "target": uri_arg(a), "shown": shown })) {
                     Ok(r) => r,
                     Err(code) => return code,
                 };
@@ -707,7 +755,15 @@ pub fn client(args: Vec<String>) -> i32 {
             }
             return finish(&cmd, &last.unwrap(), json);
         }
-        "queue" => json!({ "cmd": "queue", "n": num(&mut args, "-n", 10) }),
+        "queue" if args.first().is_some_and(|a| a == "rm") => {
+            let ns: Vec<u64> = args[1..].iter().map(|a| a.parse().unwrap_or_else(|_| usage("queue rm: song numbers from `spot queue`"))).collect();
+            if ns.is_empty() {
+                usage("queue rm: which? (numbers from `spot queue`)");
+            }
+            json!({ "cmd": "queue_rm", "n": ns, "shown": shown })
+        }
+        "queue" if args.first().is_some_and(|a| a == "clear") => json!({ "cmd": "queue_clear", "shown": shown }),
+        "queue" => json!({ "cmd": "queue", "n": shown }),
         "search" => {
             let kinds = [("--tracks", "track"), ("--songs", "track"), ("--albums", "album"), ("--artists", "artist"), ("--playlists", "playlist")];
             let kind = kinds.iter().filter(|(f, _)| flag(&mut args, f)).map(|(_, k)| *k).last().unwrap_or("track");
@@ -751,6 +807,10 @@ fn start() -> i32 {
         eprintln!("spot: {NOT_SET_UP}");
         return 1;
     }
+    if !wait_for(5, lock_free) {
+        eprintln!("spot: another spot is still running (or shutting down); try again in a moment");
+        return 1;
+    }
     use std::{os::unix::process::CommandExt, process::Stdio};
     let exe = std::env::current_exe().unwrap_or_else(|_| "spot".into());
     let mut child = match std::process::Command::new(exe)
@@ -787,8 +847,8 @@ fn start() -> i32 {
     1
 }
 
-/// `spot quit`: ask the player to stop, then wait for its socket to go, so a `spot start`
-/// right after doesn't find the old one.
+/// `spot quit`: ask the player to stop, then wait until it has, so a `spot start` right after
+/// doesn't find the old one.
 fn quit() -> i32 {
     let conn = match connect() {
         Ok(c) => c,
@@ -796,16 +856,14 @@ fn quit() -> i32 {
     };
     send(&conn, &json!({ "cmd": "quit" }));
     let _ = BufReader::new(&conn).read_line(&mut String::new());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if UnixStream::connect(sock_path()).is_err() {
-            println!("spot quit");
-            return 0;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    // gone once it lets go of the lock (it may send a last scrobble first, up to 3s)
+    if wait_for(8, lock_free) {
+        println!("spot quit");
+        0
+    } else {
+        eprintln!("spot: asked it to quit, but it's still running");
+        1
     }
-    eprintln!("spot: asked it to quit, but it's still running");
-    1
 }
 
 fn connect() -> Result<UnixStream, i32> {
@@ -912,12 +970,22 @@ fn status_text(v: &Value) -> String {
     } else {
         let mark = if v["playing"] == true { "▶" } else { "‖" };
         out.push(format!("{mark} {}  {} / {}", song(t), ms(&v["position_ms"]), ms(&t["ms"])));
-        out.push(format!("  {}  ·  {}", t["album"].as_str().unwrap_or(""), t["uri"].as_str().unwrap_or("")));
+        out.push(format!("  album: {}  ·  {}", t["album"].as_str().unwrap_or(""), t["uri"].as_str().unwrap_or("")));
     }
     let mut modes = vec![];
-    if let Some(q) = v["queue"].as_object() {
+    let list = v["list"].as_object().map(|q| {
         let uri = q["uri"].as_str().filter(|u| u.starts_with("spotify:")).map(|u| format!(" {u}")).unwrap_or_default();
-        modes.push(format!("from {}{uri} ({} of {})", q["name"].as_str().unwrap_or("?"), q["pos"], q["len"]));
+        format!("{}{uri} ({} of {})", q["name"].as_str().unwrap_or("?"), q["pos"], q["len"])
+    });
+    match (v["from_queue"] == true, list) {
+        (true, Some(l)) => modes.push(format!("from the queue, then {l}")),
+        (true, None) => modes.push("from the queue".into()),
+        (false, Some(l)) if !t.is_null() => modes.push(format!("from {l}")),
+        _ => {}
+    }
+    match v["queued"].as_u64() {
+        Some(0) | None => {}
+        Some(n) => modes.push(format!("{n} queued")),
     }
     if v["shuffle"] == true {
         modes.push("shuffle".into());
@@ -975,12 +1043,24 @@ fn finish(cmd: &str, res: &Value, json: bool) -> i32 {
             format!("{}  {}", p["name"].as_str().unwrap_or("?"), p["uri"].as_str().unwrap_or(""))
         }),
         "queue" => {
+            let row = |t: &Value| format!("{} ({})  {}", song(t), ms(&t["ms"]), t["uri"].as_str().unwrap_or(""));
             println!("{}", status_text(res).lines().next().unwrap_or(""));
-            let up = res["upcoming"].as_array().unwrap_or(&none);
-            if up.is_empty() {
-                println!("nothing after this");
+            let queued = res["queue"].as_array().unwrap_or(&none);
+            if !queued.is_empty() {
+                println!("queue (`spot queue rm N` removes):");
+                list(queued, &row);
             }
-            list(up, &|t| format!("{} ({})  {}", song(t), ms(&t["ms"]), t["uri"].as_str().unwrap_or("")));
+            let up = res["upcoming"].as_array().unwrap_or(&none);
+            match res["list"]["name"].as_str() {
+                Some(name) if !up.is_empty() => {
+                    println!("then {name}:");
+                    for t in up {
+                        println!("     {}", row(t));
+                    }
+                }
+                _ if queued.is_empty() => println!("nothing after this"),
+                _ => {}
+            }
         }
         _ => println!("{}", status_text(res)),
     }
