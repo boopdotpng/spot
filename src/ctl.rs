@@ -21,6 +21,12 @@ pub enum Then {
     Queue { shown: usize },
 }
 
+/// What a `play` / `queue add` names: a uri (and its name if we know it), or a search.
+enum Target {
+    Uri(String, Option<String>),
+    Search(&'static str, String),
+}
+
 /// A `spot watch` / `spot wait` connection, sent events until it hangs up.
 pub struct Watcher {
     out: UnixStream,
@@ -377,51 +383,92 @@ impl App {
         });
     }
 
-    /// `liked`, a playlist's name, or a Spotify uri: what to fetch, and its name if we know it.
-    fn target(&self, t: &str) -> Result<(String, Option<String>), String> {
+    /// What `t` names: `liked`, a Spotify uri, one of their playlists, or failing those words to
+    /// search for (`song` / `album` / `artist` / `playlist` first picks what to search; songs
+    /// otherwise). Several matching playlists is an error that lists them, numbered.
+    fn target(&self, t: &str) -> Result<Target, Value> {
         let t = t.trim();
         let low = t.to_lowercase();
         if matches!(low.as_str(), "liked" | "liked songs" | "spotify:collection") {
-            return Ok(("liked".into(), None));
+            return Ok(Target::Uri("liked".into(), None));
         }
         if let Some(rest) = t.strip_prefix("spotify:") {
             let kind = rest.split(':').next().unwrap_or("");
             if !matches!(kind, "track" | "album" | "artist" | "playlist") {
-                return Err(format!("can't play a {kind} uri (songs, albums, artists and playlists work)"));
+                return Err(err(format!("can't play a {kind} uri (songs, albums, artists and playlists work)")));
             }
             let name = self.playlists.iter().find(|p| key_uri(&p.key()).as_deref() == Some(t)).map(|p| p.name.clone());
-            return Ok((t.into(), name));
+            return Ok(Target::Uri(t.into(), name));
         }
-        // an exact name, else the only one containing it
         let name_of = |p: &&Playlist| playlist_name(p).to_lowercase();
         let exact: Vec<&Playlist> = self.playlists.iter().filter(|p| name_of(p) == low).collect();
-        let found = if exact.len() == 1 { exact } else { self.playlists.iter().filter(|p| name_of(p).contains(&low)).collect() };
-        match found.as_slice() {
-            [p] => Ok((key_uri(&p.key()).unwrap_or_default(), Some(p.name.clone()))),
-            [] => Err(format!(
-                "no playlist of yours is called '{t}'. To play anything else, find it with `spot search {t}` and `spot play <uri>`"
-            )),
-            many => Err(format!(
-                "'{t}' matches several playlists: {}",
-                many.iter().map(|p| playlist_name(p)).collect::<Vec<_>>().join(", ")
-            )),
+        if let [p] = exact.as_slice() {
+            return Ok(Target::Uri(key_uri(&p.key()).unwrap_or_default(), Some(p.name.clone())));
         }
+        let (kind, q) = match low.split_once(' ') {
+            Some(("song" | "track", q)) => (Some("track"), q),
+            Some(("album", q)) => (Some("album"), q),
+            Some(("artist", q)) => (Some("artist"), q),
+            Some(("playlist", q)) => (Some("playlist"), q),
+            _ => (None, low.as_str()),
+        };
+        let q = q.trim();
+        if matches!(kind, None | Some("playlist")) {
+            // the only one of theirs containing it
+            let found: Vec<&Playlist> = self.playlists.iter().filter(|p| name_of(p).contains(q)).collect();
+            match found.as_slice() {
+                [] => {}
+                [p] => return Ok(Target::Uri(key_uri(&p.key()).unwrap_or_default(), Some(p.name.clone()))),
+                many => {
+                    let mut e = err(format!(
+                        "'{q}' matches {} of your playlists; `spot play N` picks one{}:",
+                        many.len(),
+                        if kind.is_none() { format!(", `spot play song {q}` searches songs instead") } else { String::new() }
+                    ));
+                    e["results"] = many
+                        .iter()
+                        .map(|p| json!({ "name": playlist_name(p), "uri": key_uri(&p.key()) }))
+                        .collect::<Vec<_>>()
+                        .into();
+                    return Err(e);
+                }
+            }
+        }
+        if q.is_empty() {
+            return Err(err(format!("play which {}?", kind.unwrap_or("song"))));
+        }
+        Ok(Target::Search(kind.unwrap_or("track"), q.into()))
     }
 
-    /// Fetch the tracks behind `t` in the background; on_loaded acts on them.
+    /// Fetch the tracks behind `t` in the background (searching first if it's words);
+    /// on_loaded acts on them.
     fn load(&mut self, t: String, then: Then, reply: Reply) {
-        let (uri, name) = match self.target(&t) {
+        let target = match self.target(&t) {
             Ok(x) => x,
-            Err(e) => return void(reply.send(err(e))),
+            Err(e) => return void(reply.send(e)),
         };
         let (api, sess, tx) = (self.api.clone(), self.sess.subscribe(), self.tx.clone());
         self.rt.spawn(async move {
+            let (uri, name, found) = match target {
+                Target::Uri(uri, name) => (uri, name, None),
+                Target::Search(ty, q) => {
+                    let what = if ty == "track" { "song" } else { ty };
+                    let res = search(api.clone(), q.clone(), ty, 1).await;
+                    let hit = &res["results"][0];
+                    let Some(uri) = hit["uri"].as_str() else {
+                        let e = if res["ok"] == true { err(format!("no {what} on Spotify matches '{q}'")) } else { res.clone() };
+                        return void(reply.send(e));
+                    };
+                    let name = (ty == "playlist").then(|| hit["name"].as_str().unwrap_or("playlist").to_string());
+                    (uri.to_string(), name, Some(format!("the top {what} for '{q}'")))
+                }
+            };
             let res = resolve(api, sess, uri.clone(), name).await;
-            let _ = tx.send(Msg::Loaded { reply, then, uri, res });
+            let _ = tx.send(Msg::Loaded { reply, then, uri, found, res });
         });
     }
 
-    pub fn on_loaded(&mut self, reply: Reply, then: Then, uri: String, res: Result<(String, Vec<Track>), String>) {
+    pub fn on_loaded(&mut self, reply: Reply, then: Then, uri: String, found: Option<String>, res: Result<(String, Vec<Track>), String>) {
         let (name, tracks) = match res {
             Ok(x) => x,
             Err(e) => return void(reply.send(err(e))),
@@ -467,7 +514,11 @@ impl App {
             }
         };
         let _ = reply.send(match res {
-            Ok(()) => self.queue_json(shown),
+            Ok(()) => {
+                let mut v = self.queue_json(shown);
+                v["found"] = found.into();
+                v
+            }
             Err(e) => err(e),
         });
     }
@@ -595,10 +646,12 @@ Control the running player, from any terminal, script or agent:
                              spot search 'track:one more time artist:daft punk'
                              spot search 'artist:radiohead year:1997' --albums
   spot play <uri>            a song plays now, then the queue and the list carry on; an album,
-                             artist (all songs) or playlist replaces the queue
+                             artist (all songs) or playlist replaces the list
                              (--from <song uri> starts there, --show opens it in the window)
   spot play 3                the 3rd result of the last search (queue add takes these too)
-  spot play liked            Liked Songs; `spot play <name>` plays one of your playlists
+  spot play liked            Liked Songs
+  spot play <words>          one of your playlists by name, else the top song on Spotify
+  spot play album <words>    the top album (or artist, song, playlist: yours first, then Spotify's)
   spot play | pause | toggle
   spot next | prev
   spot seek 1:30 | +10 | -10
@@ -607,7 +660,7 @@ Control the running player, from any terminal, script or agent:
   spot repeat [off | all | one]   no argument cycles
   spot queue [-n 20]         the queue, then what the list plays after it
   spot queue [add] <uri>...  add to the end of the queue (`spot queue 2` = result 2) (songs play before the list carries on;
-                             an album or playlist queues all its songs)
+                             an album or playlist queues all its songs); words work as in play
   spot queue rm 2 3          remove songs from the queue, by their number in `spot queue`
   spot queue clear           empty the queue
   spot playlists             your playlists, with uris
@@ -616,9 +669,8 @@ Control the running player, from any terminal, script or agent:
                              what's next, so there's time to `queue add` something else)
   spot wait <event> [--before 30]   wait for the next such event, print it, exit
 
-  --json                     JSON output, one object per line
-
-Finding music: `spot search` first, then `spot play` a uri from the results; play doesn't search.
+Finding music: `spot play <words>` plays the top hit and says so; to choose, `spot search` and
+`spot play N`. Several of your playlists matching lists them, numbered for `spot play N`.
 Spotify links (https://open.spotify.com/...) work anywhere a uri does.
 Exit codes: 0 ok, 1 error, 2 bad usage, 3 spot isn't running.";
 
@@ -668,8 +720,7 @@ fn parse_time(s: &str) -> Option<i64> {
 }
 
 pub fn client(args: Vec<String>) -> i32 {
-    let json = args.iter().any(|a| a == "--json");
-    let mut args: Vec<String> = args.into_iter().filter(|a| a != "--json").collect();
+    let mut args = args;
     let cmd = args.remove(0);
     let flag = |args: &mut Vec<String>, f: &str| match args.iter().position(|a| a == f) {
         Some(i) => {
@@ -740,7 +791,12 @@ pub fn client(args: Vec<String>) -> i32 {
         "queue" if args.first().is_some_and(|a| a == "add") => {
             args.remove(0);
             if args.is_empty() {
-                usage("queue add: which uri?");
+                usage("queue add: what?");
+            }
+            // several numbers or uris queue each; anything else is one thing to find
+            let one = |a: &String| a.parse::<usize>().is_ok() || a.starts_with("spotify:") || a.contains("open.spotify.com/");
+            if !args.iter().all(one) {
+                args = vec![args.join(" ")];
             }
             let mut last = None;
             for a in &args {
@@ -749,11 +805,11 @@ pub fn client(args: Vec<String>) -> i32 {
                     Err(code) => return code,
                 };
                 if res["ok"] != true {
-                    return finish(&cmd, &res, json);
+                    return finish(&cmd, &res);
                 }
                 last = Some(res);
             }
-            return finish(&cmd, &last.unwrap(), json);
+            return finish(&cmd, &last.unwrap());
         }
         "queue" if args.first().is_some_and(|a| a == "rm") => {
             let ns: Vec<u64> = args[1..].iter().map(|a| a.parse().unwrap_or_else(|_| usage("queue rm: song numbers from `spot queue`"))).collect();
@@ -780,16 +836,16 @@ pub fn client(args: Vec<String>) -> i32 {
                 },
                 _ => None,
             };
-            return watch(before * 1000, until, json);
+            return watch(before * 1000, until);
         }
         _ => usage(&format!("unknown command '{cmd}'")),
     };
     match request(&req) {
         Ok(res) => {
-            if cmd == "search" && res["ok"] == true {
+            if res["results"].is_array() {
                 save_results(&res);
             }
-            finish(&cmd, &res, json)
+            finish(&cmd, &res)
         }
         Err(code) => code,
     }
@@ -899,7 +955,7 @@ fn request(req: &Value) -> Result<Value, i32> {
     }
 }
 
-fn watch(before_ms: u64, until: Option<String>, json: bool) -> i32 {
+fn watch(before_ms: u64, until: Option<String>) -> i32 {
     let conn = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -914,20 +970,12 @@ fn watch(before_ms: u64, until: Option<String>, json: bool) -> i32 {
         if until.as_deref().is_some_and(|u| u != name) {
             continue;
         }
-        if json {
-            println!("{line}");
-        } else {
-            println!("{}", event_line(&ev));
-        }
+        println!("{}", event_line(&ev));
         if until.is_some() {
             return 0;
         }
     }
-    if json {
-        println!("{}", json!({ "event": "quit" }));
-    } else {
-        println!("spot quit");
-    }
+    println!("spot quit");
     3
 }
 
@@ -1009,25 +1057,23 @@ fn status_text(v: &Value) -> String {
     out.join("\n")
 }
 
-fn finish(cmd: &str, res: &Value, json: bool) -> i32 {
-    if res["ok"] != true {
-        if json {
-            println!("{res}");
-        } else {
-            eprintln!("spot: {}", res["error"].as_str().unwrap_or("failed"));
-        }
-        return 1;
-    }
-    if json {
-        println!("{res}");
-        return 0;
-    }
+fn finish(cmd: &str, res: &Value) -> i32 {
     let list = |items: &[Value], row: &dyn Fn(&Value) -> String| {
         for (i, it) in items.iter().enumerate() {
             println!("{:>3}  {}", i + 1, row(it));
         }
     };
     let none = Vec::new();
+    let named = |p: &Value| format!("{}  {}", p["name"].as_str().unwrap_or("?"), p["uri"].as_str().unwrap_or(""));
+    if res["ok"] != true {
+        eprintln!("spot: {}", res["error"].as_str().unwrap_or("failed"));
+        // the playlists a name matched, numbered for `spot play N`
+        list(res["results"].as_array().unwrap_or(&none), &named);
+        return 1;
+    }
+    if let Some(f) = res["found"].as_str() {
+        println!("{f}:");
+    }
     match cmd {
         "search" => {
             let items = res["results"].as_array().unwrap_or(&none);
@@ -1039,9 +1085,7 @@ fn finish(cmd: &str, res: &Value, json: bool) -> i32 {
                 _ => format!("{} · {}  {}", r["name"].as_str().unwrap_or("?"), r["sub"].as_str().unwrap_or(""), r["uri"].as_str().unwrap_or("")),
             });
         }
-        "playlists" => list(res["playlists"].as_array().unwrap_or(&none), &|p| {
-            format!("{}  {}", p["name"].as_str().unwrap_or("?"), p["uri"].as_str().unwrap_or(""))
-        }),
+        "playlists" => list(res["playlists"].as_array().unwrap_or(&none), &named),
         "queue" => {
             let row = |t: &Value| format!("{} ({})  {}", song(t), ms(&t["ms"]), t["uri"].as_str().unwrap_or(""));
             println!("{}", status_text(res).lines().next().unwrap_or(""));

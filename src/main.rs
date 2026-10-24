@@ -170,7 +170,7 @@ enum Msg {
     Connected(Result<Session, String>),
     Status(String),
     Ctl(Value, ctl::Reply), // a `spot <command>` request
-    Loaded { reply: ctl::Reply, then: ctl::Then, uri: String, res: Result<(String, Vec<Track>), String> },
+    Loaded { reply: ctl::Reply, then: ctl::Then, uri: String, found: Option<String>, res: Result<(String, Vec<Track>), String> },
     Watch(ctl::Watcher),
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }
@@ -3193,7 +3193,7 @@ fn init_log() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let headless = args.first().is_some_and(|a| a == "--headless");
-    match args.iter().find(|a| *a != "--json").map(String::as_str) {
+    match args.first().map(String::as_str) {
         None => {}
         Some("--headless") if args.len() == 1 => {}
         Some("clean") => return clean_cache(),
@@ -3625,7 +3625,7 @@ fn run(headless: bool) -> Result<(), String> {
                     }
                 }
                 Msg::Ctl(req, reply) => app.on_ctl(req, reply),
-                Msg::Loaded { reply, then, uri, res } => app.on_loaded(reply, then, uri, res),
+                Msg::Loaded { reply, then, uri, found, res } => app.on_loaded(reply, then, uri, found, res),
                 Msg::Watch(w) => app.watch(w),
                 Msg::Quit => app.quit = true,
             }

@@ -105,6 +105,8 @@ from any terminal, script or agent (an LLM can drive it from `spot help` alone):
     spot play spotify:track:…        # plays now, then the queue and the list carry on
     spot play spotify:album:…        # album / artist / playlist: replaces the list (--from <song uri>, --show)
     spot play liked                  # or one of your playlists by name
+    spot play black beatles          # not a playlist of yours: the top song on Spotify
+    spot play album abbey road       # or artist / song / playlist: the top one of those
     spot pause | play | toggle | next | prev
     spot seek 1:30 | +10 | -10
     spot vol 60 | +10 | -10
@@ -116,13 +118,14 @@ from any terminal, script or agent (an LLM can drive it from `spot help` alone):
 
 Spotify's field filters work in searches: `spot search 'track:one more time artist:daft punk'`,
 `spot search 'artist:radiohead year:1997' --albums`.
-`play` doesn't search: `spot search` first, then play a result by its number (`spot play 3`,
-`spot queue add 2 5`) or uri.
+`spot play <words>` plays the top hit and says what it picked; to choose yourself, `spot search`
+first, then play a result by its number (`spot play 3`, `spot queue add 2 5`) or uri. When several
+of your playlists match, it lists them numbered, for `spot play N`.
 
 The queue is spot's own, like Spotify's: songs you add play in order before the list you're
 playing carries on, and it's kept across restarts. `spot play <song>` plays a song right away
 and then goes on with the queue. Spotify links work
-anywhere a uri does. Add `--json` for one JSON object per line. Exit code 3 means spot isn't running.
+anywhere a uri does. Exit code 3 means spot isn't running.
 
 `spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
 `end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
