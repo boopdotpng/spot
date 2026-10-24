@@ -1616,9 +1616,11 @@ impl App {
         if self.status.starts_with("approve the audio session") {
             self.status.clear();
         }
-        // the song restored from last time (or picked while connecting): fetch it now, so
-        // space starts it without waiting on the network
-        self.load_cur();
+        // a song picked while connecting starts now. The one restored from last time waits for
+        // play: loading it asks Spotify for its audio key, and those are rate-limited
+        if self.want_play {
+            self.load_cur();
+        }
     }
 
     /// Load `cur` into the player at the current position, playing if that's wanted.
