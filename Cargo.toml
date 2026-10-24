@@ -30,3 +30,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# librespot-core 0.8.0 plus a retry for audio keys Spotify refuses at random (vendor/README.md)
+[patch.crates-io]
+librespot-core = { path = "vendor/librespot-core" }
