@@ -456,6 +456,11 @@ impl App {
         self.pos_ms + self.pos_at.map_or(0, |t| t.elapsed().as_millis() as u64)
     }
 
+    /// Volume in percent.
+    pub fn vol_pct(&self) -> u32 {
+        (self.vol as u32 * 100 + 32767) / 65535
+    }
+
     pub fn set_volume(&mut self, delta: i32) {
         self.vol = (self.vol as i32 + delta).clamp(0, 65535) as u16;
         self.vol_until = Some(Instant::now() + Duration::from_millis(1500));

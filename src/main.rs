@@ -35,6 +35,7 @@ use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, M
 mod app;
 mod auth;
 mod cache;
+mod cli;
 mod ctl;
 mod keys;
 mod lastfm;
@@ -145,10 +146,10 @@ fn main() {
         None => {}
         Some("--headless") if args.len() == 1 => {}
         Some("clean") => return clean_cache(),
-        Some(c) if ctl::COMMANDS.contains(&c) => std::process::exit(ctl::client(args)),
+        Some(c) if cli::COMMANDS.contains(&c) => std::process::exit(cli::client(args)),
         Some(a) => {
             let ok = matches!(a, "-h" | "--help" | "help");
-            if ok { println!("{}", ctl::USAGE) } else { eprintln!("spot: unknown argument '{a}'\n\n{}", ctl::USAGE) }
+            if ok { println!("{}", cli::USAGE) } else { eprintln!("spot: unknown argument '{a}'\n\n{}", cli::USAGE) }
             std::process::exit(if ok { 0 } else { 2 });
         }
     }

@@ -472,7 +472,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.focus == Focus::Tracks && total > 0 {
             right.push(Span::styled(format!("{}/{}   ", num(sel.map_or(0, |s| s + 1)), num(total)), dim));
         }
-        let pct = (app.vol as u32 * 100 + 32767) / 65535;
+        let pct = app.vol_pct();
         if app.vol_until.is_some_and(|u| Instant::now() < u) {
             right.push(Span::styled("vol ", dim));
             right.extend(meter(10, pct as f64 / 100.0, false, th));

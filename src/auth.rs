@@ -81,3 +81,28 @@ pub async fn start_session(s: Session, cache: Cache, tx: mpsc::Sender<Msg>) {
     };
     let _ = tx.send(Msg::Connected(r));
 }
+
+/// Browser login, off the runtime: librespot's callback listener blocks its thread.
+pub async fn browser_login(oauth: Arc<OAuthClient>, redirect: &str) -> Result<librespot_oauth::OAuthToken, String> {
+    let (otx, orx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let r = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())
+            .and_then(|rt| rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}")));
+        let _ = otx.send(r);
+    });
+    match tokio::time::timeout(Duration::from_secs(300), orx).await {
+        Ok(r) => r.map_err(|_| "login: aborted".to_string())?,
+        Err(_) => {
+            // nobody came back from the browser; poke the listener so it frees the port
+            if let Some(addrs) = reqwest::Url::parse(redirect).ok().and_then(|u| u.socket_addrs(|| None).ok()) {
+                for a in addrs {
+                    let _ = std::net::TcpStream::connect_timeout(&a, Duration::from_secs(1));
+                }
+            }
+            Err("login timed out".into())
+        }
+    }
+}

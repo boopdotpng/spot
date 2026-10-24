@@ -242,7 +242,7 @@ impl App {
                 }
             }
             Msg::Ctl(req, reply) => self.on_ctl(req, reply),
-            Msg::Loaded { reply, then, uri, found, res } => self.on_loaded(reply, then, uri, found, res),
+            Msg::Loaded(reply, then, list) => self.on_loaded(reply, then, list),
             Msg::Watch(w) => self.watch(w),
             Msg::Quit => self.quit = true,
         }

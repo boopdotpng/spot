@@ -72,6 +72,14 @@ impl Kind {
             Kind::Artists => Kind::Tracks,
         }
     }
+    /// What Spotify's search calls it.
+    pub fn ty(self) -> &'static str {
+        match self {
+            Kind::Tracks => "track",
+            Kind::Albums => "album",
+            Kind::Artists => "artist",
+        }
+    }
     pub fn label(self) -> &'static str {
         match self {
             Kind::Tracks => "songs",
@@ -98,6 +106,10 @@ impl Playlist {
     pub fn key(&self) -> String {
         self.id.clone().unwrap_or_else(|| "liked".into())
     }
+    /// `liked`, or its spotify:playlist: uri.
+    pub fn uri(&self) -> String {
+        self.id.as_ref().map_or_else(|| "liked".into(), |id| format!("spotify:playlist:{id}"))
+    }
 }
 
 pub enum Msg {
@@ -116,8 +128,8 @@ pub enum Msg {
     Relogin(bool), // true: waiting on browser login; false: it finished
     Connected(Result<Session, String>),
     Status(String),
-    Ctl(Value, ctl::Reply), // a `spot <command>` request
-    Loaded { reply: ctl::Reply, then: ctl::Then, uri: String, found: Option<String>, res: Result<(String, Vec<Track>), String> },
+    Ctl(Vec<String>, ctl::Reply), // a `spot <command>` request
+    Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `queue add` named, fetched
     Watch(ctl::Watcher),
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }

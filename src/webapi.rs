@@ -92,31 +92,6 @@ impl Api {
     }
 }
 
-/// Browser login, off the runtime: librespot's callback listener blocks its thread.
-pub async fn browser_login(oauth: Arc<OAuthClient>, redirect: &str) -> Result<librespot_oauth::OAuthToken, String> {
-    let (otx, orx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let r = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())
-            .and_then(|rt| rt.block_on(oauth.get_access_token_async()).map_err(|e| format!("login: {e}")));
-        let _ = otx.send(r);
-    });
-    match tokio::time::timeout(Duration::from_secs(300), orx).await {
-        Ok(r) => r.map_err(|_| "login: aborted".to_string())?,
-        Err(_) => {
-            // nobody came back from the browser; poke the listener so it frees the port
-            if let Some(addrs) = reqwest::Url::parse(redirect).ok().and_then(|u| u.socket_addrs(|| None).ok()) {
-                for a in addrs {
-                    let _ = std::net::TcpStream::connect_timeout(&a, Duration::from_secs(1));
-                }
-            }
-            Err("login timed out".into())
-        }
-    }
-}
-
 pub fn parse_track(v: &Value) -> Option<Track> {
     let uri = v["uri"].as_str()?;
     if !uri.starts_with("spotify:track:") {
@@ -169,80 +144,18 @@ pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
     let _ = tx.send(Msg::Playlists(out));
 }
 
-/// Refresh a playlist / Liked Songs. With nothing cached the tracks stream in as they load;
-/// otherwise the cached copy is already showing and gets replaced only if it changed.
-pub async fn load_tracks(api: Arc<Api>, sess: Sess, tx: mpsc::Sender<Msg>, view: u64, pl: Playlist, cached: Arc<Vec<Track>>) {
-    let res = match &pl.id {
-        Some(id) => playlist_tracks(sess, id, &cached, &tx, view).await,
-        None => liked_tracks(api, &cached, &tx, view).await,
-    };
-    match res {
-        Ok(Some(tracks)) => {
-            save_tracks(&tracks_path(&pl.key()), &tracks);
-            if !cached.is_empty() {
-                let _ = tx.send(Msg::Replace { view, tracks: Arc::new(tracks) });
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            let _ = tx.send(Msg::Error(e));
-        }
-    }
-    let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
-}
-
-pub async fn liked_page(api: Arc<Api>, offset: usize) -> Result<(Vec<Track>, usize), String> {
-    let v = api.get(&format!("{API}/me/tracks?limit=50&offset={offset}")).await?;
-    let page = v["items"].as_array().into_iter().flatten().filter_map(|it| parse_track(&it["track"])).collect();
-    Ok((page, v["total"].as_u64().unwrap_or(0) as usize))
-}
-
-/// The full Liked Songs list, or None if `cached` is still current.
-pub async fn liked_tracks(api: Arc<Api>, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
-    let (mut got, total) = liked_page(api.clone(), 0).await?;
-    if cached.is_empty() {
-        let _ = tx.send(Msg::Tracks { view, tracks: got.clone(), done: false });
-    } else if let Some(j) = (cached.len() + got.len()).checked_sub(total)
-        && j > 0
-        && j <= cached.len()
-        && got.last().is_some_and(|t| t.uri == cached[j - 1].uri)
-    {
-        // Likes come newest first: new ones push the cache down, unlikes pull what's after them
-        // up. If the first page's last song sits where the cache has it, shifted by exactly the
-        // change in count, everything after it is unchanged.
-        if j == got.len() && got.iter().zip(cached).all(|(a, b)| a.uri == b.uri) {
-            return Ok(None);
-        }
-        got.extend_from_slice(&cached[j..]);
-        return Ok(Some(got));
-    }
-    // Each page takes about a second, so fetch the rest a few at a time, keeping their order.
-    const PARALLEL: usize = 16;
-    let mut offsets = (got.len().max(50)..total).step_by(50);
-    let mut pending = std::collections::VecDeque::new();
-    loop {
-        while pending.len() < PARALLEL
-            && let Some(o) = offsets.next()
-        {
-            pending.push_back(tokio::spawn(liked_page(api.clone(), o)));
-        }
-        let Some(next) = pending.pop_front() else { break };
-        let (page, _) = next.await.map_err(|e| e.to_string())??;
-        if cached.is_empty() {
-            let _ = tx.send(Msg::Tracks { view, tracks: page.clone(), done: false });
-        }
-        got.extend(page);
-    }
-    Ok(Some(got))
-}
-
-pub fn parse_link(kind: Kind, v: &Value) -> Option<Link> {
+/// An album, artist or playlist search result.
+pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
     let names = |a: &Value| a.as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", "));
-    let sub = match kind {
-        Kind::Albums => {
+    let sub = match ty {
+        "album" => {
             let year = v["release_date"].as_str().unwrap_or("").get(..4).unwrap_or("");
             let kind = v["album_type"].as_str().unwrap_or("");
             format!("{} · {year} {kind}", names(&v["artists"]).unwrap_or_default())
+        }
+        "playlist" => {
+            let by = v["owner"]["display_name"].as_str().unwrap_or("?");
+            format!("by {by} · {}", plural(v["tracks"]["total"].as_u64().unwrap_or(0) as usize, "song"))
         }
         _ => v["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
     };
@@ -250,39 +163,24 @@ pub fn parse_link(kind: Kind, v: &Value) -> Option<Link> {
     Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single })
 }
 
-// Dev-mode apps get max 10 results per search call, so page through a few.
-pub async fn search(api: Arc<Api>, tx: mpsc::Sender<Msg>, view: u64, q: String, kind: Kind) {
-    let (ty, key) = match kind {
-        Kind::Tracks => ("track", "tracks"),
-        Kind::Albums => ("album", "albums"),
-        Kind::Artists => ("artist", "artists"),
-    };
-    for offset in (0..50).step_by(10) {
+/// Search Spotify for `n` results of a type (track, album, artist or playlist), each page handed
+/// to `page` as it comes, with whether it's the last. Dev-mode apps get 10 results per call.
+pub async fn search(api: &Api, q: &str, ty: &str, n: usize, mut page: impl FnMut(&[Value], bool)) -> Result<(), String> {
+    for offset in (0..n).step_by(10) {
+        let limit = (n - offset).min(10).to_string();
         let url = reqwest::Url::parse_with_params(
             &format!("{API}/search"),
-            &[("q", q.as_str()), ("type", ty), ("limit", "10"), ("offset", &offset.to_string())],
+            &[("q", q), ("type", ty), ("limit", &limit), ("offset", &offset.to_string())],
         )
-        .unwrap();
-        match api.get(url.as_str()).await {
-            Ok(v) => {
-                let items = v[key]["items"].as_array().cloned().unwrap_or_default();
-                let last = items.len() < 10 || v[key]["next"].is_null();
-                if kind == Kind::Tracks {
-                    let tracks = items.iter().filter_map(parse_track).collect();
-                    let _ = tx.send(Msg::Tracks { view, tracks, done: last });
-                } else {
-                    let links = items.iter().filter_map(|i| parse_link(kind, i)).collect();
-                    let _ = tx.send(Msg::Links { view, links, done: last });
-                }
-                if last {
-                    return;
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(Msg::Error(format!("search: {e}")));
-                break;
-            }
+        .map_err(|e| e.to_string())?;
+        let v = api.get(url.as_str()).await.map_err(|e| format!("search: {e}"))?;
+        let found = &v[format!("{ty}s")];
+        let items = found["items"].as_array().map_or(&[][..], Vec::as_slice);
+        let last = items.len() < 10 || found["next"].is_null() || offset + 10 >= n;
+        page(items, last);
+        if last {
+            break;
         }
     }
-    let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
+    Ok(())
 }

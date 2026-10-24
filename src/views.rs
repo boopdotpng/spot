@@ -53,7 +53,7 @@ impl App {
         };
         v.loading = v.tracks.is_empty();
         let cached = v.tracks.clone();
-        self.rt.spawn(load_tracks(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, pl, cached));
+        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, pl.uri(), cached));
         self.show(v, true);
     }
 
@@ -61,7 +61,20 @@ impl App {
         let kind = self.search_kind;
         let title = format!("Search {}: {q}", kind.label());
         let v = self.new_view(format!("search:{}:{q}", kind.label()), title, kind);
-        self.rt.spawn(search(self.api.clone(), self.tx.clone(), v.id, q, kind));
+        let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
+        self.rt.spawn(async move {
+            let res = search(&api, &q, kind.ty(), 50, |items, done| {
+                let _ = tx.send(match kind {
+                    Kind::Tracks => Msg::Tracks { view, tracks: items.iter().filter_map(parse_track).collect(), done },
+                    _ => Msg::Links { view, links: items.iter().filter_map(|i| parse_link(kind.ty(), i)).collect(), done },
+                });
+            })
+            .await;
+            if let Err(e) = res {
+                let _ = tx.send(Msg::Error(e));
+                let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
+            }
+        });
         self.show(v, true);
         self.focus = Focus::Tracks;
     }
@@ -72,7 +85,7 @@ impl App {
         v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
         v.loading = v.tracks.is_empty();
         let cached = v.tracks.clone();
-        self.rt.spawn(link_tracks(self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
+        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
         self.show(v, true);
         self.focus = Focus::Tracks;
     }
@@ -91,7 +104,7 @@ impl App {
         if self.artist_songs {
             v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
             v.loading = v.tracks.is_empty();
-            self.rt.spawn(link_tracks(s, tx, id, uri, v.tracks.clone()));
+            self.rt.spawn(load_list(self.api.clone(), s, tx, id, uri, v.tracks.clone()));
         } else {
             let cached = read_links(&releases_path(&uri));
             v.loading = cached.is_empty();

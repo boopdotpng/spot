@@ -221,3 +221,8 @@ pub fn clean_cache() {
     }
     println!("Cleared {:.1} MB of cache from {}.", freed as f64 / 1e6, dir.display());
 }
+
+/// The running player's control socket (ctl.rs).
+pub fn sock_path() -> PathBuf {
+    cache_dir().join("sock")
+}
