@@ -14,6 +14,7 @@ pub struct Track {
     pub album_id: u128, // SpotifyIds for goto album / artist (first artist); 0 = unknown
     pub artist_id: u128,
     pub disc: u32, // disc number on its album; 0 = unknown
+    pub explicit: bool,
 }
 
 /// An album or artist search result.

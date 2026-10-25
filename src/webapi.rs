@@ -111,6 +111,7 @@ pub fn parse_track(v: &Value) -> Option<Track> {
         album_id: id(&v["album"]),
         artist_id: id(&v["artists"][0]),
         disc: v["disc_number"].as_u64().unwrap_or(0) as u32,
+        explicit: v["explicit"].as_bool().unwrap_or(false),
     })
 }
 

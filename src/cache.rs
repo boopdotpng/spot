@@ -82,7 +82,7 @@ pub fn push_tracks(out: &mut String, tracks: &[Track]) {
     for t in tracks {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}",
             t.uri,
             clean(&t.name),
             clean(&t.artists),
@@ -92,7 +92,8 @@ pub fn push_tracks(out: &mut String, tracks: &[Track]) {
             t.ms,
             t.album_id,
             t.artist_id,
-            t.disc
+            t.disc,
+            t.explicit as u8
         );
     }
 }
@@ -114,11 +115,17 @@ pub fn parse_line(l: &str) -> Option<Track> {
         album_id: id(),
         artist_id: id(),
         disc: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+        explicit: f.next() == Some("1"),
     })
 }
 
 pub fn read_tracks(path: &std::path::Path) -> Vec<Track> {
-    fs::read_to_string(path).map(|s| s.lines().filter_map(parse_line).collect()).unwrap_or_default()
+    let s = fs::read_to_string(path).unwrap_or_default();
+    // lists cached before the explicit flag was kept load fresh, or they'd never get it
+    if s.lines().next().is_some_and(|l| l.split('\t').count() < 11) {
+        return vec![];
+    }
+    s.lines().filter_map(parse_line).collect()
 }
 
 pub fn save_tracks(path: &std::path::Path, tracks: &[Track]) {

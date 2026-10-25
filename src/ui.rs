@@ -309,7 +309,15 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         } else {
             [th.dim, th.text, th.sub, th.dim, th.dim].map(|c| Style::new().fg(c))
         };
-        let mut cells = vec![numcell(i, playing, n), cell(&t.name, 1, name), cell(&t.artists, 2, artist)];
+        // explicit songs get an outlined E (U+1F134) after the title, like Spotify's label
+        let title = if t.explicit {
+            let badge = Style::new().fg(if playing { th.accent } else { th.dim });
+            let line = Line::from(vec![Span::raw(fit(&t.name, w[1].saturating_sub(2))), Span::raw(" "), Span::styled("\u{1F134}", badge)]);
+            Cell::from(line).style(name)
+        } else {
+            cell(&t.name, 1, name)
+        };
+        let mut cells = vec![numcell(i, playing, n), title, cell(&t.artists, 2, artist)];
         if wide {
             cells.push(cell(&t.album, 3, album));
         }

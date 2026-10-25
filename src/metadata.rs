@@ -72,6 +72,7 @@ pub fn pb_track(uri: &str, t: &PbTrack) -> Track {
         album_id: id(t.album.gid()),
         artist_id: t.artist.first().map_or(0, |a| id(a.gid())),
         disc: t.disc_number().max(0) as u32,
+        explicit: t.explicit(),
     }
 }
 
