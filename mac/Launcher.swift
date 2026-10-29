@@ -100,14 +100,12 @@ final class Model: ObservableObject {
     @Published var now: Playing?
     var close: () -> Void = {}
     private var generation = 0
-    private var pending: Bool?  // enter pressed before results came: play (false) or queue (true) the first
 
     func reset() {
         query = ""
         results = []
         note = nil
         selected = 0
-        pending = nil
         theme = Theme.load()
     }
 
@@ -120,7 +118,6 @@ final class Model: ObservableObject {
             results = []
             note = nil
             busy = false
-            pending = nil
             return
         }
         busy = true
@@ -141,10 +138,6 @@ final class Model: ObservableObject {
             } else {
                 results = []
                 note = text
-            }
-            if let queue = pending {
-                pending = nil
-                choose(queue: queue)
             }
         }
     }
@@ -187,10 +180,19 @@ final class Model: ObservableObject {
     }
 
     /// Play (or queue) the selected result, then get out of the way.
-    /// While a search is on its way, waits for it and takes its first result.
+    /// Before the results are in, the window closes right away and the first result plays (or
+    /// queues) in the background once it's found; a beep if nothing is.
     func choose(queue: Bool) {
         if busy {
-            pending = queue
+            let (q, kind) = (query.trimmingCharacters(in: .whitespaces), kind)
+            generation += 1  // the window's own search is moot now
+            busy = false
+            close()
+            Task {
+                let (code, text) = await request(["search", "--tsv", "-n", "\(maxRows)", kind.flag, q])
+                guard code == 0, let first = text.split(separator: "\n").first.flatMap(Result.init) else { return NSSound.beep() }
+                if await request(queue ? ["queue", "add", first.uri] : ["play", first.uri]).0 != 0 { NSSound.beep() }
+            }
             return
         }
         guard results.indices.contains(selected) else { return }
@@ -302,6 +304,7 @@ struct LauncherView: View {
         .font(mono)
         .frame(width: width)
         .modifier(Glass(th: th))
+        .padding(margin)
         .onAppear { focused = true }
     }
 }
@@ -336,6 +339,9 @@ struct DragsWindow: ViewModifier {
 }
 
 let corner: CGFloat = 14
+/// Transparent room around the glass, inside the window: the glass's shadow (stronger while the
+/// window is key) fades out there instead of being cut off square by the window's edge.
+let margin: CGFloat = 40
 
 struct Blur: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
@@ -478,13 +484,13 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var hotKey: EventHotKeyRef?
     var changes: AnyCancellable?
     var poll: Timer?  // refreshes what's playing while the window is open
-    var bottom: CGFloat = 0  // the window's bottom edge: it grows upward from here
+    var bottom: CGFloat = 0  // the glass's bottom edge (the window's is `margin` lower): it grows upward from here
     var placing = false  // moving the window ourselves, not the user dragging it
     var previous: NSRunningApplication?  // focus goes back here on close
 
     func applicationDidFinishLaunching(_ note: Notification) {
         panel = Panel(
-            contentRect: NSRect(x: 0, y: 0, width: width, height: barHeight),
+            contentRect: NSRect(x: 0, y: 0, width: width + 2 * margin, height: barHeight + 2 * margin),
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered, defer: false)
         panel.isFloatingPanel = true
@@ -561,7 +567,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let f = screen.visibleFrame
             (midX, bottom) = (f.midX, f.minY + f.height * 0.12)
         }
-        place(NSRect(x: midX - width / 2, y: bottom, width: width, height: barHeight))
+        place(NSRect(x: midX - width / 2, y: bottom, width: width, height: barHeight).insetBy(dx: -margin, dy: -margin))
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate()
         model.refreshNow()
@@ -583,8 +589,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func fit() {
         let above: CGFloat = model.note != nil ? barHeight + 1 : model.results.isEmpty ? 0 : CGFloat(model.results.count) * rowHeight + 12 + 1
         let h = barHeight + above + (model.now != nil ? nowHeight : 0)
-        guard abs(panel.frame.height - h) > 0.5 || abs(panel.frame.minY - bottom) > 0.5 else { return }
-        place(NSRect(x: panel.frame.minX, y: bottom, width: width, height: h))
+        guard abs(panel.frame.height - h - 2 * margin) > 0.5 || abs(panel.frame.minY + margin - bottom) > 0.5 else { return }
+        place(NSRect(x: panel.frame.midX - width / 2, y: bottom, width: width, height: h).insetBy(dx: -margin, dy: -margin))
     }
 
     func place(_ frame: NSRect) {
@@ -596,7 +602,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// The user dragged it: grow from there, and open there next time.
     func windowDidMove(_ n: Notification) {
         guard !placing, panel.isVisible else { return }
-        bottom = panel.frame.minY
+        bottom = panel.frame.minY + margin
         UserDefaults.standard.set(panel.frame.midX, forKey: "midX")
         UserDefaults.standard.set(bottom, forKey: "bottom")
     }
