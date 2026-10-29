@@ -158,9 +158,9 @@ at `~/.cache/spot/sock`.
 
 ## macOS launcher (⌥Space)
 
-A small native app that searches and plays from anywhere: `⌥Space` opens a bar at the bottom of
-the screen in spot's colors (the `ctrl+t` theme, light or dark following the system). Type to
-search, `tab` cycles songs / albums / artists, `↑`/`↓` move, `enter` plays (pressed before the
+A small native app that searches and plays from anywhere: `⌥Space` opens a Liquid Glass bar at
+the bottom of the screen, tinted with spot's `ctrl+t` theme, with what's playing under the search.
+Drag it anywhere; it opens there next time. Type to search, `tab` cycles songs / albums / artists, `↑`/`↓` move, `enter` plays (pressed before the
 results are in, it plays the first one), `⌘enter` adds to the queue, `esc` closes. It's a
 separate program that talks to the running spot over its socket, and starts it (`spot start`)
 if it isn't running. About 18 MB of memory, no CPU while hidden.

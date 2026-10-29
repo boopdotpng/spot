@@ -28,6 +28,8 @@ PLIST
 codesign -s - --force "$tmp/Spot Launcher.app"
 
 pkill -x SpotLauncher 2>/dev/null || true
+# wait for the old one to exit, or `open` fails (-600)
+for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x SpotLauncher >/dev/null || break; sleep 0.2; done
 mkdir -p "$(dirname "$app")"
 rm -rf "$app"
 mv "$tmp/Spot Launcher.app" "$app"

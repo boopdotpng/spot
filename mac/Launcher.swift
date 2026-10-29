@@ -80,6 +80,12 @@ struct Result: Identifiable {
     var duration: String { ms > 0 ? String(format: "%d:%02d", ms / 60000, ms / 1000 % 60) : "" }
 }
 
+/// What spot is playing, from `spot status --tsv`.
+struct Playing: Equatable {
+    let playing: Bool
+    let name, artists: String
+}
+
 @MainActor
 final class Model: ObservableObject {
     @Published var query = "" { didSet { if query != oldValue { search() } } }
@@ -89,6 +95,7 @@ final class Model: ObservableObject {
     @Published var note: String?  // an error or "starting spot…", shown in place of results
     @Published var busy = false
     @Published var theme = Theme.load()
+    @Published var now: Playing?
     var close: () -> Void = {}
     private var generation = 0
     private var pending: Bool?  // enter pressed before results came: play (false) or queue (true) the first
@@ -140,6 +147,16 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Ask spot what's playing; nothing if it isn't running (this doesn't start it).
+    func refreshNow() {
+        Task {
+            let (code, text) = await Task.detached { spot(["status", "--tsv"]) }.value
+            let f = text.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            let now = code == 0 && f.count >= 3 ? Playing(playing: f[0] == "1", name: f[1], artists: f[2]) : nil
+            if now != self.now { self.now = now }
+        }
+    }
+
     func move(_ by: Int) {
         guard !results.isEmpty else { return }
         selected = (selected + by + results.count) % results.count
@@ -182,7 +199,7 @@ final class Model: ObservableObject {
 /// spot's palettes (src/theme.rs FAMILIES): the one picked with ctrl+t, light or dark following
 /// the system appearance. [accent, accent2, deep, hl, text, sub, dim, gold, pink, err]
 struct Theme {
-    let accent, deep, hl, text, sub, dim, gold, err: Color
+    let accent, hl, text, sub, dim, gold, err: Color
 
     static let families: [String: (dark: [UInt32], light: [UInt32])] = [
         "desert": ([0xd0924a, 0xb08a66, 0x2e2722, 0x5c4128, 0xd6c8b4, 0x8f8679, 0x4f4a55, 0xd9b066, 0xa58b98, 0xc26a50],
@@ -207,7 +224,10 @@ struct Theme {
         let fam = families[name] ?? families["desert"]!
         let light = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
         let h = (light ? fam.light : fam.dark).map { Color(hex: $0) }
-        return Theme(accent: h[0], deep: h[2], hl: h[3], text: h[4], sub: h[5], dim: h[6], gold: h[7], err: h[9])
+        // on glass the text takes the system's label colors, which stay readable over whatever is
+        // behind; the theme only tints: its accent, the selection, the glass
+        return Theme(accent: h[0], hl: h[0].opacity(0.22), text: .primary, sub: .secondary,
+                     dim: Color(nsColor: .tertiaryLabelColor), gold: h[0], err: h[9])
     }
 }
 
@@ -222,6 +242,7 @@ extension Color {
 let width: CGFloat = 540
 let rowHeight: CGFloat = 22
 let barHeight: CGFloat = 30
+let nowHeight: CGFloat = 26
 let maxRows = 12
 let mono = Font.system(size: 13, design: .monospaced)
 
@@ -250,16 +271,75 @@ struct LauncherView: View {
                 .padding(.vertical, 6)
             }
             if model.note != nil || !model.results.isEmpty {
-                Rectangle().fill(th.dim.opacity(0.6)).frame(height: 1)
+                Rectangle().fill(.separator).frame(height: 1)
             }
             Prompt(model: model, focused: $focused, th: th)
+            if let now = model.now {
+                NowPlaying(now: now, th: th)
+            }
         }
         .font(mono)
         .frame(width: width)
-        .background(th.deep)
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(th.dim.opacity(0.8)))
+        .modifier(Glass(th: th))
         .onAppear { focused = true }
+    }
+}
+
+/// Liquid Glass over a partial blur of what's behind (so text under the window doesn't fight the
+/// results), tinted faintly with the theme's accent; before macOS 26, the blur alone. The glass
+/// follows System Settings (Appearance → Liquid Glass, and Reduce Transparency).
+let glassBlur = 0.5  // how much blur under the glass: 1 frosted and plain, 0 all glass
+struct Glass: ViewModifier {
+    let th: Theme
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        if #available(macOS 26, *) {
+            content.background(Blur().opacity(glassBlur)).clipShape(shape)
+                .glassEffect(.regular.tint(th.accent.opacity(0.06)).interactive(), in: shape)
+        } else {
+            content.background(Blur()).clipShape(shape).overlay(shape.strokeBorder(.separator))
+        }
+    }
+}
+
+/// Dragging here moves the window (macOS 15+; before that, only its empty background does).
+struct DragsWindow: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15, *) {
+            content.contentShape(Rectangle()).gesture(WindowDragGesture())
+        } else {
+            content
+        }
+    }
+}
+
+struct Blur: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .hudWindow
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
+/// `▶ name  artists`, like the top line of spot's player
+struct NowPlaying: View {
+    let now: Playing
+    let th: Theme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(now.playing ? "▶" : "‖").foregroundStyle(th.accent)
+            Text(now.name).foregroundStyle(th.text).bold().lineLimit(1).layoutPriority(1)
+            Text(now.artists).foregroundStyle(th.sub).lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: nowHeight)
+        .modifier(DragsWindow())
     }
 }
 
@@ -288,7 +368,8 @@ struct Prompt: View {
         }
         .padding(.horizontal, 12)
         .frame(height: barHeight)
-        .background(th.text.opacity(0.06))
+        .background(Color.primary.opacity(0.04))
+        .modifier(DragsWindow())
     }
 }
 
@@ -336,7 +417,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: Panel!
     var hotKey: EventHotKeyRef?
     var changes: AnyCancellable?
-    var bottom: CGFloat = 0  // the window's bottom edge, where show() put it
+    var poll: Timer?  // refreshes what's playing while the window is open
+    var bottom: CGFloat = 0  // the window's bottom edge: it grows upward from here
+    var placing = false  // moving the window ourselves, not the user dragging it
     var previous: NSRunningApplication?  // focus goes back here on close
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -349,6 +432,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.backgroundColor = .clear
         panel.isOpaque = false
+        panel.isMovableByWindowBackground = true
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
         panel.delegate = self
@@ -405,28 +489,54 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func show() {
         previous = NSWorkspace.shared.frontmostApplication
         model.reset()
-        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
-        let f = screen.visibleFrame
-        // bottom center, clear of the Dock
-        bottom = f.minY + f.height * 0.12
-        panel.setFrame(NSRect(x: f.midX - width / 2, y: bottom, width: width, height: barHeight), display: false)
+        // where it was dragged to last (if that's still on a screen), else bottom center, clear of the Dock
+        let d = UserDefaults.standard
+        var midX = d.double(forKey: "midX")
+        bottom = d.double(forKey: "bottom")
+        let saved = NSPoint(x: midX, y: bottom + barHeight / 2)
+        if d.object(forKey: "midX") == nil || !NSScreen.screens.contains(where: { NSMouseInRect(saved, $0.visibleFrame, false) }) {
+            let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+            let f = screen.visibleFrame
+            (midX, bottom) = (f.midX, f.minY + f.height * 0.12)
+        }
+        place(NSRect(x: midX - width / 2, y: bottom, width: width, height: barHeight))
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate()
+        model.refreshNow()
+        poll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.model.refreshNow() }
+        }
     }
 
     func hide() {
         guard panel.isVisible else { return }
+        poll?.invalidate()
+        poll = nil
         panel.orderOut(nil)
         if previous?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previous?.activate() }
     }
 
-    /// The prompt line, plus the results (or a note) and a rule above it. The bottom edge stays put,
+    /// The prompt line and what's playing under it, plus the results (or a note) and a rule above it. The bottom edge stays put,
     /// so it grows upward.
     func fit() {
         let above: CGFloat = model.note != nil ? barHeight + 1 : model.results.isEmpty ? 0 : CGFloat(model.results.count) * rowHeight + 12 + 1
-        let h = barHeight + above
+        let h = barHeight + above + (model.now != nil ? nowHeight : 0)
         guard abs(panel.frame.height - h) > 0.5 || abs(panel.frame.minY - bottom) > 0.5 else { return }
-        panel.setFrame(NSRect(x: panel.frame.minX, y: bottom, width: width, height: h), display: true)
+        place(NSRect(x: panel.frame.minX, y: bottom, width: width, height: h))
+    }
+
+    func place(_ frame: NSRect) {
+        placing = true
+        panel.setFrame(frame, display: true)
+        placing = false
+    }
+
+    /// The user dragged it: grow from there, and open there next time.
+    func windowDidMove(_ n: Notification) {
+        guard !placing, panel.isVisible else { return }
+        bottom = panel.frame.minY
+        UserDefaults.standard.set(panel.frame.midX, forKey: "midX")
+        UserDefaults.standard.set(bottom, forKey: "bottom")
     }
 
     func windowDidResignKey(_ n: Notification) { hide() }
