@@ -21,6 +21,9 @@ On anything else (Intel Macs, ARM Linux), or to build from source, use cargo (ne
 Use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to build
 with vergen 9.1.
 
+On macOS there's also a `⌥Space` launcher to search and play from any app; see
+[macOS launcher](#macos-launcher-space).
+
 ### Linux dependencies
 
 ALSA, OpenSSL and D-Bus (audio, HTTPS, and MPRIS media keys). The prebuilt binary needs the
@@ -150,6 +153,24 @@ systemd service.) Media keys and Now Playing work headless too.
 The CLI and the keys drive the same player, so they work at the same time: the window shows what
 the CLI changed, and `--show` also opens the list it played. It talks to spot over a Unix socket
 at `~/.cache/spot/sock`.
+
+## macOS launcher (⌥Space)
+
+A small native app that searches and plays from anywhere: `⌥Space` opens a bar at the bottom of
+the screen in spot's colors (the `ctrl+t` theme, light or dark following the system). Type to
+search, `tab` cycles songs / albums / artists, `↑`/`↓` move, `enter` plays (pressed before the
+results are in, it plays the first one), `⌘enter` adds to the queue, `esc` closes. It's a
+separate program that talks to the running spot over its socket, and starts it (`spot start`)
+if it isn't running. About 18 MB of memory, no CPU while hidden.
+
+Build it from a clone (needs macOS 14+ and the Xcode command line tools, `xcode-select --install`):
+
+    git clone https://github.com/boopdotpng/spot && spot/mac/build.sh
+
+It installs to `~/Applications/Spot Launcher.app` (set `SPOT_LAUNCHER_DIR` to change), starts
+it, and adds it to Login Items on first launch (remove it in System Settings → General → Login
+Items). Run `build.sh` again to update. It needs a spot newer than 1.2.1: until the next release,
+install spot with cargo (above), then quit and restart the player.
 
 ## Notes
 
