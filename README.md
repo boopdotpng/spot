@@ -173,8 +173,8 @@ Build it from a clone (needs macOS 14+ and the Xcode command line tools, `xcode-
 
 It installs to `~/Applications/Spot Launcher.app` (set `SPOT_LAUNCHER_DIR` to change), starts
 it, and adds it to Login Items on first launch (remove it in System Settings → General → Login
-Items). Run `build.sh` again to update. It needs a spot newer than 1.2.1: until the next release,
-install spot with cargo (above), then quit and restart the player.
+Items). Run `build.sh` again to update. It needs spot 1.3.0 or newer: after updating spot,
+quit and restart the player.
 
 ## Notes
 
