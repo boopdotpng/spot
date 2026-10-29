@@ -40,11 +40,12 @@ func spot(_ args: [String]) -> (Int, String) {
     return (code, rest.trimmingCharacters(in: .newlines))
 }
 
-/// `spot start`: the player in the background. Looks where install.sh and cargo put it.
+/// `spot start`: the player in the background. Looks where install.sh and cargo put it, then
+/// asks your shell (an app doesn't get its PATH).
 func startSpot() -> Bool {
     let home = NSHomeDirectory()
     let candidates = ["\(home)/.local/bin/spot", "\(home)/.cargo/bin/spot", "/opt/homebrew/bin/spot", "/usr/local/bin/spot"]
-    guard let exe = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return false }
+    guard let exe = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) ?? fromShell("spot") else { return false }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: exe)
     p.arguments = ["start"]
@@ -53,6 +54,22 @@ func startSpot() -> Bool {
     guard (try? p.run()) != nil else { return false }
     p.waitUntilExit()
     return p.terminationStatus == 0
+}
+
+/// Where your login shell finds `cmd`, if anywhere.
+func fromShell(_ cmd: String) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh")
+    p.arguments = ["-lic", "command -v \(cmd)"]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    p.standardInput = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return nil }
+    p.waitUntilExit()
+    let path = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        .split(separator: "\n").last.map(String.init)?.trimmingCharacters(in: .whitespaces)
+    return path.flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
 }
 
 // MARK: model
@@ -318,12 +335,17 @@ struct Glass: ViewModifier {
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
+        // glass needs the macOS 26 SDK (Xcode 26) to build; older ones build the blur alone
+        #if compiler(>=6.2)
         if #available(macOS 26, *) {
             content.background(Blur().opacity(glassBlur)).clipShape(shape)
                 .glassEffect(.regular.tint(th.accent.opacity(0.06)).interactive(), in: shape)
         } else {
             content.background(Blur()).clipShape(shape).overlay(shape.strokeBorder(.separator))
         }
+        #else
+        content.background(Blur()).clipShape(shape).overlay(shape.strokeBorder(.separator))
+        #endif
     }
 }
 

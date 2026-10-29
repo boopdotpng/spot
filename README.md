@@ -23,8 +23,10 @@ On anything else (Intel Macs, ARM Linux), or to build from source, use cargo (ne
 Use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to build
 with vergen 9.1.
 
-On macOS there's also a `⌥Space` launcher to search and play from any app; see
-[macOS launcher](#macos-launcher-space).
+On macOS there's also a `⌥Space` launcher to search and play from any app. Add `--launcher` to
+install it too (see [macOS launcher](#macos-launcher-space)):
+
+    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh -s -- --launcher
 
 ### Linux dependencies
 
@@ -167,14 +169,22 @@ what's playing; the play icon pauses), `esc` closes. It's a separate program tha
 running spot over its socket, and starts it (`spot start`) if it isn't running. About 18 MB of
 memory, no CPU while hidden.
 
-Build it from a clone (needs macOS 14+ and the Xcode command line tools, `xcode-select --install`):
+Install it with spot (macOS 14+; Liquid Glass on 26+):
 
-    git clone https://github.com/boopdotpng/spot && spot/mac/build.sh
+    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh -s -- --launcher
 
 It installs to `~/Applications/Spot Launcher.app` (set `SPOT_LAUNCHER_DIR` to change), starts
 it, and adds it to Login Items on first launch (remove it in System Settings → General → Login
-Items). Run `build.sh` again to update. It needs spot 1.3.0 or newer: after updating spot,
-quit and restart the player.
+Items). Once it's installed, the plain install command updates it along with spot. It's signed
+ad hoc, not by an Apple developer: fine when installed this way (macOS only checks downloads
+from browsers), but a downloaded copy from the releases page needs System Settings → Privacy &
+Security → Open Anyway the first time.
+
+To build it from a clone instead (needs the Xcode command line tools, `xcode-select --install`;
+Xcode 26 for Liquid Glass): `git clone https://github.com/boopdotpng/spot && spot/mac/build.sh`.
+Run `build.sh` again to update.
+
+It needs spot 1.3.0 or newer: after updating spot, quit and restart the player.
 
 ## Notes
 

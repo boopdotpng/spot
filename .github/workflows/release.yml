@@ -29,17 +29,32 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - if: runner.os == 'macOS'
+        name: launcher
+        run: |
+          # the newest Xcode here: Liquid Glass needs the macOS 26 SDK (an older one would build without it)
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          sdk="$(xcrun --show-sdk-version)"
+          echo "macOS SDK $sdk"
+          [ "${sdk%%.*}" -ge 26 ] || { echo "the launcher needs the macOS 26 SDK"; exit 1; }
+          mac/build.sh --out launcher
       - if: startsWith(github.ref, 'refs/tags/')
         name: package
         run: |
           name=spot-${{ matrix.target }}
           tar -czf $name.tar.gz -C target/${{ matrix.target }}/release spot
           shasum -a 256 $name.tar.gz > $name.tar.gz.sha256
+          if [ -d launcher ]; then
+            ditto -c -k --keepParent "launcher/Spot Launcher.app" Spot-Launcher.zip
+            shasum -a 256 Spot-Launcher.zip > Spot-Launcher.zip.sha256
+          fi
       - if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: spot-${{ matrix.target }}.tar.gz*
+          path: |
+            spot-${{ matrix.target }}.tar.gz*
+            Spot-Launcher.zip*
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

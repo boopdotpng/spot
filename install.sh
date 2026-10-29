@@ -1,7 +1,17 @@
 #!/bin/sh
 # Installs the latest spot release: curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh
 # SPOT_INSTALL_DIR overrides where it goes (default ~/.local/bin).
+# On macOS, `| sh -s -- --launcher` also installs the ⌥Space launcher app to ~/Applications
+# (SPOT_LAUNCHER_DIR to change); once it's installed, running this again updates it too.
 set -eu
+
+launcher=0
+for arg in "$@"; do
+  case "$arg" in
+    --launcher) launcher=1 ;;
+    *) echo "spot install: unknown option $arg (only --launcher)" >&2; exit 2 ;;
+  esac
+done
 
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) target=aarch64-apple-darwin ;;
@@ -13,7 +23,8 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 dir="${SPOT_INSTALL_DIR:-$HOME/.local/bin}"
-url="https://github.com/boopdotpng/spot/releases/latest/download/spot-$target.tar.gz"
+releases="https://github.com/boopdotpng/spot/releases/latest/download"
+url="$releases/spot-$target.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -32,4 +43,25 @@ case ":$PATH:" in
 esac
 if [ "$target" = x86_64-unknown-linux-gnu ]; then
   echo "linux: needs ALSA, OpenSSL 3 and D-Bus libraries (libasound2, libssl3, libdbus-1-3)"
+  if [ "$launcher" = 1 ]; then
+    echo "note: the launcher is a macOS app; skipped" >&2
+  fi
+  exit
+fi
+
+app="${SPOT_LAUNCHER_DIR:-$HOME/Applications}/Spot Launcher.app"
+if [ "$launcher" = 1 ] || [ -d "$app" ]; then
+  url="$releases/Spot-Launcher.zip"
+  echo "downloading $url"
+  # fetched with curl, so macOS doesn't quarantine it and its ad hoc signature is enough
+  curl -fsSL "$url" -o "$tmp/launcher.zip"
+  ditto -x -k "$tmp/launcher.zip" "$tmp/launcher"
+  pkill -x SpotLauncher 2>/dev/null || true
+  # wait for the old one to exit, or `open` fails (-600)
+  for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x SpotLauncher >/dev/null || break; sleep 0.2; done
+  mkdir -p "$(dirname "$app")"
+  rm -rf "$app"
+  mv "$tmp/launcher/Spot Launcher.app" "$app"
+  open "$app"
+  echo "installed $app: ⌥Space opens it (it adds itself to Login Items)"
 fi
