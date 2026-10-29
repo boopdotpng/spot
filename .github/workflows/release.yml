@@ -44,7 +44,7 @@ jobs:
           name=spot-${{ matrix.target }}
           tar -czf $name.tar.gz -C target/${{ matrix.target }}/release spot
           shasum -a 256 $name.tar.gz > $name.tar.gz.sha256
-          if [ -d launcher ]; then
+          if [ "$RUNNER_OS" = macOS ]; then
             ditto -c -k --keepParent "launcher/Spot Launcher.app" Spot-Launcher.zip
             shasum -a 256 Spot-Launcher.zip > Spot-Launcher.zip.sha256
           fi

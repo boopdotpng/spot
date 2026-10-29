@@ -3,11 +3,14 @@
 # installs it to ~/Applications. It adds itself to Login Items on first launch.
 # `build.sh --out DIR` only builds it, into DIR (what the release workflow does).
 set -eu
-cd "$(dirname "$0")"
 out=""
 if [ "${1:-}" = --out ]; then
-  out="$2"
+  case "$2" in
+    /*) out="$2" ;;
+    *) out="$PWD/$2" ;;  # relative to where it was run, not mac/
+  esac
 fi
+cd "$(dirname "$0")"
 app="${SPOT_LAUNCHER_DIR:-$HOME/Applications}/Spot Launcher.app"
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml)"
 tmp="$(mktemp -d)"
