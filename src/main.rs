@@ -146,6 +146,7 @@ fn main() {
         None => {}
         Some("--headless") if args.len() == 1 => {}
         Some("clean") => return clean_cache(),
+        Some("-v" | "--version") if args.len() == 1 => return println!("spot {}", env!("CARGO_PKG_VERSION")),
         Some(c) if cli::COMMANDS.contains(&c) => std::process::exit(cli::client(args)),
         Some(a) => {
             let ok = matches!(a, "-h" | "--help" | "help");

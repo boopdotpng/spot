@@ -22,6 +22,7 @@ spot: tiny Spotify player, and a command line for the one that's running
   spot --headless            the same in the foreground, for a launchd / systemd service
   spot quit                  stop the player, either kind (it resumes where it was next start)
   spot clean                 clear cached songs and lists (keeps login)
+  spot -v, --version         which spot this is
 
 Control the running player, from any terminal, script or agent:
   spot status                what's playing, position, queue, modes, volume, what's next
@@ -58,8 +59,7 @@ Control the running player, from any terminal, script or agent:
 
 Finding music: `spot play <words>` plays the top hit and says so; to choose, `spot search` and
 `spot play N`. Several of your playlists matching lists them, numbered for `spot play N`.
-Spotify links (https://open.spotify.com/...) work anywhere a uri does.
-Exit codes: 0 ok, 1 error, 2 bad usage, 3 spot isn't running.";
+Spotify links (https://open.spotify.com/...) work anywhere a uri does.";
 
 /// True once no player holds the lock: after a quit, the old one may still be finishing up
 /// (sending a scrobble) for a moment after its socket is gone.
