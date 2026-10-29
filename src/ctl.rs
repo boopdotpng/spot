@@ -100,6 +100,18 @@ fn uri_arg(a: &str) -> Result<String, Fail> {
     })
 }
 
+/// A search result's image closest to 300px wide (sharp at thumbnail size on a retina screen), or "".
+fn cover(v: &Value) -> String {
+    let images = v["images"].as_array().map_or(&[][..], Vec::as_slice);
+    let near = images.iter().min_by_key(|i| i["width"].as_u64().unwrap_or(0).abs_diff(300));
+    near.and_then(|i| i["url"].as_str()).unwrap_or("").into()
+}
+
+/// Fields joined by tabs, with any tabs or newlines inside them made spaces.
+fn tsv_row(fields: &[&str]) -> String {
+    fields.iter().map(|f| f.replace(['\t', '\n'], " ")).collect::<Vec<_>>().join("\t")
+}
+
 /// Take `--flag` out of the arguments.
 fn flag(args: &mut Vec<String>, f: &str) -> bool {
     let i = args.iter().position(|a| a == f);
@@ -357,6 +369,9 @@ impl App {
         let kinds = [("--tracks", "track"), ("--songs", "track"), ("--albums", "album"), ("--artists", "artist"), ("--playlists", "playlist")];
         let ty = kinds.iter().filter(|(f, _)| flag(&mut args, f)).map(|(_, k)| *k).last().unwrap_or("track");
         let n = num_opt(&mut args, "-n")?.unwrap_or(10).clamp(1, 50) as usize;
+        // for programs (the macOS launcher): uri, name, subtitle, cover url, ms, explicit; tab-separated,
+        // unnumbered, and the last search's numbers are left alone
+        let tsv = flag(&mut args, "--tsv");
         if args.is_empty() {
             return Err(usage("search: for what?"));
         }
@@ -367,11 +382,20 @@ impl App {
                 for i in items {
                     if ty == "track" {
                         if let Some(t) = parse_track(i) {
-                            rows.push(format!("{} · {}  {}  {}", song(&t), t.album, mmss(t.ms), t.uri));
+                            rows.push(if tsv {
+                                let sub = format!("{} · {}", t.artists, t.album);
+                                tsv_row(&[&t.uri, &t.name, &sub, &cover(&i["album"]), &t.ms.to_string(), if t.explicit { "1" } else { "" }])
+                            } else {
+                                format!("{} · {}  {}  {}", song(&t), t.album, mmss(t.ms), t.uri)
+                            });
                             uris.push(t.uri);
                         }
                     } else if let Some(l) = parse_link(ty, i) {
-                        rows.push(format!("{} · {}  {}", l.name, l.sub, l.uri));
+                        rows.push(if tsv {
+                            tsv_row(&[&l.uri, &l.name, &l.sub, &cover(i), "", ""])
+                        } else {
+                            format!("{} · {}  {}", l.name, l.sub, l.uri)
+                        });
                         uris.push(l.uri);
                     }
                 }
@@ -379,6 +403,7 @@ impl App {
             .await;
             let _ = reply.send(match res {
                 Err(e) => fail(e),
+                Ok(()) if tsv => (0, rows.join("\n")),
                 Ok(()) if rows.is_empty() => (0, "no results".into()),
                 Ok(()) => {
                     save_results(&uris);
