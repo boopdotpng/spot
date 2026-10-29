@@ -314,7 +314,7 @@ struct Glass: ViewModifier {
     let th: Theme
 
     func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
         if #available(macOS 26, *) {
             content.background(Blur().opacity(glassBlur)).clipShape(shape)
                 .glassEffect(.regular.tint(th.accent.opacity(0.06)).interactive(), in: shape)
@@ -335,12 +335,23 @@ struct DragsWindow: ViewModifier {
     }
 }
 
+let corner: CGFloat = 14
+
 struct Blur: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
         v.material = .hudWindow
         v.blendingMode = .behindWindow
         v.state = .active
+        // the window server blurs the view's whole rectangle, whatever SwiftUI clips; only a mask
+        // rounds it (else its square corners show past the glass)
+        let mask = NSImage(size: NSSize(width: corner * 2 + 1, height: corner * 2 + 1), flipped: false) { r in
+            NSBezierPath(roundedRect: r, xRadius: corner, yRadius: corner).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: corner, left: corner, bottom: corner, right: corner)
+        mask.resizingMode = .stretch
+        v.maskImage = mask
         return v
     }
     func updateNSView(_ v: NSVisualEffectView, context: Context) {}
@@ -393,10 +404,16 @@ struct Prompt: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(th.sub)
-            TextField("", text: $model.query, prompt: Text("Search \(model.kind.rawValue)").foregroundStyle(th.dim))
-                .textFieldStyle(.plain)
-                .foregroundStyle(th.text)
-                .focused(focused)
+            // the placeholder is ours, not the field's: AppKit's keeps its first color and isn't vibrant on glass
+            ZStack(alignment: .leading) {
+                if model.query.isEmpty {
+                    Text("Search \(model.kind.rawValue)").foregroundStyle(th.dim).allowsHitTesting(false)
+                }
+                TextField("", text: $model.query)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(th.text)
+                    .focused(focused)
+            }
             if model.busy {
                 Text("…").foregroundStyle(th.dim)
             }
@@ -476,7 +493,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.isMovableByWindowBackground = true
-        panel.hasShadow = true
+        panel.hasShadow = false  // the window server's is square at the corners; the glass draws its own
         panel.hidesOnDeactivate = false
         panel.delegate = self
         let host = NSHostingView(rootView: LauncherView(model: model))
@@ -573,7 +590,6 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func place(_ frame: NSRect) {
         placing = true
         panel.setFrame(frame, display: true)
-        panel.invalidateShadow()  // else it keeps the old size's shape: square corners peek out
         placing = false
     }
 
