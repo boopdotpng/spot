@@ -238,9 +238,16 @@ impl App {
     fn command(&mut self, cmd: &str, mut args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
         let nothing = || fail("nothing to play: start something with `spot play <words>`");
         match cmd {
-            // for programs: playing (1 or empty), name, artists, album, uri; nothing playing is no line
+            // for programs: playing (1 or empty), name, artists, album, uri, shuffle (1 or empty),
+            // repeat (off, all, one); nothing playing is no line
             "status" if flag(&mut args, "--tsv") => {
-                let row = |t: &Track| tsv_row(&[if self.want_play { "1" } else { "" }, &t.name, &t.artists, &t.album, &t.uri]);
+                let repeat = match self.repeat {
+                    Repeat::Off => "off",
+                    Repeat::All => "all",
+                    Repeat::One => "one",
+                };
+                let on = |b: bool| if b { "1" } else { "" };
+                let row = |t: &Track| tsv_row(&[on(self.want_play), &t.name, &t.artists, &t.album, &t.uri, on(self.shuffle), repeat]);
                 return Ok(Some(self.now().map(row).unwrap_or_default()));
             }
             "status" => {}
