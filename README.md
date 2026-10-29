@@ -6,7 +6,7 @@ Needs Spotify Premium. macOS and Linux.
 
 ![spot playing an album in Ghostty](assets/screenshot.png)
 
-![the ⌥Space launcher searching songs](assets/launcher.png)
+![the ⌥Space launcher searching songs, in light mode](assets/launcher.png)
 
 ## Install
 
@@ -158,12 +158,14 @@ at `~/.cache/spot/sock`.
 
 ## macOS launcher (⌥Space)
 
-A small native app that searches and plays from anywhere: `⌥Space` opens a Liquid Glass bar at
-the bottom of the screen, tinted with spot's `ctrl+t` theme, with what's playing under the search.
-Drag it anywhere; it opens there next time. Type to search, `tab` cycles songs / albums / artists, `↑`/`↓` move, `enter` plays (pressed before the
-results are in, it plays the first one), `⌘enter` adds to the queue, `esc` closes. It's a
-separate program that talks to the running spot over its socket, and starts it (`spot start`)
-if it isn't running. About 18 MB of memory, no CPU while hidden.
+A small native app that searches and plays from anywhere: `⌥Space` opens a Liquid Glass bar at the
+bottom of the screen, tinted with spot's `ctrl+t` theme, with what's playing under the search. Drag
+it anywhere; it opens there next time. Type to search, `tab` cycles songs / albums / artists,
+`↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the first one), `⌘enter`
+adds to the queue, `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the icons beside
+what's playing; the play icon pauses), `esc` closes. It's a separate program that talks to the
+running spot over its socket, and starts it (`spot start`) if it isn't running. About 18 MB of
+memory, no CPU while hidden.
 
 Build it from a clone (needs macOS 14+ and the Xcode command line tools, `xcode-select --install`):
 

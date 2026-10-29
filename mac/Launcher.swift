@@ -1,6 +1,6 @@
 // Spot Launcher: ⌥Space from anywhere opens a Spotlight-style bar that searches Spotify through
 // the running spot (over its socket, ~/.cache/spot/sock) and plays what you pick.
-// ↑↓ move, ⏎ plays, ⌘⏎ queues, tab cycles songs / albums / artists, esc closes.
+// ↑↓ move, ⏎ plays, ⌘⏎ queues, tab cycles songs / albums / artists, ⌃S shuffle, ⌃R repeat, esc closes.
 
 import AppKit
 import Carbon.HIToolbox
@@ -82,8 +82,10 @@ struct Result: Identifiable {
 
 /// What spot is playing, from `spot status --tsv`.
 struct Playing: Equatable {
-    let playing: Bool
+    var playing: Bool
     let name, artists: String
+    var shuffle: Bool
+    var repeats: String  // off, all, one
 }
 
 @MainActor
@@ -152,8 +154,25 @@ final class Model: ObservableObject {
         Task {
             let (code, text) = await Task.detached { spot(["status", "--tsv"]) }.value
             let f = text.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            let now = code == 0 && f.count >= 3 ? Playing(playing: f[0] == "1", name: f[1], artists: f[2]) : nil
+            let now = code == 0 && f.count >= 7
+                ? Playing(playing: f[0] == "1", name: f[1], artists: f[2], shuffle: f[5] == "1", repeats: f[6]) : nil
             if now != self.now { self.now = now }
+        }
+    }
+
+    func togglePlay() { control(["toggle"]) { $0.playing.toggle() } }
+    func toggleShuffle() { control(["shuffle"]) { $0.shuffle.toggle() } }
+    /// off → all → one, as spot's `r` does.
+    func cycleRepeat() { control(["repeat"]) { $0.repeats = ["off": "all", "all": "one"][$0.repeats] ?? "off" } }
+
+    /// Show the change right away, then tell spot and check what it did.
+    private func control(_ args: [String], _ change: (inout Playing) -> Void) {
+        guard var n = now else { return }
+        change(&n)
+        now = n
+        Task {
+            _ = await Task.detached { spot(args) }.value
+            refreshNow()
         }
     }
 
@@ -246,7 +265,7 @@ let nowHeight: CGFloat = 26
 let maxRows = 12
 let mono = Font.system(size: 13, design: .monospaced)
 
-/// spot's status line and list, floating: results numbered above, the `/` prompt at the bottom.
+/// spot's status line and list, floating: results numbered above, the search line at the bottom.
 struct LauncherView: View {
     @ObservedObject var model: Model
     @FocusState private var focused: Bool
@@ -263,19 +282,21 @@ struct LauncherView: View {
             } else if !model.results.isEmpty {
                 VStack(spacing: 0) {
                     ForEach(Array(model.results.enumerated()), id: \.element.id) { i, r in
-                        Row(n: i + 1, result: r, songs: model.kind == .songs, selected: i == model.selected, th: th)
+                        // the list's margin belongs to its first and last rows, so their highlight
+                        // reaches the window's top edge and the rule
+                        let margin: (top: CGFloat, bottom: CGFloat) = (i == 0 ? 6 : 0, i == model.results.count - 1 ? 6 : 0)
+                        Row(n: i + 1, result: r, songs: model.kind == .songs, selected: i == model.selected, margin: margin, th: th)
                             .contentShape(Rectangle())
                             .onTapGesture { model.selected = i; model.choose(queue: false) }
                     }
                 }
-                .padding(.vertical, 6)
             }
             if model.note != nil || !model.results.isEmpty {
                 Rectangle().fill(.separator).frame(height: 1)
             }
             Prompt(model: model, focused: $focused, th: th)
             if let now = model.now {
-                NowPlaying(now: now, th: th)
+                NowPlaying(model: model, now: now, th: th)
             }
         }
         .font(mono)
@@ -327,15 +348,18 @@ struct Blur: NSViewRepresentable {
 
 /// `▶ name  artists`, like the top line of spot's player
 struct NowPlaying: View {
+    @ObservedObject var model: Model
     let now: Playing
     let th: Theme
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(now.playing ? "▶" : "‖").foregroundStyle(th.accent)
+            icon(now.playing ? "pause.fill" : "play.fill", on: true, help: now.playing ? "Pause" : "Play", model.togglePlay)
             Text(now.name).foregroundStyle(th.text).bold().lineLimit(1).layoutPriority(1)
             Text(now.artists).foregroundStyle(th.sub).lineLimit(1)
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            icon("shuffle", on: now.shuffle, help: "Shuffle (⌃S)", model.toggleShuffle)
+            icon(now.repeats == "one" ? "repeat.1" : "repeat", on: now.repeats != "off", help: "Repeat (⌃R)", model.cycleRepeat)
         }
         .padding(.horizontal, 12)
         .frame(height: nowHeight)
@@ -343,7 +367,22 @@ struct NowPlaying: View {
     }
 }
 
-/// ` / query▏          songs · albums · artists`
+extension NowPlaying {
+    /// An SF Symbol button: the theme's accent when on, faint when off.
+    func icon(_ name: String, on: Bool, help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(on ? th.accent : th.dim)
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+/// `🔍 query▏          songs · albums · artists`
 struct Prompt: View {
     @ObservedObject var model: Model
     var focused: FocusState<Bool>.Binding
@@ -351,8 +390,10 @@ struct Prompt: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text("/").foregroundStyle(th.accent).bold()
-            TextField("", text: $model.query, prompt: Text("search").foregroundStyle(th.dim))
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(th.sub)
+            TextField("", text: $model.query, prompt: Text("Search \(model.kind.rawValue)").foregroundStyle(th.dim))
                 .textFieldStyle(.plain)
                 .foregroundStyle(th.text)
                 .focused(focused)
@@ -368,7 +409,6 @@ struct Prompt: View {
         }
         .padding(.horizontal, 12)
         .frame(height: barHeight)
-        .background(Color.primary.opacity(0.04))
         .modifier(DragsWindow())
     }
 }
@@ -379,6 +419,7 @@ struct Row: View {
     let result: Result
     let songs: Bool
     let selected: Bool
+    let margin: (top: CGFloat, bottom: CGFloat)
     let th: Theme
 
     var body: some View {
@@ -399,6 +440,8 @@ struct Row: View {
         }
         .padding(.horizontal, 12)
         .frame(height: rowHeight)
+        .padding(.top, margin.top)
+        .padding(.bottom, margin.bottom)
         .background(selected ? th.hl : .clear)
     }
 }
@@ -464,6 +507,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case kVK_ANSI_P where e.modifierFlags.contains(.control): model.move(-1)
         case kVK_Return, kVK_ANSI_KeypadEnter: model.choose(queue: cmd)
         case kVK_Tab: model.cycleKind(back: e.modifierFlags.contains(.shift))
+        case kVK_ANSI_S where e.modifierFlags.contains(.control): model.toggleShuffle()
+        case kVK_ANSI_R where e.modifierFlags.contains(.control): model.cycleRepeat()
         case kVK_ANSI_Q where cmd: NSApp.terminate(nil)
         default: return false
         }
@@ -528,6 +573,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func place(_ frame: NSRect) {
         placing = true
         panel.setFrame(frame, display: true)
+        panel.invalidateShadow()  // else it keeps the old size's shape: square corners peek out
         placing = false
     }
 
