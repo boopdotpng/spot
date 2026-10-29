@@ -64,5 +64,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { path: dist, merge-multiple: true }
+      # the notes are the tag's message; checkout leaves that out, so fetch the tag itself
       - env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "spot $GITHUB_REF_NAME" --generate-notes
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          if [ "$(git cat-file -t "$GITHUB_REF_NAME")" != tag ]; then
+            echo "::error::$GITHUB_REF_NAME has no notes: tag it with git tag -a $GITHUB_REF_NAME --cleanup=verbatim -F notes.md"
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "spot $GITHUB_REF_NAME" --notes-from-tag

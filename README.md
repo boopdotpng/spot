@@ -234,10 +234,13 @@ It needs spot 1.3.0 or newer: after updating spot, quit and restart the player.
 
 ## Releasing
 
-Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), commit, then tag and push:
+Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), commit, then
+write the release notes (markdown) and tag with them, and push:
 
-    git tag v1.1.0 && git push origin master v1.1.0
+    git tag -a v1.1.0 --cleanup=verbatim -F notes.md && git push origin master v1.1.0
 
+(`--cleanup=verbatim` keeps the `## ` headings, which git would otherwise strip as comments.)
 GitHub Actions builds Apple Silicon macOS and x86_64 Linux binaries and publishes the release
-with generated notes; `install.sh` always fetches the latest one. Pushes to master also build
-(no release) to keep the Rust cache warm; changes to only `.md` files skip CI.
+with the tag's message as its notes (a tag without one fails the release); `install.sh` always
+fetches the latest one. Pushes to master also build (no release) to keep the Rust cache warm;
+changes to only `.md` files skip CI.
