@@ -6,6 +6,8 @@ Needs Spotify Premium. macOS and Linux.
 
 ![spot playing an album in Ghostty](assets/screenshot.png)
 
+![the ⌥Space launcher searching songs](assets/launcher.png)
+
 ## Install
 
 Prebuilt binaries for Apple Silicon macOS and x86_64 Linux:
