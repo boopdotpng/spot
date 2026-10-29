@@ -190,6 +190,10 @@ fn handle(mut conn: UnixStream, tx: mpsc::Sender<Msg>) {
     }
     let mut args: Vec<String> = line.trim_end_matches('\n').split('\t').map(String::from).collect();
     log::debug!("cli: {args:?}");
+    if args.first().is_some_and(|a| a == "attach") {
+        crate::terminal::serve(conn, &args, tx);
+        return;
+    }
     if matches!(args[0].as_str(), "watch" | "wait") {
         match watcher(&mut args) {
             Ok((before_ms, until)) => {

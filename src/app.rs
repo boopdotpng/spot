@@ -112,6 +112,7 @@ pub struct App {
     pub finished: bool,         // the queue ran out
     pub ctl: ctl::State,
     pub quit: bool,
+    pub terminal: Option<terminal::Display>,
 }
 
 impl App {
@@ -122,12 +123,12 @@ impl App {
                 self.status.clear();
                 self.on_key(k);
             }
-            Msg::Redraw => {}
+            Msg::Attach(a) => self.attach_terminal(a),
+            Msg::Terminal { id, event } => self.terminal_event(id, event),
             Msg::Scheme(light) => {
                 LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
                 // the background changed with it: ask for the new one (answered as Msg::Background)
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(b"\x1b]11;?\x1b\\").and_then(|_| std::io::stdout().flush());
+                self.query_background();
             }
             Msg::Background(bg) => BG.store(bg, std::sync::atomic::Ordering::Relaxed),
             Msg::Player(ev) => self.on_player(ev),

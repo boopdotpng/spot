@@ -63,12 +63,15 @@ pub fn last_path() -> PathBuf {
 }
 
 pub fn write_atomic(path: &std::path::Path, data: &str) {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("tmp");
-    if fs::write(&tmp, data).is_ok() {
-        let _ = fs::rename(&tmp, path);
+    // Background refreshes can write the same list concurrently. Each needs its own temp file.
+    let tmp = path.with_extension(format!("{}.{:016x}.tmp", std::process::id(), rand::random::<u64>()));
+    let Ok(mut file) = fs::OpenOptions::new().write(true).create_new(true).open(&tmp) else { return };
+    if file.write_all(data.as_bytes()).and_then(|_| fs::rename(&tmp, path)).is_err() {
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -77,7 +80,7 @@ pub fn clean(s: &str) -> std::borrow::Cow<'_, str> {
     if s.contains(['\t', '\n', '\r']) { s.replace(['\t', '\n', '\r'], " ").into() } else { s.into() }
 }
 
-pub fn push_tracks(out: &mut String, tracks: &[Track]) {
+pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Track>) {
     use std::fmt::Write;
     for t in tracks {
         let _ = writeln!(
@@ -200,7 +203,7 @@ pub fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
         repeat as u8,
         order.join(",")
     );
-    push_tracks(&mut s, &q.tracks);
+    push_tracks(&mut s, q.tracks.iter());
     write_atomic(&last_path(), &s);
 }
 
@@ -232,4 +235,34 @@ pub fn clean_cache() {
 /// The running player's control socket (ctl.rs).
 pub fn sock_path() -> PathBuf {
     cache_dir().join("sock")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_cache_writes_publish_complete_files() {
+        let dir = std::env::temp_dir().join(format!("spot-cache-test-{:016x}", rand::random::<u64>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("list");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let (path, barrier) = (&path, &barrier);
+                scope.spawn(move || {
+                    let data = i.to_string().repeat(64 * 1024);
+                    barrier.wait();
+                    for _ in 0..10 {
+                        write_atomic(path, &data);
+                        let saved = fs::read(path).unwrap();
+                        assert_eq!(saved.len(), data.len());
+                        assert!(saved.iter().all(|&b| b == saved[0]));
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

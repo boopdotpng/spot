@@ -68,6 +68,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('d') if !ctrl => self.detach_terminal_saying("detached; `spot` brings it back"),
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('/') => self.input = Some(String::new()),
             KeyCode::Char('?') => self.help = !self.help,
@@ -131,28 +132,8 @@ impl App {
     }
 }
 
-// ---------- main ----------
-
-// ratatui hides the cursor; we exit via process::exit so Terminal's Drop never re-shows it.
-/// Reads keys from stdin. Crossterm's reader can't be used: it treats the terminal's color
+/// Parse raw terminal input. Crossterm's reader can't be used: it treats the terminal's color
 /// scheme report (`CSI ? 997 ; 1|2 n`) as an unfinished sequence and swallows the keys after it.
-pub fn read_input(tx: mpsc::Sender<Msg>) {
-    use std::io::Read;
-    let mut stdin = std::io::stdin().lock();
-    let mut buf = [0u8; 1024];
-    loop {
-        let n = match stdin.read(&mut buf) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        for m in parse_input(&buf[..n]) {
-            if tx.send(m).is_err() {
-                return;
-            }
-        }
-    }
-}
-
 pub fn parse_input(b: &[u8]) -> Vec<Msg> {
     let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
     let ctrl = |c: u8| Msg::Key(KeyEvent::new(KeyCode::Char(c as char), KeyModifiers::CONTROL));

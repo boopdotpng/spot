@@ -129,6 +129,7 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("ctrl+t", "theme"),
         ("g  M  G", "top / middle / bottom"),
         ("q", "quit"),
+        ("d", "detach (keep playing)"),
     ];
     const COL: usize = 36;
     let cols = (width.saturating_sub(1) / COL).clamp(1, 4);
@@ -149,6 +150,22 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
     }
     out
 }
+
+/// Keep the selection visible, examining at most one screen of songs even after a big jump.
+fn table_offset(off: usize, selected: usize, height: usize, starts_disc: impl Fn(usize) -> bool) -> usize {
+    let mut off = off.min(selected).max(selected.saturating_sub(height.saturating_sub(1)));
+    let mut lines: usize = (off..=selected)
+        .map(|r| 1 + if starts_disc(r) { if r == off { 1 } else { 2 } } else { 0 })
+        .sum();
+    while off < selected && lines > height {
+        lines -= 1 + usize::from(starts_disc(off));
+        off += 1;
+        // A disc header at the top no longer needs a blank line above it.
+        lines -= usize::from(starts_disc(off));
+    }
+    off
+}
+
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     use ratatui::{layout::Rect, widgets::HighlightSpacing};
@@ -261,14 +278,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let starts_disc = |r: usize| discs && (r == 0 || disc_of(r) != disc_of(r - 1));
     // lines above row r's song when the window starts at `off`
     let above = |r: usize, off: usize| if !starts_disc(r) { 0 } else if r == off { 1 } else { 2 };
-    let lines_to = |off: usize, s: usize| (off..=s).map(|r| 1 + above(r, off)).sum::<usize>();
     if let Some(s) = sel {
-        if s < off {
-            off = s;
-        }
-        while off < s && lines_to(off, s) > height {
-            off += 1;
-        }
+        off = table_offset(off, s, height, starts_disc);
     }
     let num_w = num(app.view.len().max(1)).len() as u16;
     let wide = table_area.width >= 90; // room for an album column
@@ -526,4 +537,42 @@ pub fn prompt(label: &str, color: Color, buf: &str, avail: usize, th: &Theme) ->
         Span::styled(text, Style::new().fg(th.text)),
         Span::styled("▏", Style::new().fg(color)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::table_offset;
+
+    #[test]
+    fn scrolling_matches_original_layout_with_and_without_disc_headers() {
+        for discs in [false, true] {
+            let starts_disc = |r: usize| discs && r.is_multiple_of(5);
+            for height in 0..15 {
+                for selected in 0..40 {
+                    for old in 0..40 {
+                        let mut expected = old.min(selected);
+                        while expected < selected {
+                            let lines: usize = (expected..=selected)
+                                .map(|r| 1 + if starts_disc(r) { if r == expected { 1 } else { 2 } } else { 0 })
+                                .sum();
+                            if lines <= height { break; }
+                            expected += 1;
+                        }
+                        assert_eq!(table_offset(old, selected, height, starts_disc), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jumping_to_end_only_examines_one_screen() {
+        let calls = std::cell::Cell::new(0);
+        let off = table_offset(0, 100_000, 30, |_| {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert_eq!(off, 99_971);
+        assert!(calls.get() <= 30);
+    }
 }

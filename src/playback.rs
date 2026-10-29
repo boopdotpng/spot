@@ -139,7 +139,7 @@ impl App {
             let _ = fs::remove_file(path);
         } else {
             let mut s = format!("{}\n", self.queued.is_some() as u8);
-            push_tracks(&mut s, &self.queued.iter().chain(&self.upnext).cloned().collect::<Vec<_>>());
+            push_tracks(&mut s, self.queued.iter().chain(&self.upnext));
             write_atomic(&path, &s);
         }
     }
@@ -337,10 +337,10 @@ impl App {
 
     /// Keep queue views (open or in the history) showing the queue as it changes.
     pub fn queue_changed(&mut self) {
-        let tracks = Arc::new(self.upnext.clone());
+        let mut tracks = None;
         for v in std::iter::once(&mut self.view).chain(self.history.iter_mut().map(|(v, _)| v)) {
             if v.key == QUEUE_KEY {
-                v.tracks = tracks.clone();
+                v.tracks = tracks.get_or_insert_with(|| Arc::new(self.upnext.clone())).clone();
             }
         }
         if self.view.key == QUEUE_KEY {

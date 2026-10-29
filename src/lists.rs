@@ -152,18 +152,16 @@ pub async fn send_tracks(
     view: u64,
 ) -> Result<Vec<Track>, String> {
     let mut seen = std::collections::HashSet::new();
-    let mut all = vec![];
+    let mut all = Vec::with_capacity(uris.len());
     for chunk in uris.chunks(200) {
-        let mut found = batch_meta::<PbTrack>(session, chunk, ExtensionKind::TRACK_V4).await?;
-        let tracks: Vec<Track> = chunk
-            .iter()
-            .filter_map(|u| found.remove(u).map(|t| pb_track(u, &t)))
+        let found = batch_meta::<PbTrack>(session, chunk, ExtensionKind::TRACK_V4).await?;
+        let tracks: Vec<Track> = tracks_in_order(chunk, &found)
             .filter(|t| !dedupe || seen.insert((t.name.to_lowercase(), t.artists.to_lowercase())))
             .collect();
-        all.extend_from_slice(&tracks);
         if stream {
-            let _ = tx.send(Msg::Tracks { view, tracks, done: false });
+            let _ = tx.send(Msg::Tracks { view, tracks: tracks.clone(), done: false });
         }
+        all.extend(tracks);
     }
     Ok(all)
 }

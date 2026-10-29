@@ -99,12 +99,14 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
 | `?` | key help (any key closes it) |
 | `q` | quit |
+| `d` | detach the TUI; music keeps playing (`spot` brings it back) |
 
 Media keys and the macOS Now Playing widget work too.
 
 ## Command line
 
-Only one spot plays at a time; starting a second one says so. Instead, control the running one
+Only one spot plays at a time. Running `spot` starts the background player if needed and opens
+its TUI; when it's already playing, `spot` attaches to that same player. Control the running one
 from any terminal, script or agent (an LLM can drive it from `spot help` alone):
 
     spot search daft punk            # songs (--albums, --artists, --playlists; -n 20), numbered, with uris
@@ -153,6 +155,12 @@ so a script or an agent (Claude Code's Bash tool, say) can start it and carry on
 stops it, keeping the resume point like `q` does. Log in once by running `spot` in a terminal
 first. (`spot --headless` is the same player in the foreground, for running it as a launchd or
 systemd service.) Media keys and Now Playing work headless too.
+
+Press `d` in the TUI to close it while the music keeps playing. `spot` opens it again,
+preserving the open list, cursor, queue and playback position. Closing the terminal also leaves
+the player running. One TUI is open at a time: running `spot` in another terminal takes it over,
+closing the old one. `q` and `spot quit` stop the player and music as before. After upgrading
+an older running player, quit and start it once so `spot` can reopen its TUI.
 
 The CLI and the keys drive the same player, so they work at the same time: the window shows what
 the CLI changed, and `--show` also opens the list it played. It talks to spot over a Unix socket

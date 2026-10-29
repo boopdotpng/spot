@@ -115,7 +115,8 @@ impl Playlist {
 
 pub enum Msg {
     Key(KeyEvent),
-    Redraw,
+    Attach(terminal::Attachment),
+    Terminal { id: u64, event: terminal::Event },
     Scheme(bool), // terminal switched color scheme; true = light
     Background(u32), // terminal's background color (OSC 11 reply)
     Player(PlayerEvent),

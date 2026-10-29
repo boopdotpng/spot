@@ -16,7 +16,8 @@ pub const COMMANDS: &[&str] = &[
 pub const USAGE: &str = "\
 spot: tiny Spotify player, and a command line for the one that's running
 
-  spot                       start the player in this terminal (one at a time; it holds the audio)
+  spot                       open the TUI, starting the player in the background if needed (and
+                             taking the TUI from any other terminal); d closes it, music playing
   spot start                 start it in the background, without a window, and return once
                              it's ready (what scripts and agents should use)
   spot --headless            the same in the foreground, for a launchd / systemd service
@@ -127,7 +128,7 @@ pub fn client(args: Vec<String>) -> i32 {
 
 /// `spot start`: run `spot --headless` detached from this terminal (its own process group, no
 /// stdio, so whatever started it can exit or close), and wait until it answers.
-fn start() -> i32 {
+pub fn start() -> i32 {
     if UnixStream::connect(sock_path()).is_ok() {
         println!("spot is already running");
         return 0;

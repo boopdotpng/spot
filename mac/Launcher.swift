@@ -508,7 +508,6 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var poll: Timer?  // refreshes what's playing while the window is open
     var bottom: CGFloat = 0  // the glass's bottom edge (the window's is `margin` lower): it grows upward from here
     var placing = false  // moving the window ourselves, not the user dragging it
-    var previous: NSRunningApplication?  // focus goes back here on close
 
     func applicationDidFinishLaunching(_ note: Notification) {
         panel = Panel(
@@ -517,7 +516,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .modalPanel
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .transient]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.isMovableByWindowBackground = true
@@ -538,6 +537,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return self.key(e) ? nil : e
         }
         registerHotKey()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(activeSpaceChanged),
+            name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
     }
 
@@ -577,7 +579,6 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func show() {
-        previous = NSWorkspace.shared.frontmostApplication
         model.reset()
         // where it was dragged to last (if that's still on a screen), else bottom center, clear of the Dock
         let d = UserDefaults.standard
@@ -590,8 +591,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             (midX, bottom) = (f.midX, f.minY + f.height * 0.12)
         }
         place(NSRect(x: midX - width / 2, y: bottom, width: width, height: barHeight).insetBy(dx: -margin, dy: -margin))
+        // keys without activating, like Spotlight: the app underneath stays frontmost, so closing has no focus to
+        // hand back (handing it back is what dragged a desktop swipe back to the old desktop)
         panel.makeKeyAndOrderFront(nil)
-        NSApp.activate()
         model.refreshNow()
         poll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.model.refreshNow() }
@@ -603,8 +605,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         poll?.invalidate()
         poll = nil
         panel.orderOut(nil)
-        if previous?.processIdentifier != ProcessInfo.processInfo.processIdentifier { previous?.activate() }
     }
+
+    @objc func activeSpaceChanged(_ note: Notification) { hide() }
 
     /// The prompt line and what's playing under it, plus the results (or a note) and a rule above it. The bottom edge stays put,
     /// so it grows upward.

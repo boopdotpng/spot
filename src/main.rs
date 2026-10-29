@@ -1,5 +1,6 @@
 // spot: a tiny Spotify TUI. librespot for audio, Web API for library/search, ratatui for UI.
 // This file: startup (logins, the player, the threads feeding the main loop) and the main loop.
+// The player stays in the background; terminal.rs handles disposable TUI connections.
 // The imports here are shared by every module (`use crate::*`).
 
 use std::{
@@ -44,6 +45,7 @@ mod metadata;
 mod model;
 mod playback;
 mod theme;
+mod terminal;
 mod ui;
 mod views;
 mod webapi;
@@ -80,19 +82,6 @@ const SKIP_SETTLE: Duration = Duration::from_millis(500);
 /// View key of the queue (`Q`); has a colon, so it's never a playlist id.
 const QUEUE_KEY: &str = "queue:";
 const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal to log in";
-
-/// Running without the window (`spot --headless`): nothing draws or reads the terminal.
-static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn restore_terminal() {
-    if HEADLESS.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    use std::io::Write;
-    let _ = std::io::stdout().write_all(b"\x1b[?2031l");
-    ratatui::restore();
-    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
-}
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -141,9 +130,8 @@ fn init_log() {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let headless = args.first().is_some_and(|a| a == "--headless");
     match args.first().map(String::as_str) {
-        None => {}
+        None => std::process::exit(terminal::launch()),
         Some("--headless") if args.len() == 1 => {}
         Some("clean") => return clean_cache(),
         Some("-v" | "--version") if args.len() == 1 => return println!("spot {}", env!("CARGO_PKG_VERSION")),
@@ -169,11 +157,9 @@ fn main() {
         Err(_) => None,
     };
     init_log();
-    HEADLESS.store(headless, std::sync::atomic::Ordering::Relaxed);
     let ui = std::thread::spawn(move || {
-        if let Err(e) = run(headless) {
+        if let Err(e) = run(false) {
             log::error!("exiting: {e}");
-            restore_terminal();
             eprintln!("spot: {e}");
             std::process::exit(1);
         }
@@ -186,7 +172,8 @@ fn main() {
     let _ = ui.join();
 }
 
-fn run(headless: bool) -> Result<(), String> {
+/// `setup_only` completes interactive first-run approvals before the client starts the player.
+fn run(setup_only: bool) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -240,12 +227,8 @@ fn run(headless: bool) -> Result<(), String> {
     let session = first_session.clone().unwrap_or_else(|| Session::new(SessionConfig::default(), Some(cache.clone())));
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    ctl::serve(tx.clone());
     let http = reqwest::Client::new();
     let lastfm = lastfm_setup(&rt, &http, &redirect, tx.clone());
-    if let Some(fm) = lastfm.clone() {
-        rt.spawn(async move { fm.drain().await }); // whatever didn't get sent last time
-    }
     let api = Arc::new(Api {
         http,
         oauth: Arc::new(oauth),
@@ -254,6 +237,14 @@ fn run(headless: bool) -> Result<(), String> {
         path: refresh_path,
         tx: tx.clone(),
     });
+
+    if setup_only {
+        return Ok(());
+    }
+    if let Some(fm) = lastfm.clone() {
+        rt.spawn(async move { fm.drain().await }); // whatever didn't get sent last time
+    }
+    ctl::serve(tx.clone());
 
     let mixer = mixer::find(None).unwrap()(MixerConfig::default()).map_err(|e| e.to_string())?;
     let vol = cache.volume().unwrap_or(u16::MAX);
@@ -272,10 +263,6 @@ fn run(headless: bool) -> Result<(), String> {
     }
     rt.spawn(load_playlists(api.clone(), tx.clone()));
 
-    // probe light/dark before anything reads stdin
-    if !headless {
-        probe_terminal();
-    }
     let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
     if let Some(i) = FAMILIES.iter().position(|(name, ..)| *name == theme.trim()) {
         FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
@@ -301,29 +288,6 @@ fn run(headless: bool) -> Result<(), String> {
             _ = int.recv() => {}
         }
         let _ = stx.send(Msg::Quit);
-    });
-
-    let ktx = tx.clone();
-    let rtx = tx.clone();
-    if !headless {
-        std::thread::spawn(move || read_input(ktx));
-    }
-    std::thread::spawn(move || {
-        if headless {
-            return;
-        }
-        // we read stdin ourselves, so nothing reports SIGWINCH; poll the size instead
-        let mut last = ratatui::crossterm::terminal::size().ok();
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            let now = ratatui::crossterm::terminal::size().ok();
-            if now != last {
-                last = now;
-                if rtx.send(Msg::Redraw).is_err() {
-                    break;
-                }
-            }
-        }
     });
 
     let media = MediaControls::new(PlatformConfig { display_name: "spot", dbus_name: "spot", hwnd: None })
@@ -385,6 +349,7 @@ fn run(headless: bool) -> Result<(), String> {
         finished: false,
         ctl: ctl::State::default(),
         quit: false,
+        terminal: None,
     };
 
     if let Some(last) = read_last() {
@@ -393,16 +358,8 @@ fn run(headless: bool) -> Result<(), String> {
     app.restore_upnext();
     app.open_playlist(0);
 
-    let mut term = (!headless).then(ratatui::init);
-    if !headless && std::env::var_os("SPOT_THEME").is_none() {
-        // color scheme reports: subscribe to changes (2031) and ask for the current one (996)
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(b"\x1b[?2031h\x1b[?996n").and_then(|_| std::io::stdout().flush());
-    }
     while !app.quit {
-        if let Some(term) = &mut term {
-            term.draw(|f| draw(f, &mut app)).map_err(|e| e.to_string())?;
-        }
+        app.draw_terminal();
         // Only wake up once a second while playing (progress clock); otherwise sleep until input.
         let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
         // wake up in time to take the popup / volume meter down
@@ -430,7 +387,7 @@ fn run(headless: bool) -> Result<(), String> {
         app.tick_watchers();
     }
     ctl::unlink();
-    restore_terminal();
+    app.detach_terminal();
     app.save_last();
     app.player.stop();
     app.end_listen();

@@ -76,3 +76,21 @@ pub fn pb_track(uri: &str, t: &PbTrack) -> Track {
     }
 }
 
+/// Metadata replies are keyed by URI; the original list supplies ordering and duplicates.
+pub fn tracks_in_order<'a>(uris: &'a [String], found: &'a HashMap<String, PbTrack>) -> impl Iterator<Item = Track> + 'a {
+    uris.iter().filter_map(|u| found.get(u).map(|t| pb_track(u, t)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_preserves_order_and_duplicates_and_skips_missing_tracks() {
+        let uris = ["b", "a", "missing", "b"].map(String::from);
+        let found = ["a", "b"].into_iter().map(|u| (u.into(), PbTrack::default())).collect();
+        let tracks: Vec<_> = tracks_in_order(&uris, &found).map(|t| t.uri).collect();
+        assert_eq!(tracks, ["b", "a", "b"]);
+    }
+}
+
