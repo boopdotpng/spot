@@ -3,13 +3,16 @@
 # SPOT_INSTALL_DIR overrides where it goes (default ~/.local/bin).
 # On macOS, `| sh -s -- --launcher` also installs the ⌥Space launcher app to ~/Applications
 # (SPOT_LAUNCHER_DIR to change); once it's installed, running this again updates it too.
+# `--skill` also copies the Claude Code skill to ~/.claude/skills/spot, replacing any copy there.
 set -eu
 
 launcher=0
+skill=0
 for arg in "$@"; do
   case "$arg" in
     --launcher) launcher=1 ;;
-    *) echo "spot install: unknown option $arg (only --launcher)" >&2; exit 2 ;;
+    --skill) skill=1 ;;
+    *) echo "spot install: unknown option $arg (only --launcher and --skill)" >&2; exit 2 ;;
   esac
 done
 
@@ -36,6 +39,19 @@ rm -f "$dir/spot"
 mv "$tmp/spot" "$dir/spot"
 chmod +x "$dir/spot"
 echo "installed spot to $dir/spot"
+
+if [ "$skill" = 1 ]; then
+  url="https://raw.githubusercontent.com/boopdotpng/spot/master/docs/skills/spot/SKILL.md"
+  echo "downloading $url"
+  # spot is in already, so a failed download here shouldn't stop the rest
+  if curl -fsSL "$url" -o "$tmp/SKILL.md"; then
+    mkdir -p "$HOME/.claude/skills/spot"
+    mv "$tmp/SKILL.md" "$HOME/.claude/skills/spot/SKILL.md"
+    echo "installed the Claude Code skill to ~/.claude/skills/spot"
+  else
+    echo "note: couldn't download the Claude Code skill; skipped" >&2
+  fi
+fi
 
 case ":$PATH:" in
   *":$dir:"*) ;;

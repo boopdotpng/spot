@@ -44,6 +44,7 @@ mod lists;
 mod metadata;
 mod model;
 mod playback;
+mod settings;
 mod theme;
 mod terminal;
 mod ui;
@@ -63,7 +64,7 @@ use ui::*;
 use webapi::*;
 
 // Each user brings their own Spotify developer app (the shared librespot client id is permanently
-// rate limited): SPOT_CLIENT_ID, else ~/.config/spot/client_id, else asked for on first run.
+// rate limited): SPOT_CLIENT_ID, else client_id in config.toml, else asked for on first run.
 // SPOT_REDIRECT overrides the redirect, which must be registered on the app.
 const REDIRECT: &str = "http://127.0.0.1:19872/login";
 const SCOPES: &[&str] = &[
@@ -172,6 +173,18 @@ fn main() {
     let _ = ui.join();
 }
 
+/// macOS sends Control Center the supported commands from the main thread, once: attaching from
+/// another, it snapshots them part way through and the rest stay greyed out for good.
+#[cfg(target_os = "macos")]
+fn on_main<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    dispatch::Queue::main().exec_sync(f)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn on_main<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 /// `setup_only` completes interactive first-run approvals before the client starts the player.
 fn run(setup_only: bool) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -181,18 +194,23 @@ fn run(setup_only: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let _guard = rt.enter();
 
+    settings::write_template();
+    let (mut settings, problems) = settings::load();
+    use_themes(std::mem::take(&mut settings.themes));
+    problems.iter().for_each(|p| log::warn!("{p}"));
+
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Played songs are kept (encrypted, as streamed) so replays start instantly and skip the
-    // network, least recently played dropped first past the limit: 1 GB, SPOT_AUDIO_CACHE_GB to change, 0 = off.
-    let audio_gb: f64 = std::env::var("SPOT_AUDIO_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    // network, least recently played dropped first past the limit: audio_cache_gb in config.toml (SPOT_AUDIO_CACHE_GB overrides), 0 = off.
+    let audio_gb: f64 = std::env::var("SPOT_AUDIO_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(settings.audio_cache_gb);
     let audio = (audio_gb > 0.0).then(|| dir.join("audio"));
     let limit = audio.as_ref().map(|_| (audio_gb * 1e9) as u64);
     let cache = Cache::new(Some(dir.clone()), Some(dir.clone()), audio, limit).map_err(|e| e.to_string())?;
     let refresh_path = dir.join("refresh_token");
 
     let redirect = std::env::var("SPOT_REDIRECT").unwrap_or_else(|_| REDIRECT.into());
-    let client_id = client_id(&redirect)?;
+    let client_id = client_id(&redirect, settings.client_id.take())?;
     let oauth = OAuthClientBuilder::new(&client_id, &redirect, SCOPES.to_vec())
         .open_in_browser()
         .build()
@@ -251,7 +269,15 @@ fn run(setup_only: bool) -> Result<(), String> {
     mixer.set_volume(vol);
     let backend = audio_backend::find(None).ok_or("no audio backend")?;
     let player = Player::new(
-        PlayerConfig { bitrate: Bitrate::Bitrate320, ..Default::default() } /* max librespot can play; no FLAC */,
+        // 320 is the most librespot can play; no FLAC
+        PlayerConfig {
+            bitrate: match settings.quality {
+                96 => Bitrate::Bitrate96,
+                160 => Bitrate::Bitrate160,
+                _ => Bitrate::Bitrate320,
+            },
+            ..Default::default()
+        },
         session.clone(),
         mixer.get_soft_volume(),
         move || backend(None, AudioFormat::default()),
@@ -264,7 +290,7 @@ fn run(setup_only: bool) -> Result<(), String> {
     rt.spawn(load_playlists(api.clone(), tx.clone()));
 
     let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
-    if let Some(i) = FAMILIES.iter().position(|(name, ..)| *name == theme.trim()) {
+    if let Some(i) = families().iter().position(|(name, ..)| name == theme.trim()) {
         FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -294,11 +320,13 @@ fn run(setup_only: bool) -> Result<(), String> {
         .ok()
         .and_then(|mut m| {
             let mtx = tx.clone();
-            m.attach(move |ev| {
-                let _ = mtx.send(Msg::Media(ev));
+            on_main(move || {
+                m.attach(move |ev| {
+                    let _ = mtx.send(Msg::Media(ev));
+                })
+                .ok()?;
+                Some(m)
             })
-            .ok()?;
-            Some(m)
         });
 
     let mut app = App {
@@ -335,10 +363,11 @@ fn run(setup_only: bool) -> Result<(), String> {
         playing: false,
         pos_ms: 0,
         pos_at: None,
-        status: String::new(),
+        status: problems.join("; "),
         note: None,
         retried: false,
         vol,
+        settings,
         want_play: false,
         fade_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         vol_until: None,

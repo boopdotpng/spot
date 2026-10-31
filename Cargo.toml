@@ -24,6 +24,7 @@ rand = "0.9"
 md-5 = "0.10"
 open = "5"
 terminal-colorsaurus = "1"
+toml = "1.1.8"
 
 [profile.release]
 opt-level = 3
@@ -34,3 +35,6 @@ strip = true
 # librespot-core 0.8.0 plus a retry for audio keys Spotify refuses at random (vendor/README.md)
 [patch.crates-io]
 librespot-core = { path = "vendor/librespot-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch = "0.2"

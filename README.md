@@ -49,8 +49,8 @@ spot needs a Spotify app of your own (free, takes a minute). On first start it a
 3. Tick **Web API** and save.
 4. Paste the app's Client ID when spot asks for it.
 
-It's saved to `~/.config/spot/client_id` (delete it to set up again, or set `SPOT_CLIENT_ID`
-to override). Using a different redirect URI? Set `SPOT_REDIRECT` to match.
+It's saved as `client_id` in `~/.config/spot/config.toml` (delete that line to set up again, or set
+`SPOT_CLIENT_ID` to override). Using a different redirect URI? Set `SPOT_REDIRECT` to match.
 Then log in through the browser; there's one more one-time approval for the audio session.
 
 ## Last.fm (optional)
@@ -122,7 +122,10 @@ from any terminal, script or agent (an LLM can drive it from `spot help` alone):
     spot shuffle [on|off] · spot repeat [off|all|one]
     spot queue                       # the queue, then the list's next songs
     spot queue 2 5                   # add results, uris, or a whole album / playlist to the queue (= `queue add`)
-    spot queue rm 1 · spot queue clear
+    spot queue add --at 1 <what>     # the same, in at a position of the queue (1 plays next)
+    spot queue rm 1 5-8              # remove by number, range or uri
+    spot queue mv 3-5 1              # move songs to a position, in order (numbers, ranges or uris)
+    spot queue clear
     spot status · spot playlists
 
 Spotify's field filters work in searches: `spot search 'track:one more time artist:daft punk'`,
@@ -137,16 +140,19 @@ and then goes on with the queue. Spotify links work
 anywhere a uri does. Exit code 3 means spot isn't running.
 
 `spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
-`end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
+`skip` (a media key skipped or seeked), `end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
 what's next, so there's time to `spot queue add` something. It works as a monitor target
 for agents. `spot wait ending` blocks until the next one and exits.
 
 ### Claude Code
 
-The repo ships a skill (`.claude/skills/spot`) so Claude Code can play music for you. To use it
-in every project, copy it into your skills:
+The repo ships a skill ([`docs/skills/spot`](docs/skills/spot/SKILL.md)) so Claude Code can play music for you. To use it
+in every project, add `--skill` when installing, which copies it to `~/.claude/skills/spot`
+(replacing any copy there). It's off by default:
 
-    mkdir -p ~/.claude/skills && cp -r .claude/skills/spot ~/.claude/skills/
+    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh -s -- --skill
+
+Or from a clone: `mkdir -p ~/.claude/skills && cp -r docs/skills/spot ~/.claude/skills/`.
 
 ### Without a window
 
@@ -166,14 +172,21 @@ The CLI and the keys drive the same player, so they work at the same time: the w
 the CLI changed, and `--show` also opens the list it played. It talks to spot over a Unix socket
 at `~/.cache/spot/sock`.
 
+## Config
+
+`~/.config/spot/config.toml` is written on first launch with everything commented out: audio quality, the song cache's size, the launcher's
+popup, and colors for your own themes. See [docs/config.md](docs/config.md) for every key.
+
 ## macOS launcher (⌥Space)
 
 A small native app that searches and plays from anywhere: `⌥Space` opens a Liquid Glass bar at the
-bottom of the screen, tinted with spot's `ctrl+t` theme, with what's playing under the search. Drag
+bottom of the screen, with what's playing under the search. Drag
 it anywhere; it opens there next time. Type to search, `tab` cycles songs / albums / artists,
 `↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the first one), `⌘enter`
-adds to the queue, `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the icons beside
-what's playing; the play icon pauses), `esc` closes. It's a separate program that talks to the
+adds to the queue, `⌘c` copies the selected result's open.spotify.com link (with no results, the
+playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the icons beside what's playing; the play icon pauses),
+`esc` closes. Skipping or seeking with the media keys shows what's playing for a moment, in a small
+popup right under the notch (or the menu bar; `popup` in [config.toml](docs/config.md) turns it off). It's a separate program that talks to the
 running spot over its socket, and starts it (`spot start`) if it isn't running. About 18 MB of
 memory, no CPU while hidden.
 
@@ -201,7 +214,7 @@ It needs spot 1.3.0 or newer: after updating spot, quit and restart the player.
   With repeat on, each pass through the list gets a fresh shuffle.
 - **Artists** open as every song (`v` switches to their albums & singles, to pick one) and play their full discography (albums + singles/EPs, newest first, duplicate
   single/album versions removed). Shuffle + `P` = shuffle the whole discography.
-- **Quality**: 320 kbps Ogg Vorbis, the highest librespot can stream. Spotify's lossless (FLAC)
+- **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
   isn't exposed to third-party/Connect players, so librespot can't select it.
 - Audio: librespot (no Spotify app needed).
 - Playlist list, Liked Songs, search: Web API through your own Spotify app (see First run).
@@ -217,7 +230,7 @@ It needs spot 1.3.0 or newer: after updating spot, quit and restart the player.
   the cache and refresh in the background.
 - **Audio cache**: played songs are kept in `~/.cache/spot/audio` (as streamed, encrypted), so
   replaying them starts instantly without the network. Capped at 1 GB, least recently played
-  dropped first; set `SPOT_AUDIO_CACHE_GB` to change the cap (`0` turns it off).
+  dropped first; set `audio_cache_gb` in [config.toml](docs/config.md) to change the cap (`0` turns it off).
 - **`spot clean`** clears the caches (songs, playlist / album / artist lists) and prints how much
   it freed. Login, settings, the resume point and unsent scrobbles are kept.
 - **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song

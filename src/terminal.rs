@@ -178,7 +178,7 @@ pub fn launch() -> i32 {
             eprintln!("spot: {e}");
             return 1;
         }
-        let code = cli::start();
+        let code = cli::start(false);
         if code != 0 { return code; }
     }
     client()

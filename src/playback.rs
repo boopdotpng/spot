@@ -232,6 +232,7 @@ impl App {
     pub fn on_media(&mut self, ev: MediaControlEvent) {
         use MediaControlEvent as E;
         let step = Duration::from_secs(10);
+        self.ctl.skipped |= matches!(ev, E::Next | E::Previous | E::Seek(_) | E::SeekBy(..));
         match ev {
             E::Toggle => self.toggle(),
             E::Play if !self.want_play => self.toggle(),
@@ -312,7 +313,13 @@ impl App {
 
     /// Add songs to the end of the queue; with nothing playing (or everything played), the first starts.
     pub fn enqueue(&mut self, tracks: impl IntoIterator<Item = Track>) {
-        self.upnext.extend(tracks);
+        self.enqueue_at(self.upnext.len(), tracks);
+    }
+
+    /// The same, in at position `at` (past the end: at the end).
+    pub fn enqueue_at(&mut self, at: usize, tracks: impl IntoIterator<Item = Track>) {
+        let at = at.min(self.upnext.len());
+        self.upnext.splice(at..at, tracks);
         self.queue_changed();
         if self.cur.is_none() || self.finished {
             self.skip(1);

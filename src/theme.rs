@@ -82,7 +82,7 @@ pub fn parse_bg_reply(body: &[u8]) -> Option<u32> {
 
 /// Current light/dark mode; flipped live when the terminal reports a color scheme change.
 pub static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Index into FAMILIES, cycled with ctrl+t and remembered in the cache dir.
+/// Index into families(), cycled with ctrl+t and remembered in the cache dir.
 pub static FAMILY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Theme families as (name, dark, light). Each palette is
@@ -119,12 +119,40 @@ pub const FAMILIES: [(&str, [u32; 10], [u32; 10]); 7] = [
      [0xd0601c, 0x8839ef, 0xf6e8e0, 0xfad8c4, 0x40302a, 0x7d6a62, 0xc4b2aa, 0xb07a10, 0xc0479a, 0xd20f39]),
 ];
 
+/// A theme: its name and palettes, dark and light.
+pub type Family = (String, [u32; 10], [u32; 10]);
+/// The palette's colors, as config.toml names them.
+pub const COLOR_NAMES: [&str; 10] = ["accent", "accent2", "deep", "hl", "text", "sub", "dim", "gold", "pink", "err"];
+
+static LIVE: std::sync::OnceLock<Vec<Family>> = std::sync::OnceLock::new();
+
+/// The built-in themes with config.toml's: same name replaces, a new one goes at the end.
+pub fn merged(custom: Vec<Family>) -> Vec<Family> {
+    let mut all: Vec<Family> = FAMILIES.iter().map(|(n, d, l)| (n.to_string(), *d, *l)).collect();
+    for f in custom {
+        match all.iter_mut().find(|a| a.0 == f.0) {
+            Some(a) => *a = f,
+            None => all.push(f),
+        }
+    }
+    all
+}
+
+/// Before anything draws: the first call to families() settles them.
+pub fn use_themes(custom: Vec<Family>) {
+    let _ = LIVE.set(merged(custom));
+}
+
+pub fn families() -> &'static [Family] {
+    LIVE.get_or_init(|| merged(vec![]))
+}
+
 pub fn theme() -> &'static Theme {
     use std::sync::atomic::Ordering::Relaxed;
     static T: std::sync::OnceLock<Vec<Theme>> = std::sync::OnceLock::new();
     let t = T.get_or_init(|| {
         let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
-        FAMILIES.iter().flat_map(|(_, dark, light)| [palette(truecolor.then_some(dark), false), palette(truecolor.then_some(light), true)]).collect()
+        families().iter().flat_map(|(_, dark, light)| [palette(truecolor.then_some(dark), false), palette(truecolor.then_some(light), true)]).collect()
     });
     &t[FAMILY.load(Relaxed) * 2 + LIGHT.load(Relaxed) as usize]
 }
@@ -173,9 +201,10 @@ pub fn palette(hex: Option<&[u32; 10]>, light: bool) -> Theme {
 
 /// Switch to the next theme family and remember it.
 pub fn cycle_family() -> &'static str {
+    let all = families();
     use std::sync::atomic::Ordering::Relaxed;
-    let i = (FAMILY.load(Relaxed) + 1) % FAMILIES.len();
+    let i = (FAMILY.load(Relaxed) + 1) % all.len();
     FAMILY.store(i, Relaxed);
-    let _ = fs::write(cache_dir().join("theme"), FAMILIES[i].0);
-    FAMILIES[i].0
+    let _ = fs::write(cache_dir().join("theme"), &all[i].0);
+    &all[i].0
 }

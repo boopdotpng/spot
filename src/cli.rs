@@ -50,12 +50,17 @@ Control the running player, from any terminal, script or agent:
   spot queue [add] <what>... add to the end of the queue: result numbers, uris, or words as in
                              play (`spot queue 2` = result 2). Songs play before the list carries
                              on; an album or playlist queues all its songs
-  spot queue rm 2 3          remove songs from the queue, by their number in `spot queue`
+  spot queue add --at 2 <what>...   the same, in at that position of the queue (1 plays next)
+  spot queue rm 2 5-8        remove songs from the queue: numbers in `spot queue`, ranges, or uris
+                             (a uri still means the same song if the queue has moved on)
+  spot queue mv 5 1          move songs to a position: the same numbers, ranges or uris, then
+                             where the first goes (`spot queue mv 3-5 1`); they stay in order
   spot queue clear           empty the queue
   spot playlists             your playlists, numbered, with uris
   spot watch [--before 30]   a line per event as it happens: track (new song), playing,
-                             paused, end (nothing left to play), ending (the song ends in 30s; says
-                             what's next, so there's time to `queue add` something else)
+                             paused, skip (a media key skipped or seeked), end (nothing left to
+                             play), ending (the song ends in 30s; says what's next, so there's
+                             time to `queue add` something else)
   spot wait <event> [--before 30]   wait for the next such event, print it, exit
 
 Finding music: `spot play <words>` plays the top hit and says so; to choose, `spot search` and
@@ -85,7 +90,7 @@ fn wait_for(secs: u64, ok: impl Fn() -> bool) -> bool {
 /// `watch` and `wait` keep printing event lines as they come.
 pub fn client(args: Vec<String>) -> i32 {
     match args[0].as_str() {
-        "start" => return start(),
+        "start" => return start(true),
         "quit" => return quit(),
         _ => {}
     }
@@ -127,13 +132,16 @@ pub fn client(args: Vec<String>) -> i32 {
 }
 
 /// `spot start`: run `spot --headless` detached from this terminal (its own process group, no
-/// stdio, so whatever started it can exit or close), and wait until it answers.
-pub fn start() -> i32 {
+/// stdio, so whatever started it can exit or close), and wait until it answers. `say` prints how
+/// that went; the TUI doesn't, or the line would be waiting in the terminal when it closes.
+pub fn start(say: bool) -> i32 {
     if UnixStream::connect(sock_path()).is_ok() {
-        println!("spot is already running");
+        if say {
+            println!("spot is already running");
+        }
         return 0;
     }
-    let id = std::env::var_os("SPOT_CLIENT_ID").is_some() || config_dir().join("client_id").exists();
+    let id = std::env::var_os("SPOT_CLIENT_ID").is_some() || settings::load().0.client_id.is_some() || old_client_id().is_some();
     if !id || !cache_dir().join("refresh_token").exists() || !cache_dir().join("credentials.json").exists() {
         eprintln!("spot: {NOT_SET_UP}");
         return 1;
@@ -170,7 +178,9 @@ pub fn start() -> i32 {
             return 1;
         }
         if UnixStream::connect(sock_path()).is_ok() {
-            println!("spot is running in the background (pid {}); `spot quit` stops it", child.id());
+            if say {
+                println!("spot is running in the background (pid {}); `spot quit` stops it", child.id());
+            }
             return 0;
         }
     }

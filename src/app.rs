@@ -101,6 +101,7 @@ pub struct App {
     pub status: String,
     pub note: Option<(String, Instant)>, // brief popup and when it disappears
     pub retried: bool,
+    pub settings: settings::Settings,
     pub vol: u16,               // user volume; the mixer dips below it during fades
     pub want_play: bool,        // intent, flips immediately (playing lags until the player confirms)
     pub fade_gen: Arc<std::sync::atomic::AtomicU64>, // bumps cancel an in-flight fade

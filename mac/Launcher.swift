@@ -1,6 +1,6 @@
 // Spot Launcher: ⌥Space from anywhere opens a Spotlight-style bar that searches Spotify through
 // the running spot (over its socket, ~/.cache/spot/sock) and plays what you pick.
-// ↑↓ move, ⏎ plays, ⌘⏎ queues, tab cycles songs / albums / artists, ⌃S shuffle, ⌃R repeat, esc closes.
+// ↑↓ move, ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with no results, to what's playing), tab cycles songs / albums / artists, ⌃S shuffle, ⌃R repeat, esc closes.
 
 import AppKit
 import Carbon.HIToolbox
@@ -10,12 +10,11 @@ import SwiftUI
 
 // MARK: talking to spot
 
-/// One request to the running spot: the reply's exit code and text. Code 3: it isn't running.
-func spot(_ args: [String]) -> (Int, String) {
+/// A connection to the running spot, if there is one.
+func connectSpot() -> Int32? {
     let path = NSHomeDirectory() + "/.cache/spot/sock"
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard fd >= 0 else { return (1, "no socket") }
-    defer { close(fd) }
+    guard fd >= 0 else { return nil }
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     withUnsafeMutableBytes(of: &addr.sun_path) { buf in
@@ -24,7 +23,17 @@ func spot(_ args: [String]) -> (Int, String) {
     let ok = withUnsafePointer(to: &addr) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
     }
-    guard ok == 0 else { return (3, "spot isn't running") }
+    guard ok == 0 else {
+        close(fd)
+        return nil
+    }
+    return fd
+}
+
+/// One request to the running spot: the reply's exit code and text. Code 3: it isn't running.
+func spot(_ args: [String]) -> (Int, String) {
+    guard let fd = connectSpot() else { return (3, "spot isn't running") }
+    defer { close(fd) }
     let line = Array((args.joined(separator: "\t") + "\n").utf8)
     guard write(fd, line, line.count) == line.count else { return (1, "couldn't send the request") }
     var data = Data()
@@ -38,6 +47,28 @@ func spot(_ args: [String]) -> (Int, String) {
     let (head, rest) = reply.firstIndex(of: "\n").map { (String(reply[..<$0]), String(reply[reply.index(after: $0)...])) } ?? (reply, "")
     guard let code = Int(head) else { return (1, "no reply from spot (an older version? `spot quit`, then start it again)") }
     return (code, rest.trimmingCharacters(in: .newlines))
+}
+
+/// Follow `spot watch` for good, calling `onSkip` per media key press. Blocks, so it gets a thread
+/// of its own; while spot isn't running it looks again every few seconds.
+func watchSkips(_ onSkip: @escaping @Sendable () -> Void) {
+    while true {
+        if let fd = connectSpot() {
+            var pending = Data()
+            var buf = [UInt8](repeating: 0, count: 4096)
+            if write(fd, "watch\n", 6) == 6 {
+                while case let n = read(fd, &buf, buf.count), n > 0 {
+                    pending.append(buf, count: n)
+                    while let end = pending.firstIndex(of: 10) {
+                        if pending[pending.startIndex..<end].starts(with: "skip:".utf8) { onSkip() }
+                        pending = Data(pending[(end + 1)...])
+                    }
+                }
+            }
+            close(fd)
+        }
+        sleep(3)
+    }
 }
 
 /// `spot start`: the player in the background. Looks where install.sh and cargo put it, then
@@ -74,6 +105,11 @@ func fromShell(_ cmd: String) -> String? {
 
 // MARK: model
 
+/// spotify:track:id as https://open.spotify.com/track/id
+func shareLink(_ uri: String) -> String {
+    "https://open.spotify.com/" + uri.dropFirst("spotify:".count).replacingOccurrences(of: ":", with: "/")
+}
+
 /// What a search finds, cycled with tab, as in spot's own `/` prompt.
 enum Kind: String, CaseIterable {
     case songs, albums, artists
@@ -100,7 +136,7 @@ struct Result: Identifiable {
 /// What spot is playing, from `spot status --tsv`.
 struct Playing: Equatable {
     var playing: Bool
-    let name, artists: String
+    let name, artists, uri: String
     var shuffle: Bool
     var repeats: String  // off, all, one
 }
@@ -113,17 +149,21 @@ final class Model: ObservableObject {
     @Published var selected = 0
     @Published var note: String?  // an error or "starting spot…", shown in place of results
     @Published var busy = false
-    @Published var theme = Theme.load()
+    let theme = Theme()
+    var popup = true  // config.toml, by way of spot
+    var popupSeconds = 3.0
     @Published var now: Playing?
+    @Published var copied = false  // a link just went to the clipboard
     var close: () -> Void = {}
     private var generation = 0
+    private var copiedFade: Task<Void, Never>?
 
     func reset() {
         query = ""
         results = []
         note = nil
         selected = 0
-        theme = Theme.load()
+        copied = false
     }
 
     /// Search as you type: waits a moment for typing to stop, and drops answers to older queries.
@@ -160,14 +200,22 @@ final class Model: ObservableObject {
     }
 
     /// Ask spot what's playing; nothing if it isn't running (this doesn't start it).
-    func refreshNow() {
-        Task {
-            let (code, text) = await Task.detached { spot(["status", "--tsv"]) }.value
-            let f = text.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-            let now = code == 0 && f.count >= 7
-                ? Playing(playing: f[0] == "1", name: f[1], artists: f[2], shuffle: f[5] == "1", repeats: f[6]) : nil
-            if now != self.now { self.now = now }
-        }
+    func fetchNow() async {
+        let (code, text) = await Task.detached { spot(["status", "--tsv"]) }.value
+        let f = text.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+        let now = code == 0 && f.count >= 7
+            ? Playing(playing: f[0] == "1", name: f[1], artists: f[2], uri: f[4], shuffle: f[5] == "1", repeats: f[6]) : nil
+        if now != self.now { self.now = now }
+    }
+
+    func refreshNow() { Task { await fetchNow() } }
+
+    /// The popup's settings; the defaults if spot is too old to say.
+    func fetchPopup() async {
+        let (code, text) = await Task.detached { spot(["launcher"]) }.value
+        let f = text.split(separator: "\t", omittingEmptySubsequences: false)
+        guard code == 0, f.count >= 2, let seconds = Double(f[1]) else { return }
+        (popup, popupSeconds) = (f[0] == "1", seconds)
     }
 
     func togglePlay() { control(["toggle"]) { $0.playing.toggle() } }
@@ -220,6 +268,20 @@ final class Model: ObservableObject {
         }
     }
 
+    /// ⌘C: the link to the selected result, or with no results what's playing, on the clipboard,
+    /// and a moment's "copied".
+    func copyLink() {
+        guard let uri = results.indices.contains(selected) ? results[selected].uri : now?.uri, !uri.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(shareLink(uri), forType: .string)
+        copied = true
+        copiedFade?.cancel()
+        copiedFade = Task {
+            try? await Task.sleep(for: .seconds(1.2))
+            if !Task.isCancelled { copied = false }
+        }
+    }
+
     /// Off the main thread; starts spot first if it isn't running.
     private func request(_ args: [String]) async -> (Int, String) {
         let first = await Task.detached { spot(args) }.value
@@ -234,45 +296,16 @@ final class Model: ObservableObject {
 
 // MARK: theme
 
-/// spot's palettes (src/theme.rs FAMILIES): the one picked with ctrl+t, light or dark following
-/// the system appearance. [accent, accent2, deep, hl, text, sub, dim, gold, pink, err]
+/// The system's colors: on glass the text takes its label colors, which stay readable over
+/// whatever is behind, and the accent is the one set in System Settings.
 struct Theme {
-    let accent, hl, text, sub, dim, gold, err: Color
-
-    static let families: [String: (dark: [UInt32], light: [UInt32])] = [
-        "desert": ([0xd0924a, 0xb08a66, 0x2e2722, 0x5c4128, 0xd6c8b4, 0x8f8679, 0x4f4a55, 0xd9b066, 0xa58b98, 0xc26a50],
-                   [0xa8621c, 0x8a6440, 0xe8dfd3, 0xf0d3a8, 0x3a3029, 0x6e655a, 0xa39a90, 0x9a7014, 0x8f5f78, 0xb0472f]),
-        "lagoon": ([0x4fb3a9, 0x7fa8b8, 0x1d2b2e, 0x1f4a4c, 0xcfdcda, 0x7f9796, 0x3f5256, 0xe39a7b, 0xd98ba0, 0xe0685e],
-                   [0x16857c, 0x3f6f86, 0xdcebea, 0xbfe3df, 0x23393b, 0x56706f, 0x9db3b2, 0xc0623f, 0xb4506e, 0xc23b30]),
-        "moss": ([0x9cbf6b, 0xb5a77a, 0x262b22, 0x3d4a2c, 0xd8dccb, 0x8d9581, 0x4a5243, 0xe0b45e, 0xc08aa8, 0xd46a5a],
-                 [0x5b8a2a, 0x7d6e3f, 0xe5eadb, 0xd6e6bd, 0x2e3326, 0x626b55, 0xa7ae98, 0xa8781a, 0x96507a, 0xb5402f]),
-        "iris": ([0xa98be0, 0x8fa0d8, 0x26223a, 0x3e3466, 0xdcd6ec, 0x928ba8, 0x4b4663, 0xf0b48a, 0xe58fb6, 0xe86f7a],
-                 [0x6c4cc4, 0x4a5fb0, 0xe8e3f4, 0xd9cff5, 0x2d2840, 0x625b78, 0xaaa3c0, 0xb8673a, 0xb03f7a, 0xc2364a]),
-        "blossom": ([0xf5a6c8, 0xc6a8f0, 0x2a2430, 0x4a3550, 0xeadff0, 0xa597b0, 0x564b60, 0xf6d3a1, 0xe8a0d8, 0xf28b9a],
-                    [0xc4467e, 0x7f5cc4, 0xf3e6ef, 0xf6d4e5, 0x3d2f3f, 0x7a6a80, 0xbfaec4, 0xb27a28, 0xa850a0, 0xcc3b55]),
-        "mint": ([0x94e2c0, 0x89c4f4, 0x1f2a2a, 0x2f4a48, 0xdcefea, 0x92aaa8, 0x46585a, 0xf9e2af, 0xf5b8d0, 0xf38ba8],
-                 [0x1f9a73, 0x2f7fc4, 0xe0f1ec, 0xc6ebde, 0x26393a, 0x5d7473, 0xa5bab8, 0xb8861c, 0xc0507e, 0xd0304f]),
-        "sorbet": ([0xfab387, 0xcba6f7, 0x2c2626, 0x4d3a36, 0xf0e2da, 0xab9a92, 0x5a4e4c, 0xf9e2af, 0xf5c2e7, 0xf38ba8],
-                   [0xd0601c, 0x8839ef, 0xf6e8e0, 0xfad8c4, 0x40302a, 0x7d6a62, 0xc4b2aa, 0xb07a10, 0xc0479a, 0xd20f39]),
-    ]
-
-    static func load() -> Theme {
-        let name = (try? String(contentsOfFile: NSHomeDirectory() + "/.cache/spot/theme", encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "desert"
-        let fam = families[name] ?? families["desert"]!
-        let light = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
-        let h = (light ? fam.light : fam.dark).map { Color(hex: $0) }
-        // on glass the text takes the system's label colors, which stay readable over whatever is
-        // behind; the theme only tints: its accent, the selection, the glass
-        return Theme(accent: h[0], hl: h[0].opacity(0.22), text: .primary, sub: .secondary,
-                     dim: Color(nsColor: .tertiaryLabelColor), gold: h[0], err: h[9])
-    }
-}
-
-extension Color {
-    init(hex: UInt32) {
-        self.init(.sRGB, red: Double(hex >> 16 & 0xff) / 255, green: Double(hex >> 8 & 0xff) / 255, blue: Double(hex & 0xff) / 255)
-    }
+    let accent = Color.accentColor
+    let hl = Color.accentColor.opacity(0.22)
+    let text = Color.primary
+    let sub = Color.secondary
+    let dim = Color(nsColor: .tertiaryLabelColor)
+    let gold = Color.accentColor
+    let err = Color.red
 }
 
 // MARK: views
@@ -282,6 +315,8 @@ let rowHeight: CGFloat = 22
 let barHeight: CGFloat = 30
 let nowHeight: CGFloat = 26
 let maxRows = 12
+let toastWidth: CGFloat = 340  // longer than this ends in …
+let toastGap: CGFloat = 6  // between the notch and the toast
 let mono = Font.system(size: 13, design: .monospaced)
 
 /// spot's status line and list, floating: results numbered above, the search line at the bottom.
@@ -322,6 +357,20 @@ struct LauncherView: View {
         .frame(width: width)
         .modifier(Glass(th: th))
         .padding(margin)
+        // in the window's margin under the glass, so showing it doesn't resize anything
+        .overlay(alignment: .bottom) {
+            if model.copied {
+                Text("copied")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3)
+                    .background(th.accent, in: Capsule())
+                    .padding(.bottom, 12)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: model.copied)
         .onAppear { focused = true }
     }
 }
@@ -421,6 +470,28 @@ extension NowPlaying {
     }
 }
 
+/// What's playing after a media key: the bar's now playing line, on its own and hands off.
+struct Toast: View {
+    let now: Playing
+    let th: Theme
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: now.playing ? "play.fill" : "pause.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(th.accent)
+            // no priority: past toastWidth both get an even share, each ending in …
+            Text(now.name).foregroundStyle(th.text).bold().lineLimit(1)
+            Text(now.artists).foregroundStyle(th.sub).lineLimit(1)
+        }
+        .font(mono)
+        .padding(.horizontal, 14)
+        .frame(height: barHeight)
+        .modifier(Glass(th: th))
+        .padding(margin)
+    }
+}
+
 /// `🔍 query▏          songs · albums · artists`
 struct Prompt: View {
     @ObservedObject var model: Model
@@ -499,6 +570,12 @@ final class Panel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+/// The toast's window: its transparent margin may sit up under the menu bar, or past the screen's
+/// edge, which AppKit would otherwise push it down from.
+final class ToastPanel: NSPanel {
+    override func constrainFrameRect(_ frame: NSRect, to screen: NSScreen?) -> NSRect { frame }
+}
+
 @MainActor
 final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = Model()
@@ -508,6 +585,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var poll: Timer?  // refreshes what's playing while the window is open
     var bottom: CGFloat = 0  // the glass's bottom edge (the window's is `margin` lower): it grows upward from here
     var placing = false  // moving the window ourselves, not the user dragging it
+    var toast: ToastPanel!
+    var toastView: NSHostingController<Toast?>!
+    var toastFade: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         panel = Panel(
@@ -537,6 +617,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return self.key(e) ? nil : e
         }
         registerHotKey()
+        makeToast()
+        Thread.detachNewThread { [self] in
+            watchSkips { Task { @MainActor in await self.skipped() } }
+        }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(activeSpaceChanged),
             name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
@@ -557,6 +641,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case kVK_ANSI_S where e.modifierFlags.contains(.control): model.toggleShuffle()
         case kVK_ANSI_R where e.modifierFlags.contains(.control): model.cycleRepeat()
         case kVK_ANSI_Q where cmd: NSApp.terminate(nil)
+        case kVK_ANSI_C where cmd: model.copyLink()
         default: return false
         }
         return true
@@ -579,17 +664,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func show() {
+        toastFade?.cancel()
+        toast.orderOut(nil)
         model.reset()
-        // where it was dragged to last (if that's still on a screen), else bottom center, clear of the Dock
-        let d = UserDefaults.standard
-        var midX = d.double(forKey: "midX")
-        bottom = d.double(forKey: "bottom")
-        let saved = NSPoint(x: midX, y: bottom + barHeight / 2)
-        if d.object(forKey: "midX") == nil || !NSScreen.screens.contains(where: { NSMouseInRect(saved, $0.visibleFrame, false) }) {
-            let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
-            let f = screen.visibleFrame
-            (midX, bottom) = (f.midX, f.minY + f.height * 0.12)
-        }
+        let midX: CGFloat
+        (midX, bottom) = home()
         place(NSRect(x: midX - width / 2, y: bottom, width: width, height: barHeight).insetBy(dx: -margin, dy: -margin))
         // keys without activating, like Spotlight: the app underneath stays frontmost, so closing has no focus to
         // hand back (handing it back is what dragged a desktop swipe back to the old desktop)
@@ -597,6 +676,60 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         model.refreshNow()
         poll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.model.refreshNow() }
+        }
+    }
+
+    /// Where the bar opens: where it was dragged to last (if that's still on a screen), else
+    /// bottom center, clear of the Dock. Its horizontal middle and its bottom edge.
+    func home() -> (CGFloat, CGFloat) {
+        let d = UserDefaults.standard
+        let (midX, bottom) = (d.double(forKey: "midX"), d.double(forKey: "bottom"))
+        let saved = NSPoint(x: midX, y: bottom + barHeight / 2)
+        if d.object(forKey: "midX") != nil && NSScreen.screens.contains(where: { NSMouseInRect(saved, $0.visibleFrame, false) }) {
+            return (midX, bottom)
+        }
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+        let f = screen.visibleFrame
+        return (f.midX, f.minY + f.height * 0.12)
+    }
+
+    func makeToast() {
+        toast = ToastPanel(
+            contentRect: NSRect(x: 0, y: 0, width: width, height: barHeight),
+            styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        toast.isFloatingPanel = true
+        toast.level = .modalPanel
+        toast.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        toast.backgroundColor = .clear
+        toast.isOpaque = false
+        toast.hasShadow = false
+        toast.hidesOnDeactivate = false
+        toast.ignoresMouseEvents = true
+        toastView = NSHostingController(rootView: nil)
+        toastView.sizingOptions = []
+        toast.contentView = toastView.view
+    }
+
+    /// A media key was pressed. The bar already shows what's playing; otherwise, a moment's toast.
+    func skipped() async {
+        await model.fetchNow()
+        await model.fetchPopup()
+        guard !panel.isVisible, model.popup, let now = model.now else { return }
+        toastView.rootView = Toast(now: now, th: model.theme)
+        let size = toastView.sizeThatFits(in: NSSize(width: toastWidth + 2 * margin, height: barHeight + 2 * margin))
+        // on the screen you're on: right under the notch, or the menu bar on a screen without one
+        let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
+        let top = screen.safeAreaInsets.top > 0 ? screen.frame.maxY - screen.safeAreaInsets.top : screen.visibleFrame.maxY
+        toast.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: top - toastGap + margin - size.height, width: size.width, height: size.height), display: true)
+        toast.alphaValue = 1
+        toast.orderFrontRegardless()
+        toastFade?.cancel()
+        toastFade = Task {
+            try? await Task.sleep(for: .seconds(model.popupSeconds))
+            guard !Task.isCancelled else { return }
+            await NSAnimationContext.runAnimationGroup { $0.duration = 0.25; toast.animator().alphaValue = 0 }
+            if !Task.isCancelled { toast.orderOut(nil) }
         }
     }
 

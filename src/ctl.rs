@@ -28,7 +28,7 @@ fn usage(e: &str) -> Fail {
 /// What a background lookup was for, carried back to the main loop with its songs.
 pub enum Then {
     Play { from: Option<String>, show: bool },
-    Queue { shown: usize },
+    Queue { shown: usize, at: Option<usize> },
 }
 
 /// A list a request named, fetched: its uri, name and songs, and what was searched to find it.
@@ -59,6 +59,7 @@ pub struct State {
     watchers: Vec<Watcher>,
     plays: u64,
     playing: bool,
+    pub skipped: bool, // a media key skipped or seeked since the last tick
 }
 
 /// The last search's (or `spot playlists`') uris, one per line, so `spot play 3` can pick one.
@@ -141,6 +142,48 @@ fn parse_time(s: &str) -> Option<i64> {
     Some((secs * 1000.0) as i64)
 }
 
+/// Which queued songs `args` name, as indices in order: numbers from `spot queue`, ranges (`3-5`),
+/// or uris, which still mean the same song if the queue moves on (every copy of it, if it's in twice).
+fn positions(args: &[String], upnext: &[Track], cmd: &str) -> Result<Vec<usize>, Fail> {
+    if args.is_empty() {
+        return Err(usage(&format!("{cmd}: which? (numbers from `spot queue`, or uris)")));
+    }
+    let len = upnext.len();
+    let mut out = vec![];
+    for a in args {
+        if a.starts_with("spotify:") || a.contains("open.spotify.com/") {
+            let uri = uri_arg(a)?;
+            let found: Vec<usize> = (0..len).filter(|&i| upnext[i].uri == uri).collect();
+            if found.is_empty() {
+                return Err(fail(format!("{uri} isn't in the queue")));
+            }
+            out.extend(found);
+            continue;
+        }
+        let (first, last) = a.split_once('-').unwrap_or((a, a));
+        let (first, last) = match (first.parse::<usize>(), last.parse::<usize>()) {
+            (Ok(f), Ok(l)) if f <= l => (f, l),
+            _ => return Err(usage(&format!("{cmd}: song numbers from `spot queue`, ranges like 3-5, or uris"))),
+        };
+        if first == 0 || last > len {
+            let bad = if first == 0 { 0 } else { last };
+            return Err(fail(format!("the queue has {}, so there's no {bad}", plural(len, "song"))));
+        }
+        out.extend(first - 1..last);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// Take the items at `from` (ascending) out and put them back in order, the first of them at `to`.
+fn move_items<T>(items: &mut Vec<T>, from: &[usize], to: usize) {
+    let mut moved: Vec<T> = from.iter().rev().map(|&i| items.remove(i)).collect();
+    moved.reverse();
+    let to = to.min(items.len());
+    items.splice(to..to, moved);
+}
+
 /// The uri a queue key stands for: Liked Songs, a playlist id, or an album / artist / track uri.
 fn key_uri(key: &str) -> Option<String> {
     if key == "liked" || key.starts_with("spotify:") {
@@ -220,8 +263,8 @@ fn watcher(args: &mut Vec<String>) -> Result<(u64, Option<String>), Fail> {
     let before = num_opt(args, "--before")?.unwrap_or(30);
     let until = match (args[0].as_str(), args.get(1).map(String::as_str)) {
         ("watch", _) => None,
-        (_, Some(e @ ("track" | "ending" | "playing" | "paused" | "end"))) => Some(e.to_string()),
-        _ => return Err(usage("wait: for track, ending, playing, paused or end")),
+        (_, Some(e @ ("track" | "ending" | "playing" | "paused" | "end" | "skip"))) => Some(e.to_string()),
+        _ => return Err(usage("wait: for track, ending, playing, paused, end or skip")),
     };
     Ok((before * 1000, until))
 }
@@ -255,6 +298,11 @@ impl App {
                 return Ok(Some(self.now().map(row).unwrap_or_default()));
             }
             "status" => {}
+            // for the launcher: popup (1 or empty), popup seconds
+            "launcher" => {
+                let s = &self.settings;
+                return Ok(Some(tsv_row(&[if s.popup { "1" } else { "" }, &s.popup_seconds.to_string()])));
+            }
             "play" | "resume" => {
                 let show = flag(&mut args, "--show");
                 let from = opt(&mut args, "--from")?.map(|f| uri_arg(&f)).transpose()?;
@@ -330,11 +378,15 @@ impl App {
         Ok(Some(self.status_text()))
     }
 
-    /// `queue [-n 10]`, `queue [add] <what>…`, `queue rm N…`, `queue clear`. Each shows the queue
-    /// after (after a change, just a peek at the list).
+    /// `queue [-n 10]`, `queue [add] [--at N] <what>…`, `queue rm <which>…`, `queue mv <which>… N`,
+    /// `queue clear`. Each shows the queue after (after a change, just a peek at the list).
     fn queue_cmd(&mut self, mut args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
         let n = num_opt(&mut args, "-n")?.map(|n| n as usize);
         let shown = n.unwrap_or(3);
+        let at = match num_opt(&mut args, "--at")? {
+            Some(0) => return Err(usage("--at: positions count from 1")),
+            at => at.map(|n| n as usize - 1),
+        };
         match args.first().map(String::as_str) {
             None => return Ok(Some(self.queue_text(n.unwrap_or(10)))),
             Some("clear") => {
@@ -342,22 +394,19 @@ impl App {
                 self.queue_changed();
             }
             Some("rm") => {
-                let mut ns = args[1..]
-                    .iter()
-                    .map(|a| a.parse::<usize>().map_err(|_| usage("queue rm: song numbers from `spot queue`")))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if ns.is_empty() {
-                    return Err(usage("queue rm: which? (numbers from `spot queue`)"));
+                for i in positions(&args[1..], &self.upnext, "queue rm")?.into_iter().rev() {
+                    self.dequeue(i);
                 }
-                let len = self.upnext.len();
-                if let Some(bad) = ns.iter().find(|&&n| n == 0 || n > len) {
-                    return Err(fail(format!("the queue has {}, so there's no {bad}", plural(len, "song"))));
-                }
-                ns.sort_unstable();
-                ns.dedup();
-                for i in ns.into_iter().rev() {
-                    self.dequeue(i - 1);
-                }
+            }
+            Some("mv") => {
+                let Some((to, which)) = args[1..].split_last() else {
+                    return Err(usage("queue mv: which songs, then the position to move them to"));
+                };
+                let to = to.parse::<usize>().ok().filter(|&n| n > 0);
+                let to = to.ok_or_else(|| usage("queue mv: the last argument is the position to move them to"))?;
+                let from = positions(which, &self.upnext, "queue mv")?;
+                move_items(&mut self.upnext, &from, to - 1);
+                self.queue_changed();
             }
             Some(_) => {
                 if args[0] == "add" {
@@ -373,7 +422,7 @@ impl App {
                 } else {
                     vec![uri_arg(&args.join(" "))?]
                 };
-                self.load(targets, Then::Queue { shown }, reply.clone());
+                self.load(targets, Then::Queue { shown, at }, reply.clone());
                 return Ok(None);
             }
         }
@@ -542,8 +591,8 @@ impl App {
                 }
                 self.status_text()
             }
-            Then::Queue { shown } => {
-                self.enqueue(tracks);
+            Then::Queue { shown, at } => {
+                self.enqueue_at(at.unwrap_or(self.upnext.len()), tracks);
                 self.queue_text(shown)
             }
         };
@@ -615,7 +664,7 @@ impl App {
         let row = |t: &Track| format!("{} ({})  {}", song(t), mmss(t.ms), t.uri);
         let mut out = vec![self.status_text().lines().next().unwrap_or("").to_string()];
         if !self.upnext.is_empty() {
-            out.push("queue (`spot queue rm N` removes):".into());
+            out.push("queue (`spot queue rm N` removes, `mv N TO` moves):".into());
             out.push(numbered(&self.upnext.iter().map(row).collect::<Vec<_>>()));
         }
         let upcoming: Vec<String> =
@@ -646,10 +695,11 @@ impl App {
     }
 
     /// Tell watchers what changed since the last tick: a new song, play / pause, the queue
-    /// running out, or the song ending within their `--before`.
+    /// running out, a media key skipping or seeking, or the song ending within their `--before`.
     pub fn tick_watchers(&mut self) {
         let new_track = std::mem::replace(&mut self.ctl.plays, self.plays) != self.plays;
         let toggled = std::mem::replace(&mut self.ctl.playing, self.want_play) != self.want_play;
+        let skipped = std::mem::take(&mut self.ctl.skipped);
         if self.ctl.watchers.is_empty() {
             return;
         }
@@ -666,6 +716,9 @@ impl App {
                 (false, true) => ("end", "end: the queue ran out".into()),
                 (false, false) => ("paused", format!("paused: {}", now())),
             });
+        }
+        if skipped {
+            events.push(("skip", format!("skip: {}", now())));
         }
         let ending = cur.filter(|t| t.ms > 0 && self.want_play).map(|t| {
             let left = t.ms.saturating_sub(self.position());
@@ -737,4 +790,59 @@ async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> 
         return Err(format!("{name} has no songs to play"));
     }
     Ok((name, tracks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queue(n: usize) -> Vec<Track> {
+        let track = |i| Track {
+            uri: format!("spotify:track:{i}"),
+            name: String::new(),
+            artists: String::new(),
+            lead: 0,
+            album: String::new(),
+            cover: None,
+            ms: 0,
+            album_id: 0,
+            artist_id: 0,
+            disc: 0,
+            explicit: false,
+        };
+        (1..=n).map(track).collect()
+    }
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positions_take_numbers_ranges_and_uris() {
+        let q = queue(8);
+        assert_eq!(positions(&args(&["2", "5-7", "6", "spotify:track:8"]), &q, "rm").unwrap(), [1, 4, 5, 6, 7]);
+        assert_eq!(positions(&args(&["https://open.spotify.com/track/3?si=x"]), &q, "rm").unwrap(), [2]);
+    }
+
+    #[test]
+    fn positions_reject_what_isnt_there() {
+        let q = queue(3);
+        for bad in [&["0"][..], &["4"], &["2-4"], &["3-2"], &["x"], &["1-"], &["spotify:track:9"], &[]] {
+            assert!(positions(&args(bad), &q, "rm").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn move_keeps_order_and_lands_at_the_position() {
+        let moved = |from: &[usize], to| {
+            let mut v = vec![1, 2, 3, 4, 5, 6];
+            move_items(&mut v, from, to);
+            v
+        };
+        assert_eq!(moved(&[4], 0), [5, 1, 2, 3, 4, 6]); // mv 5 1
+        assert_eq!(moved(&[1], 4), [1, 3, 4, 5, 2, 6]); // mv 2 5: song 2 ends up 5th
+        assert_eq!(moved(&[2, 3, 4], 0), [3, 4, 5, 1, 2, 6]); // mv 3-5 1
+        assert_eq!(moved(&[0, 5], 2), [2, 3, 1, 6, 4, 5]); // mv 1 6 3
+        assert_eq!(moved(&[0], 99), [2, 3, 4, 5, 6, 1]); // past the end
+    }
 }

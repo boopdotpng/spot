@@ -2,13 +2,17 @@
 
 use crate::*;
 
-/// The user's Spotify app client id: env, then config file, then a one-time prompt that saves it.
-pub fn client_id(redirect: &str) -> Result<String, String> {
+/// The file spot kept the client id in before config.toml; still read, so nobody sets up again.
+pub fn old_client_id() -> Option<String> {
+    fs::read_to_string(config_dir().join("client_id")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// The user's Spotify app client id: env, then config.toml, then a one-time prompt that saves it.
+pub fn client_id(redirect: &str, saved: Option<String>) -> Result<String, String> {
     if let Ok(id) = std::env::var("SPOT_CLIENT_ID") {
         return Ok(id);
     }
-    let path = config_dir().join("client_id");
-    if let Some(id) = fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    if let Some(id) = saved.or_else(old_client_id) {
         return Ok(id);
     }
     if !std::io::stdin().is_terminal() {
@@ -33,9 +37,7 @@ pub fn client_id(redirect: &str) -> Result<String, String> {
         }
         println!("That doesn't look like a client id (32 hex characters).");
     };
-    fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
-    fs::write(&path, &id).map_err(|e| e.to_string())?;
-    println!("Saved to {}.\n", path.display());
+    println!("Saved to {}.\n", settings::save_client_id(&id)?.display());
     Ok(id)
 }
 
