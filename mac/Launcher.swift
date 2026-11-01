@@ -735,6 +735,23 @@ final class ToastPanel: NSPanel {
     override func constrainFrameRect(_ frame: NSRect, to screen: NSScreen?) -> NSRect { frame }
 }
 
+// Private, but there's no public way: windows on every Space still slide with a desktop swipe,
+// unless they're in a space of their own above the ones that move.
+@_silgen_name("_CGSDefaultConnection") func CGSDefaultConnection() -> Int32
+@_silgen_name("CGSSpaceCreate") func CGSSpaceCreate(_ cid: Int32, _ flag: Int, _ options: NSDictionary?) -> UInt64
+@_silgen_name("CGSSpaceSetAbsoluteLevel") func CGSSpaceSetAbsoluteLevel(_ cid: Int32, _ space: UInt64, _ level: Int32)
+@_silgen_name("CGSShowSpaces") func CGSShowSpaces(_ cid: Int32, _ spaces: NSArray)
+@_silgen_name("CGSAddWindowsToSpaces") func CGSAddWindowsToSpaces(_ cid: Int32, _ windows: NSArray, _ spaces: NSArray)
+
+/// The space the toast stays put in. The flag must be 1, or Finder draws desktop icons in it.
+let toastSpace: UInt64 = {
+    let cid = CGSDefaultConnection()
+    let space = CGSSpaceCreate(cid, 1, nil)
+    CGSSpaceSetAbsoluteLevel(cid, space, Int32.max)
+    CGSShowSpaces(cid, [space])
+    return space
+}()
+
 @MainActor
 final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = Model()
@@ -918,6 +935,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         toast.alphaValue = 1
         toast.orderFrontRegardless()
+        CGSAddWindowsToSpaces(CGSDefaultConnection(), [toast.windowNumber], [toastSpace])
         if screen.notch != nil {
             DispatchQueue.main.async { [notchState] in notchState.open = true }  // once it's on screen, so it animates
         }
