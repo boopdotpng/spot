@@ -66,44 +66,6 @@ pub fn meter(w: usize, ratio: f64, knob: bool, th: &Theme) -> Vec<Span<'static>>
     ]
 }
 
-/// Key hints for the status line, most useful first; trimmed from the end when space runs out.
-pub fn hints(app: &App) -> Vec<(&'static str, &'static str)> {
-    let mut h = vec![];
-    match app.focus {
-        Focus::Playlists => {
-            h.push(("⏎", "open"));
-            h.push(("/", "search"));
-            h.push(("space", "pause"));
-            h.push(("s", "shuffle"));
-            h.push(("r", "repeat"));
-        }
-        Focus::Tracks => {
-            h.push(("⏎", if app.view.kind == Kind::Tracks { "play" } else { "open" }));
-            if app.view.key == QUEUE_KEY {
-                h.push(("x", "remove"));
-            } else if app.view.kind == Kind::Tracks {
-                h.push(("e", "queue"));
-            }
-            h.push(("/", "search"));
-            h.push(("^f", "find"));
-            if app.view.artist.is_some() {
-                h.push(("v", if app.artist_songs { "releases" } else { "songs" }));
-                if app.view.kind == Kind::Albums {
-                    h.push(("f", ["all", "albums", "singles"][app.view.filter.next() as usize]));
-                }
-            }
-            if !app.history.is_empty() {
-                h.push(("esc", "back"));
-            }
-            h.push(("a", "album"));
-            h.push(("A", "artist"));
-            h.push(("s", "shuffle"));
-        }
-    }
-    h.push(("?", "keys"));
-    h
-}
-
 /// The `?` key block (nano-style, at the bottom): every key in as many columns as fit.
 pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
     const KEYS: &[(&str, &str)] = &[
@@ -119,7 +81,7 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("P", "play whole list"),
         ("o", "go to playing"),
         ("e", "add to queue"),
-        ("Q", "show queue"),
+        ("Q", "up next"),
         ("x", "queue: remove song"),
         ("a  A", "album / artist"),
         ("v", "artist: songs / releases"),
@@ -129,7 +91,7 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("ctrl+t", "theme"),
         ("g  M  G", "top / middle / bottom"),
         ("q", "quit"),
-        ("d", "detach (keep playing)"),
+        ("d  ctrl+c", "detach (keep playing)"),
     ];
     const COL: usize = 36;
     let cols = (width.saturating_sub(1) / COL).clamp(1, 4);
@@ -175,8 +137,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let body = f.area();
 
     // A terminal-app frame: two panes split by a thin rule, the player under a rule across the
-    // whole width, and a vim-style status line at the bottom carrying the search / find prompts,
-    // notices and key hints. `?` swaps the status line for a nano-style key block.
+    // whole width, and a vim-style status line at the bottom carrying the search / find prompts
+    // and notices. `?` swaps the status line for a nano-style key block.
     let help = app.help.then(|| help_lines(body.width as usize, th));
     let bottom_h = help.as_ref().map_or(1, |l| l.len() as u16);
     let [top, rule, player, bottom] =
@@ -273,8 +235,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let mut off = app.tr_state.offset().min(total.saturating_sub(height));
     // multi-disc albums get a "disc n" line above each disc's first song, set off by a blank
     // line unless it's at the top; they take lines but aren't rows you can select
-    let discs = tracks && app.view.key.starts_with("spotify:album:") && app.view.tracks.iter().any(|t| t.disc > 1);
-    let disc_of = |r: usize| shown.get(r).map_or(0, |i| app.view.tracks[i].disc);
+    // up next likewise, around the queue and the list after it
+    let up_next = app.view.key == QUEUE_KEY;
+    let queued = app.upnext.len();
+    let discs = up_next || tracks && app.view.key.starts_with("spotify:album:") && app.view.tracks.iter().any(|t| t.disc > 1);
+    let disc_of = |r: usize| shown.get(r).map_or(0, |i| if up_next { usize::from(i >= queued) } else { app.view.tracks[i].disc as usize });
+    let disc_title = |r: usize| match (up_next, disc_of(r), &app.queue) {
+        (false, disc, _) => format!("disc {disc}"),
+        (true, 0, _) => "queue".into(),
+        (true, _, Some(q)) => format!("then {}", q.name),
+        (true, _, None) => "then".into(),
+    };
     let starts_disc = |r: usize| discs && (r == 0 || disc_of(r) != disc_of(r - 1));
     // lines above row r's song when the window starts at `off`
     let above = |r: usize, off: usize| if !starts_disc(r) { 0 } else if r == off { 1 } else { 2 };
@@ -348,7 +319,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             rows.push(Row::new([""]));
         }
         if above(r, off) > 0 {
-            rows.push(Row::new([Cell::from(""), Cell::from(format!("disc {}", disc_of(r)))]).style(disc_style));
+            rows.push(Row::new([Cell::from(""), Cell::from(disc_title(r))]).style(disc_style));
         }
         if sel == Some(r) {
             sel_line = Some(rows.len());
@@ -383,9 +354,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_stateful_widget(sb, area, &mut st);
     }
 
-    // player: mark + title with modes and where it's playing from, artist · album with what's next,
+    // player: mark + title with modes and where it's playing from, artist · album,
     // then the progress bar
-    let pad = Rect { x: player.x + 1, width: player.width.saturating_sub(2), ..player };
+    let mut pad = Rect { x: player.x + 1, width: player.width.saturating_sub(2), ..player };
+    // album art at the left, while there's room for the text beside it
+    if let Some(art) = app.art.image.as_ref().filter(|_| app.now().is_some() && pad.width >= 50) {
+        let w = art.size().width;
+        f.render_widget(ratatui_image::Image::new(art), Rect { width: w, ..pad });
+        pad.x += w + 1;
+        pad.width -= w + 1;
+    }
     let [now, sub, bar] = Layout::vertical([Constraint::Length(1); 3]).areas(pad);
     let gold = Style::new().fg(th.gold).bold();
     let sep_span = || Span::styled("  ·  ", dim);
@@ -425,22 +403,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(top_left)), now);
     f.render_widget(Paragraph::new(Line::from(top_right).right_aligned()), now);
     if let Some(t) = cur {
-        // up next (when the queue isn't on its last song; repeat one plays this again)
-        let next = (app.repeat != Repeat::One).then(|| app.up_next()).flatten();
-        let full = (sub.width as usize).saturating_sub(2);
-        let next_spans = next.map(|n| {
-            let room = (full / 2).saturating_sub(8);
-            let name = fit(&n.name, room);
-            let mut v = vec![Span::styled("next  ", dim), Span::styled(name.clone(), Style::new().fg(th.sub))];
-            let rest = room.saturating_sub(Span::raw(&name).width() + 3);
-            if rest >= 6 {
-                v.push(Span::styled(" · ", dim));
-                v.push(Span::styled(fit(&n.artists, rest), dim));
-            }
-            v
-        });
-        let show_next = next_spans.as_ref().is_some_and(|n| full >= width(n) + 28);
-        let avail = if show_next { full - width(next_spans.as_ref().unwrap()) - 3 } else { full };
+        let avail = (sub.width as usize).saturating_sub(2);
         let artist = fit(&t.artists, avail);
         let mut spans = vec![Span::raw("  "), Span::styled(artist.clone(), Style::new().fg(th.sub))];
         let rest = avail.saturating_sub(Span::raw(&artist).width() + 3);
@@ -449,9 +412,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             spans.push(Span::styled(fit(&t.album, rest), dim));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), sub);
-        if show_next {
-            f.render_widget(Paragraph::new(Line::from(next_spans.unwrap()).right_aligned()), sub);
-        }
     }
     let (lt, rt) = if cur.is_some() { (mmss(pos), mmss(len)) } else { (String::new(), String::new()) };
     let (lt, rt) = (Span::styled(format!("{lt:>4} "), dim), Span::styled(format!(" {rt}"), dim));
@@ -462,15 +422,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     spans.push(rt);
     f.render_widget(Paragraph::new(Line::from(spans)), bar);
 
-    // bottom: on a faint tint of the terminal background (needs truecolor)
-    if let Some(p) = panel(th) {
+    // bottom: on a faint tint of the terminal background (needs truecolor), when it has something to say
+    let quiet = !app.help && app.input.is_none() && app.find.is_none() && app.status.is_empty() && app.note.is_none();
+    if let Some(p) = panel(th).filter(|_| !quiet) {
         f.render_widget(Block::new().style(Style::new().bg(hex_rgb(p))), bottom);
     }
     if let Some(lines) = help {
         f.render_widget(Paragraph::new(lines), bottom);
         return;
     }
-    // status line: prompt (search / find) > error > notice > key hints; position and volume at the right
+    // status line: prompt (search / find) > error > notice > what's next; position and volume at the right
     let bw = bottom.width as usize;
     let (left_side, right_side): (Vec<Span>, Vec<Span>) = if let Some(buf) = &app.input {
         let kinds = [Kind::Tracks, Kind::Albums, Kind::Artists].map(|k| {
@@ -504,19 +465,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             vec![Span::styled(format!(" {}", fit(&app.status, avail)), Style::new().fg(th.err).bold())]
         } else if let Some((n, _)) = &app.note {
             vec![Span::styled(format!(" {}", fit(n, avail)), Style::new().fg(th.accent))]
-        } else {
-            let mut v = vec![];
-            let mut used = 0;
-            for (k, d) in hints(app) {
-                let need = k.chars().count() + d.len() + 3;
-                if used + need > avail {
-                    break;
-                }
-                v.push(Span::styled(format!(" {k}"), Style::new().fg(th.sub).bold()));
-                v.push(Span::styled(format!(" {d} "), dim));
-                used += need;
+        } else if let Some(n) = cur.filter(|_| app.repeat != Repeat::One).and_then(|_| app.up_next()) {
+            // up next (when the queue isn't on its last song; repeat one plays this again)
+            let room = avail.saturating_sub(7);
+            let name = fit(&n.name, room);
+            let mut v = vec![Span::styled(" next  ", dim), Span::styled(name.clone(), Style::new().fg(th.sub))];
+            let rest = room.saturating_sub(Span::raw(&name).width() + 3);
+            if rest >= 6 {
+                v.push(Span::styled(" · ", dim));
+                v.push(Span::styled(fit(&n.artists, rest), dim));
             }
             v
+        } else {
+            vec![]
         };
         (left, right)
     };

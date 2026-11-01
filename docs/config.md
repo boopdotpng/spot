@@ -16,14 +16,18 @@ mistake in the file shows on the status line and in the log, and that setting ke
 | `client_id` | none | your Spotify app's client id, in quotes | Saved here by the first-run setup. `SPOT_CLIENT_ID` overrides it. |
 | `quality` | `320` | `96`, `160`, `320` | Audio quality in kbps. 320 is the most librespot can stream. |
 | `audio_cache_gb` | `1` | `0` or above; decimals work | How much played music to keep on disk, least recently played dropped first. `0` turns the cache off. `SPOT_AUDIO_CACHE_GB` overrides it. |
-| `popup` | `true` | `true`, `false` | macOS launcher: show what's playing when a media key skips or seeks. |
+| `normalize` | `true` | `true`, `false` | Play every song at about the same loudness, using Spotify's loudness data. |
+| `hotkey` | `"option+space"` | modifiers (`ctrl`, `option`, `cmd`, `shift`) and a key (a letter, digit, `space`, `return`, `tab`, `f1`-`f12`), joined with `+`; f-keys need no modifier | macOS launcher: what opens it. It takes effect once the launcher reaches the restarted player, and it remembers the key for its next launch. |
+| `popup` | `"skip"` | `"skip"`, `"track"`, `"off"` | macOS launcher: when to show what's playing. `skip`: a media key skips or seeks. `track`: that, and every new song. |
 | `popup_seconds` | `3` | above `0`; decimals work | How long the popup stays up. |
 
 ```toml
 client_id = "0123456789abcdef0123456789abcdef"
 quality = 320
 audio_cache_gb = 1
-popup = true
+normalize = true
+hotkey = "option+space"
+popup = "skip"
 popup_seconds = 3
 ```
 

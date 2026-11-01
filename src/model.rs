@@ -90,8 +90,9 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Default)]
 pub enum Repeat {
+    #[default]
     Off,
     All, // loop the list (reshuffled each pass when shuffling)
     One, // replay the current song
@@ -133,6 +134,7 @@ pub enum Msg {
     Ctl(Vec<String>, ctl::Reply), // a `spot <command>` request
     Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `queue add` named, fetched
     Watch(ctl::Watcher),
+    Art(String, Option<ratatui_image::protocol::Protocol>), // a cover's url, and it drawn for the terminal
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }
 
@@ -155,6 +157,11 @@ pub struct Queue {
 impl Queue {
     pub fn idx(&self) -> usize {
         self.order[self.pos]
+    }
+
+    /// The songs after the one it's on, in play order.
+    pub fn upcoming(&self) -> impl Iterator<Item = &Track> {
+        self.order.iter().skip(self.pos + 1).map(|&i| &self.tracks[i])
     }
 
     /// Uniform Fisher-Yates over every track (OS-seeded ChaCha RNG), no "smart" weighting.

@@ -53,12 +53,21 @@ pub struct Watcher {
     warned: u64,           // play number it was last sent `ending` for
 }
 
+fn repeat_name(r: Repeat) -> &'static str {
+    match r {
+        Repeat::Off => "off",
+        Repeat::All => "all",
+        Repeat::One => "one",
+    }
+}
+
 /// Event bookkeeping: what the watchers were last told.
 #[derive(Default)]
 pub struct State {
     watchers: Vec<Watcher>,
     plays: u64,
     playing: bool,
+    modes: (bool, Repeat),
     pub skipped: bool, // a media key skipped or seeked since the last tick
 }
 
@@ -263,8 +272,8 @@ fn watcher(args: &mut Vec<String>) -> Result<(u64, Option<String>), Fail> {
     let before = num_opt(args, "--before")?.unwrap_or(30);
     let until = match (args[0].as_str(), args.get(1).map(String::as_str)) {
         ("watch", _) => None,
-        (_, Some(e @ ("track" | "ending" | "playing" | "paused" | "end" | "skip"))) => Some(e.to_string()),
-        _ => return Err(usage("wait: for track, ending, playing, paused, end or skip")),
+        (_, Some(e @ ("track" | "ending" | "playing" | "paused" | "modes" | "end" | "skip"))) => Some(e.to_string()),
+        _ => return Err(usage("wait: for track, ending, playing, paused, modes, end or skip")),
     };
     Ok((before * 1000, until))
 }
@@ -286,22 +295,18 @@ impl App {
         let nothing = || fail("nothing to play: start something with `spot play <words>`");
         match cmd {
             // for programs: playing (1 or empty), name, artists, album, uri, shuffle (1 or empty),
-            // repeat (off, all, one); nothing playing is no line
+            // repeat (off, all, one), first artist, cover url; nothing playing is no line
             "status" if flag(&mut args, "--tsv") => {
-                let repeat = match self.repeat {
-                    Repeat::Off => "off",
-                    Repeat::All => "all",
-                    Repeat::One => "one",
-                };
+                let repeat = repeat_name(self.repeat);
                 let on = |b: bool| if b { "1" } else { "" };
-                let row = |t: &Track| tsv_row(&[on(self.want_play), &t.name, &t.artists, &t.album, &t.uri, on(self.shuffle), repeat]);
+                let row = |t: &Track| tsv_row(&[on(self.want_play), &t.name, &t.artists, &t.album, &t.uri, on(self.shuffle), repeat, lastfm::lead_artist(t), t.cover.as_deref().unwrap_or("")]);
                 return Ok(Some(self.now().map(row).unwrap_or_default()));
             }
             "status" => {}
-            // for the launcher: popup (1 or empty), popup seconds
+            // for the launcher: popup (skip, track or empty), popup seconds, hotkey
             "launcher" => {
                 let s = &self.settings;
-                return Ok(Some(tsv_row(&[if s.popup { "1" } else { "" }, &s.popup_seconds.to_string()])));
+                return Ok(Some(tsv_row(&[s.popup.wire(), &s.popup_seconds.to_string(), &s.hotkey])));
             }
             "play" | "resume" => {
                 let show = flag(&mut args, "--show");
@@ -668,7 +673,7 @@ impl App {
             out.push(numbered(&self.upnext.iter().map(row).collect::<Vec<_>>()));
         }
         let upcoming: Vec<String> =
-            self.queue.iter().flat_map(|q| q.order.iter().skip(q.pos + 1).take(n).map(|&i| format!("     {}", row(&q.tracks[i])))).collect();
+            self.queue.iter().flat_map(|q| q.upcoming().take(n).map(|t| format!("     {}", row(t)))).collect();
         match &self.queue {
             Some(q) if !upcoming.is_empty() => {
                 out.push(format!("then {}:", list_name(q)));
@@ -694,11 +699,12 @@ impl App {
         }
     }
 
-    /// Tell watchers what changed since the last tick: a new song, play / pause, the queue
-    /// running out, a media key skipping or seeking, or the song ending within their `--before`.
+    /// Tell watchers what changed since the last tick: a new song, play / pause, shuffle or
+    /// repeat, the queue running out, a media key skipping or seeking, or the song ending within their `--before`.
     pub fn tick_watchers(&mut self) {
         let new_track = std::mem::replace(&mut self.ctl.plays, self.plays) != self.plays;
         let toggled = std::mem::replace(&mut self.ctl.playing, self.want_play) != self.want_play;
+        let modes = std::mem::replace(&mut self.ctl.modes, (self.shuffle, self.repeat)) != (self.shuffle, self.repeat);
         let skipped = std::mem::take(&mut self.ctl.skipped);
         if self.ctl.watchers.is_empty() {
             return;
@@ -716,6 +722,9 @@ impl App {
                 (false, true) => ("end", "end: the queue ran out".into()),
                 (false, false) => ("paused", format!("paused: {}", now())),
             });
+        }
+        if modes {
+            events.push(("modes", format!("modes: shuffle {}, repeat {}", if self.shuffle { "on" } else { "off" }, repeat_name(self.repeat))));
         }
         if skipped {
             events.push(("skip", format!("skip: {}", now())));

@@ -58,7 +58,7 @@ Control the running player, from any terminal, script or agent:
   spot queue clear           empty the queue
   spot playlists             your playlists, numbered, with uris
   spot watch [--before 30]   a line per event as it happens: track (new song), playing,
-                             paused, skip (a media key skipped or seeked), end (nothing left to
+                             paused, modes, skip (a media key skipped or seeked), end (nothing left to
                              play), ending (the song ends in 30s; says what's next, so there's
                              time to `queue add` something else)
   spot wait <event> [--before 30]   wait for the next such event, print it, exit

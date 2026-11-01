@@ -49,27 +49,67 @@ func spot(_ args: [String]) -> (Int, String) {
     return (code, rest.trimmingCharacters(in: .newlines))
 }
 
-/// Follow `spot watch` for good, calling `onSkip` per media key press. Blocks, so it gets a thread
-/// of its own; while spot isn't running it looks again every few seconds.
-func watchSkips(_ onSkip: @escaping @Sendable () -> Void) {
+/// Follow `spot watch` for good: `onConnect` each time the player is reached, so after it restarts;
+/// `onSkip` per media key press; `onTrack` per new song; `onChange` when what's playing may have changed, or the player
+/// went away. Blocks, so it gets a thread of its own; while spot isn't running it looks again
+/// every few seconds.
+func watchPlayer(onConnect: @escaping @Sendable () -> Void, onTrack: @escaping @Sendable () -> Void, onChange: @escaping @Sendable () -> Void, onSkip: @escaping @Sendable () -> Void) {
     while true {
         if let fd = connectSpot() {
             var pending = Data()
             var buf = [UInt8](repeating: 0, count: 4096)
             if write(fd, "watch\n", 6) == 6 {
+                onConnect()
                 while case let n = read(fd, &buf, buf.count), n > 0 {
                     pending.append(buf, count: n)
                     while let end = pending.firstIndex(of: 10) {
-                        if pending[pending.startIndex..<end].starts(with: "skip:".utf8) { onSkip() }
+                        let line = pending[pending.startIndex..<end]
+                        if line.starts(with: "skip:".utf8) {
+                            onSkip()
+                        } else if line.starts(with: "track:".utf8) {
+                            onTrack()
+                        } else if !line.starts(with: "ending in".utf8) {
+                            onChange()
+                        }
                         pending = Data(pending[(end + 1)...])
                     }
                 }
             }
             close(fd)
+            onChange()
         }
         sleep(3)
     }
 }
+
+/// config.toml's `hotkey`, which the player checked: its Carbon key code and modifiers.
+func parseHotKey(_ spec: String) -> (UInt32, UInt32)? {
+    var parts = spec.split(separator: "+").map(String.init)
+    guard let code = parts.popLast().flatMap({ keyCodes[$0] }) else { return nil }
+    var mods = 0
+    for part in parts {
+        switch part {
+        case "ctrl": mods |= controlKey
+        case "option": mods |= optionKey
+        case "cmd": mods |= cmdKey
+        case "shift": mods |= shiftKey
+        default: return nil
+        }
+    }
+    return (UInt32(code), UInt32(mods))
+}
+
+let keyCodes = [
+    "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F, "g": kVK_ANSI_G,
+    "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J, "k": kVK_ANSI_K, "l": kVK_ANSI_L, "m": kVK_ANSI_M, "n": kVK_ANSI_N,
+    "o": kVK_ANSI_O, "p": kVK_ANSI_P, "q": kVK_ANSI_Q, "r": kVK_ANSI_R, "s": kVK_ANSI_S, "t": kVK_ANSI_T, "u": kVK_ANSI_U,
+    "v": kVK_ANSI_V, "w": kVK_ANSI_W, "x": kVK_ANSI_X, "y": kVK_ANSI_Y, "z": kVK_ANSI_Z,
+    "0": kVK_ANSI_0, "1": kVK_ANSI_1, "2": kVK_ANSI_2, "3": kVK_ANSI_3, "4": kVK_ANSI_4,
+    "5": kVK_ANSI_5, "6": kVK_ANSI_6, "7": kVK_ANSI_7, "8": kVK_ANSI_8, "9": kVK_ANSI_9,
+    "space": kVK_Space, "return": kVK_Return, "tab": kVK_Tab,
+    "f1": kVK_F1, "f2": kVK_F2, "f3": kVK_F3, "f4": kVK_F4, "f5": kVK_F5, "f6": kVK_F6,
+    "f7": kVK_F7, "f8": kVK_F8, "f9": kVK_F9, "f10": kVK_F10, "f11": kVK_F11, "f12": kVK_F12,
+]
 
 /// `spot start`: the player in the background. Looks where install.sh and cargo put it, then
 /// asks your shell (an app doesn't get its PATH).
@@ -139,6 +179,11 @@ struct Playing: Equatable {
     let name, artists, uri: String
     var shuffle: Bool
     var repeats: String  // off, all, one
+    var lead: String  // the first of `artists`, which can have a comma in it; all of them if spot is too old to say
+    var cover: String  // the album art's url; empty if there's none, or spot is too old to say
+
+    /// The first artist, with … if there are more.
+    var leadArtist: String { lead == artists ? lead : lead + "…" }
 }
 
 @MainActor
@@ -150,11 +195,14 @@ final class Model: ObservableObject {
     @Published var note: String?  // an error or "starting spot…", shown in place of results
     @Published var busy = false
     let theme = Theme()
-    var popup = true  // config.toml, by way of spot
+    var popup = true  // config.toml, by way of spot: on media keys
+    var popupOnTrack = false  // and on every new song
     var popupSeconds = 3.0
+    var hotkey: String?
     @Published var now: Playing?
     @Published var copied = false  // a link just went to the clipboard
     var close: () -> Void = {}
+    var played: () async -> Void = {}  // a song you couldn't see started: show what it is
     private var generation = 0
     private var copiedFade: Task<Void, Never>?
 
@@ -204,18 +252,19 @@ final class Model: ObservableObject {
         let (code, text) = await Task.detached { spot(["status", "--tsv"]) }.value
         let f = text.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         let now = code == 0 && f.count >= 7
-            ? Playing(playing: f[0] == "1", name: f[1], artists: f[2], uri: f[4], shuffle: f[5] == "1", repeats: f[6]) : nil
+            ? Playing(playing: f[0] == "1", name: f[1], artists: f[2], uri: f[4], shuffle: f[5] == "1", repeats: f[6], lead: f.count >= 8 ? f[7] : f[2], cover: f.count >= 9 ? f[8] : "") : nil
         if now != self.now { self.now = now }
     }
 
     func refreshNow() { Task { await fetchNow() } }
 
-    /// The popup's settings; the defaults if spot is too old to say.
-    func fetchPopup() async {
+    /// The settings in config.toml that are for us; the defaults if spot is too old to say.
+    func fetchSettings() async {
         let (code, text) = await Task.detached { spot(["launcher"]) }.value
         let f = text.split(separator: "\t", omittingEmptySubsequences: false)
         guard code == 0, f.count >= 2, let seconds = Double(f[1]) else { return }
-        (popup, popupSeconds) = (f[0] == "1", seconds)
+        (popup, popupOnTrack, popupSeconds) = (!f[0].isEmpty, f[0] == "track", seconds)
+        if f.count >= 3 { hotkey = String(f[2]) }
     }
 
     func togglePlay() { control(["toggle"]) { $0.playing.toggle() } }
@@ -246,7 +295,8 @@ final class Model: ObservableObject {
 
     /// Play (or queue) the selected result, then get out of the way.
     /// Before the results are in, the window closes right away and the first result plays (or
-    /// queues) in the background once it's found; a beep if nothing is.
+    /// queues) in the background once it's found; a beep if nothing is. Playing, the popup says
+    /// what it turned out to be, since you never saw it.
     func choose(queue: Bool) {
         if busy {
             let (q, kind) = (query.trimmingCharacters(in: .whitespaces), kind)
@@ -256,7 +306,8 @@ final class Model: ObservableObject {
             Task {
                 let (code, text) = await request(["search", "--tsv", "-n", "\(maxRows)", kind.flag, q])
                 guard code == 0, let first = text.split(separator: "\n").first.flatMap(Result.init) else { return NSSound.beep() }
-                if await request(queue ? ["queue", "add", first.uri] : ["play", first.uri]).0 != 0 { NSSound.beep() }
+                if await request(queue ? ["queue", "add", first.uri] : ["play", first.uri]).0 != 0 { return NSSound.beep() }
+                if !queue { await played() }
             }
             return
         }
@@ -316,7 +367,15 @@ let barHeight: CGFloat = 30
 let nowHeight: CGFloat = 26
 let maxRows = 12
 let toastWidth: CGFloat = 340  // longer than this ends in …
-let toastGap: CGFloat = 6  // between the notch and the toast
+let toastGap: CGFloat = 6  // between the menu bar and the toast
+let notchMaxWidth: CGFloat = 460  // longer than this ends in …
+let notchMinSide: CGFloat = 28  // the least it grows past the notch, each side
+let notchRow: CGFloat = 30  // how far it grows down past the notch: the line it shows
+let notchArt: CGFloat = 22  // the album art on that line
+let notchCorner: CGFloat = 16
+let notchShoulder: CGFloat = 8  // the curve out into the top edge of the screen
+let notchInset: CGFloat = 16  // between the text and the toast's edges
+let notchClose = 0.3  // seconds to go back into the notch
 let mono = Font.system(size: 13, design: .monospaced)
 
 /// spot's status line and list, floating: results numbered above, the search line at the bottom.
@@ -480,15 +539,115 @@ struct Toast: View {
             Image(systemName: now.playing ? "play.fill" : "pause.fill")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(th.accent)
-            // no priority: past toastWidth both get an even share, each ending in …
             Text(now.name).foregroundStyle(th.text).bold().lineLimit(1)
-            Text(now.artists).foregroundStyle(th.sub).lineLimit(1)
+            Text(now.leadArtist).foregroundStyle(th.sub).lineLimit(1)
+                .layoutPriority(1)  // past toastWidth the song gives way
         }
         .font(mono)
         .padding(.horizontal, 14)
         .frame(height: barHeight)
         .modifier(Glass(th: th))
         .padding(margin)
+    }
+}
+
+/// Whether the notch toast is out (it springs from the notch and back), and the album art it shows.
+@MainActor final class NotchState: ObservableObject {
+    @Published var open = false
+    @Published var art: NSImage?
+}
+
+/// The notch's outline, grown: flush with the top of the screen, curving out into it at the
+/// shoulders like the hardware does, with rounded bottom corners. `shoulder` of its width on each
+/// side is outside the body.
+struct NotchShape: Shape {
+    var shoulder: CGFloat = notchShoulder
+    var corner: CGFloat = notchCorner
+
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.minY))
+        p.addQuadCurve(to: CGPoint(x: r.minX + shoulder, y: r.minY + shoulder), control: CGPoint(x: r.minX + shoulder, y: r.minY))
+        p.addLine(to: CGPoint(x: r.minX + shoulder, y: r.maxY - corner))
+        p.addQuadCurve(to: CGPoint(x: r.minX + shoulder + corner, y: r.maxY), control: CGPoint(x: r.minX + shoulder, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.maxX - shoulder - corner, y: r.maxY))
+        p.addQuadCurve(to: CGPoint(x: r.maxX - shoulder, y: r.maxY - corner), control: CGPoint(x: r.maxX - shoulder, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.maxX - shoulder, y: r.minY + shoulder))
+        p.addQuadCurve(to: CGPoint(x: r.maxX, y: r.minY), control: CGPoint(x: r.maxX - shoulder, y: r.minY))
+        p.closeSubpath()
+        return p
+    }
+}
+
+/// The toast on a screen with a notch: the notch grown out to both sides and down, what's playing
+/// on a line under it. Black whatever the appearance, so the text is white.
+struct NotchToast: View {
+    @ObservedObject var state: NotchState
+    let now: Playing
+    let th: Theme
+    let notch: CGSize
+    let width: CGFloat
+
+    /// How wide the line needs it to be.
+    static func width(for now: Playing, notch: CGFloat) -> CGFloat {
+        func wide(_ s: String, _ weight: NSFont.Weight) -> CGFloat {
+            (s as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: weight)]).width
+        }
+        let line = ceil(wide(now.name, .semibold) + wide(now.leadArtist, .regular)) + notchArt + 2 * spacing + 2 * notchInset
+        return min(max(line, notch + 2 * notchMinSide), notchMaxWidth)
+    }
+    static let spacing: CGFloat = 8
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            Color.black
+            HStack(spacing: Self.spacing) {
+                cover
+                Text(now.name).foregroundStyle(.white).fontWeight(.semibold).lineLimit(1)
+                Text(now.leadArtist).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
+                    .layoutPriority(1)  // past notchMaxWidth the song gives way
+            }
+            .font(.system(size: 13))
+            .frame(width: width - 2 * notchInset, height: notchRow)
+            .padding(.top, notch.height - 4)  // the bottom corners want the line a little high
+            .opacity(state.open ? 1 : 0)
+            .blur(radius: state.open ? 0 : 4)
+            .animation(state.open ? .easeOut(duration: 0.2) : .easeIn(duration: 0.12), value: state.open)
+        }
+        // the line keeps its size and the shape closes over it, so it goes into the notch
+        .frame(width: (state.open ? width : notch.width) + 2 * notchShoulder,
+               height: state.open ? notch.height + notchRow : notch.height, alignment: .top)
+        .clipShape(NotchShape())
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .animation(state.open ? .spring(duration: 0.38, bounce: 0.22) : .spring(duration: notchClose, bounce: 0), value: state.open)
+    }
+
+    /// The album art, once it's here. Paused, or without art, the state's glyph shows on it.
+    var cover: some View {
+        ZStack {
+            Color.white.opacity(0.12)
+            if let art = state.art {
+                Image(nsImage: art).resizable().aspectRatio(contentMode: .fill)
+                    .opacity(now.playing ? 1 : 0.45)
+            }
+            if !now.playing || state.art == nil {
+                Image(systemName: now.playing ? "play.fill" : "pause.fill")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(.white)
+            }
+        }
+        .frame(width: notchArt, height: notchArt)
+        .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+        .animation(.easeOut(duration: 0.15), value: state.art)
+    }
+}
+
+extension NSScreen {
+    /// The notch's size and the x of its middle; nil without one.
+    var notch: (size: CGSize, midX: CGFloat)? {
+        guard let left = auxiliaryTopLeftArea?.width, let right = auxiliaryTopRightArea?.width else { return nil }
+        let width = frame.width - left - right
+        return (CGSize(width: width, height: safeAreaInsets.top), frame.minX + left + width / 2)
     }
 }
 
@@ -570,7 +729,7 @@ final class Panel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
-/// The toast's window: its transparent margin may sit up under the menu bar, or past the screen's
+/// The toast's window: it may sit over the menu bar, or its transparent margin past the screen's
 /// edge, which AppKit would otherwise push it down from.
 final class ToastPanel: NSPanel {
     override func constrainFrameRect(_ frame: NSRect, to screen: NSScreen?) -> NSRect { frame }
@@ -581,13 +740,15 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let model = Model()
     var panel: Panel!
     var hotKey: EventHotKeyRef?
+    var hotKeySpec = ""  // what hotKey is, as config.toml's `hotkey`
     var changes: AnyCancellable?
-    var poll: Timer?  // refreshes what's playing while the window is open
     var bottom: CGFloat = 0  // the glass's bottom edge (the window's is `margin` lower): it grows upward from here
     var placing = false  // moving the window ourselves, not the user dragging it
     var toast: ToastPanel!
-    var toastView: NSHostingController<Toast?>!
+    var toastView: NSHostingController<AnyView>!
     var toastFade: Task<Void, Never>?
+    let notchState = NotchState()
+    let covers = NSCache<NSString, NSImage>()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         panel = Panel(
@@ -607,6 +768,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         host.sizingOptions = []  // fit() alone sizes the window
         panel.contentView = host
         model.close = { [weak self] in self?.hide() }
+        model.played = { [weak self] in await self?.announce() }
         // resize after each change to what's shown (the model's change lands after willChange)
         changes = model.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.fit() }
@@ -619,7 +781,18 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         registerHotKey()
         makeToast()
         Thread.detachNewThread { [self] in
-            watchSkips { Task { @MainActor in await self.skipped() } }
+            watchPlayer(
+                onConnect: { Task { @MainActor in
+                    await self.model.fetchSettings()
+                    if let key = self.model.hotkey { self.setHotKey(key) }
+                } },
+                onTrack: { Task { @MainActor in
+                    if self.model.popupOnTrack { await self.announce() } else if self.panel.isVisible { await self.model.fetchNow() }
+                } },
+                onChange: { Task { @MainActor in
+                    if self.panel.isVisible { await self.model.fetchNow() }
+                } },
+                onSkip: { Task { @MainActor in await self.announce() } })
         }
         NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(activeSpaceChanged),
@@ -654,9 +827,22 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             MainActor.assumeIsolated { me.toggle() }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        // the last one the player gave us: it may not be running yet, and the login shouldn't start it
+        setHotKey(UserDefaults.standard.string(forKey: "hotkey") ?? "option+space")
+    }
+
+    /// Move the hotkey to `spec`. If that one's taken the old one stays.
+    func setHotKey(_ spec: String) {
+        guard spec != hotKeySpec, let (key, mods) = parseHotKey(spec) else { return }
         let id = EventHotKeyID(signature: OSType(0x5350_4F54), id: 1)  // 'SPOT'
-        let status = RegisterEventHotKey(UInt32(kVK_Space), UInt32(optionKey), id, GetApplicationEventTarget(), 0, &hotKey)
-        if status != noErr { NSLog("spot launcher: couldn't register ⌥Space (\(status)); is something else using it?") }
+        var new: EventHotKeyRef?
+        let status = RegisterEventHotKey(key, mods, id, GetApplicationEventTarget(), 0, &new)
+        guard status == noErr else {
+            return NSLog("spot launcher: couldn't register \(spec) (\(status)); is something else using it?")
+        }
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        (hotKey, hotKeySpec) = (new, spec)
+        UserDefaults.standard.set(spec, forKey: "hotkey")
     }
 
     func toggle() {
@@ -666,6 +852,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func show() {
         toastFade?.cancel()
         toast.orderOut(nil)
+        notchState.open = false
         model.reset()
         let midX: CGFloat
         (midX, bottom) = home()
@@ -674,9 +861,6 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // hand back (handing it back is what dragged a desktop swipe back to the old desktop)
         panel.makeKeyAndOrderFront(nil)
         model.refreshNow()
-        poll = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.model.refreshNow() }
-        }
     }
 
     /// Where the bar opens: where it was dragged to last (if that's still on a screen), else
@@ -699,44 +883,72 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate {
             styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
             backing: .buffered, defer: false)
         toast.isFloatingPanel = true
-        toast.level = .modalPanel
+        toast.level = .popUpMenu  // over the menu bar, which is above .modalPanel
         toast.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         toast.backgroundColor = .clear
         toast.isOpaque = false
         toast.hasShadow = false
         toast.hidesOnDeactivate = false
         toast.ignoresMouseEvents = true
-        toastView = NSHostingController(rootView: nil)
+        toastView = NSHostingController(rootView: AnyView(EmptyView()))
         toastView.sizingOptions = []
         toast.contentView = toastView.view
     }
 
-    /// A media key was pressed. The bar already shows what's playing; otherwise, a moment's toast.
-    func skipped() async {
+    /// A media key was pressed, or a song started that you couldn't see (or any song, with
+    /// `popup = "track"`). The bar already shows
+    /// what's playing; otherwise, a moment's toast.
+    func announce() async {
         await model.fetchNow()
-        await model.fetchPopup()
         guard !panel.isVisible, model.popup, let now = model.now else { return }
-        toastView.rootView = Toast(now: now, th: model.theme)
-        let size = toastView.sizeThatFits(in: NSSize(width: toastWidth + 2 * margin, height: barHeight + 2 * margin))
-        // on the screen you're on: right under the notch, or the menu bar on a screen without one
+        // on the screen you're on: around the notch, or under the menu bar on a screen without one
         let screen = NSScreen.screens.first { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) } ?? NSScreen.main!
-        let top = screen.safeAreaInsets.top > 0 ? screen.frame.maxY - screen.safeAreaInsets.top : screen.visibleFrame.maxY
-        toast.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: top - toastGap + margin - size.height, width: size.width, height: size.height), display: true)
+        if let notch = screen.notch {
+            showCover(now.cover)
+            let width = NotchToast.width(for: now, notch: notch.size.width)
+            let size = NSSize(width: width + 2 * notchShoulder, height: notch.size.height + notchRow)
+            toastView.rootView = AnyView(NotchToast(state: notchState, now: now, th: model.theme, notch: notch.size, width: width))
+            toast.setFrame(NSRect(x: notch.midX - size.width / 2, y: screen.frame.maxY - size.height, width: size.width, height: size.height), display: true)
+        } else {
+            notchState.open = false
+            toastView.rootView = AnyView(Toast(now: now, th: model.theme))
+            let size = toastView.sizeThatFits(in: NSSize(width: toastWidth + 2 * margin, height: barHeight + 2 * margin))
+            let y = screen.visibleFrame.maxY - toastGap + margin - size.height
+            toast.setFrame(NSRect(x: screen.frame.midX - size.width / 2, y: y, width: size.width, height: size.height), display: true)
+        }
         toast.alphaValue = 1
         toast.orderFrontRegardless()
+        if screen.notch != nil {
+            DispatchQueue.main.async { [notchState] in notchState.open = true }  // once it's on screen, so it animates
+        }
         toastFade?.cancel()
         toastFade = Task {
             try? await Task.sleep(for: .seconds(model.popupSeconds))
             guard !Task.isCancelled else { return }
-            await NSAnimationContext.runAnimationGroup { $0.duration = 0.25; toast.animator().alphaValue = 0 }
+            if notchState.open {
+                notchState.open = false
+                try? await Task.sleep(for: .seconds(notchClose + 0.02))
+            } else {
+                await NSAnimationContext.runAnimationGroup { $0.duration = 0.25; toast.animator().alphaValue = 0 }
+            }
             if !Task.isCancelled { toast.orderOut(nil) }
+        }
+    }
+
+    /// Put the album art in the notch toast: at once if we have it, else when it's downloaded
+    /// (if that's still the song on show).
+    func showCover(_ url: String) {
+        notchState.art = covers.object(forKey: url as NSString)
+        guard notchState.art == nil, let u = URL(string: url) else { return }
+        Task {
+            guard let (data, _) = try? await URLSession.shared.data(from: u), let art = NSImage(data: data) else { return }
+            covers.setObject(art, forKey: url as NSString)
+            if model.now?.cover == url { notchState.art = art }
         }
     }
 
     func hide() {
         guard panel.isVisible else { return }
-        poll?.invalidate()
-        poll = nil
         panel.orderOut(nil)
     }
 

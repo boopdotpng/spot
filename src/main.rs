@@ -34,6 +34,7 @@ use serde_json::Value;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
 mod app;
+mod art;
 mod auth;
 mod cache;
 mod cli;
@@ -276,6 +277,7 @@ fn run(setup_only: bool) -> Result<(), String> {
                 160 => Bitrate::Bitrate160,
                 _ => Bitrate::Bitrate320,
             },
+            normalisation: settings.normalize,
             ..Default::default()
         },
         session.clone(),
@@ -348,6 +350,9 @@ fn run(setup_only: bool) -> Result<(), String> {
         tr_state: TableState::default(),
         focus: Focus::Playlists,
         input: None,
+        live_search: false,
+        search_at: None,
+        search_task: None,
         find: None,
         matches: vec![],
         search_kind: Kind::Tracks,
@@ -379,6 +384,7 @@ fn run(setup_only: bool) -> Result<(), String> {
         ctl: ctl::State::default(),
         quit: false,
         terminal: None,
+        art: Default::default(),
     };
 
     if let Some(last) = read_last() {
@@ -392,7 +398,7 @@ fn run(setup_only: bool) -> Result<(), String> {
         // Only wake up once a second while playing (progress clock); otherwise sleep until input.
         let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
         // wake up in time to take the popup / volume meter down
-        for until in [app.note.as_ref().map(|n| n.1), app.vol_until, app.load_at].into_iter().flatten() {
+        for until in [app.note.as_ref().map(|n| n.1), app.vol_until, app.load_at, app.search_at].into_iter().flatten() {
             timeout = timeout.min(until.saturating_duration_since(Instant::now()));
         }
         let first = match rx.recv_timeout(timeout) {
@@ -409,6 +415,10 @@ fn run(setup_only: bool) -> Result<(), String> {
         if app.load_at.is_some_and(|until| Instant::now() >= until) {
             app.load_at = None;
             app.load_cur();
+        }
+        if app.search_at.is_some_and(|until| Instant::now() >= until) {
+            app.search_at = None;
+            app.run_search();
         }
         for m in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
             app.on_msg(m);

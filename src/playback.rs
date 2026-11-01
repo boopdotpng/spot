@@ -10,6 +10,7 @@ impl App {
             let cur = q.idx();
             q.reorder(self.shuffle, Some(cur));
         }
+        self.queue_changed();
     }
 
     /// Reconnect a session that died (sleep, network change). Still connecting: nothing to do.
@@ -114,6 +115,7 @@ impl App {
         self.reset_fade();
         self.set_cur(&t, 0);
         self.load_cur();
+        self.queue_changed();
     }
 
     /// Put last session's queue back, paused on the song that was playing.
@@ -277,7 +279,11 @@ impl App {
             return;
         }
         if self.view.key == QUEUE_KEY {
-            return self.play_queued(start.unwrap_or(0));
+            let i = start.unwrap_or(0);
+            return match i.checked_sub(self.upnext.len()) {
+                None => self.play_queued(i),
+                Some(after) => self.play_upcoming(after),
+            };
         }
         let q = Queue {
             key: self.view.key.clone(),
@@ -311,6 +317,19 @@ impl App {
         self.play_current();
     }
 
+    /// Jump ahead in the list to the song `i` after the one it's on (the queue stays queued).
+    pub fn play_upcoming(&mut self, i: usize) {
+        let Some(q) = &mut self.queue else { return };
+        if q.pos + 1 + i >= q.order.len() {
+            return;
+        }
+        q.pos += 1 + i;
+        self.queued = None;
+        self.retried = false;
+        self.load_at = None;
+        self.play_current();
+    }
+
     /// Add songs to the end of the queue; with nothing playing (or everything played), the first starts.
     pub fn enqueue(&mut self, tracks: impl IntoIterator<Item = Track>) {
         self.enqueue_at(self.upnext.len(), tracks);
@@ -332,22 +351,30 @@ impl App {
         t
     }
 
-    /// `Q`: the queue as a list (enter plays a song from it, x removes one).
+    /// What's coming: the queue, then the rest of the list.
+    fn coming_up(&self) -> Vec<Track> {
+        self.upnext.iter().chain(self.queue.iter().flat_map(Queue::upcoming)).cloned().collect()
+    }
+
+    /// `Q`: what's coming, as a list (enter plays a song from it, x removes a queued one).
     pub fn open_queue(&mut self) {
-        let mut v = self.new_view(QUEUE_KEY.into(), "Queue".into(), Kind::Tracks);
-        v.tracks = Arc::new(self.upnext.clone());
+        let mut v = self.new_view(QUEUE_KEY.into(), "Up next".into(), Kind::Tracks);
+        v.tracks = Arc::new(self.coming_up());
         v.loading = false;
         let back = self.view.key != QUEUE_KEY;
         self.show(v, back);
         self.focus = Focus::Tracks;
     }
 
-    /// Keep queue views (open or in the history) showing the queue as it changes.
+    /// Keep up next views (open or in the history) showing what's coming as it changes.
     pub fn queue_changed(&mut self) {
-        let mut tracks = None;
+        if self.view.key != QUEUE_KEY && !self.history.iter().any(|(v, _)| v.key == QUEUE_KEY) {
+            return;
+        }
+        let tracks = Arc::new(self.coming_up());
         for v in std::iter::once(&mut self.view).chain(self.history.iter_mut().map(|(v, _)| v)) {
             if v.key == QUEUE_KEY {
-                v.tracks = tracks.get_or_insert_with(|| Arc::new(self.upnext.clone())).clone();
+                v.tracks = tracks.clone();
             }
         }
         if self.view.key == QUEUE_KEY {
@@ -373,9 +400,11 @@ impl App {
             self.note = Some(("x removes songs from the queue (Q)".into(), Instant::now() + Duration::from_millis(1500)));
             return;
         }
-        if let Some(t) = self.selected_track().and_then(|i| self.dequeue(i)) {
-            self.note = Some((format!("removed {}", t.name), Instant::now() + Duration::from_millis(1500)));
-        }
+        let note = match self.selected_track().and_then(|i| self.dequeue(i)) {
+            Some(t) => format!("removed {}", t.name),
+            None => "only queued songs can be removed".into(),
+        };
+        self.note = Some((note, Instant::now() + Duration::from_millis(1500)));
     }
 
     /// What plays after the current song, if that's known (a shuffled wrap picks a new order later).

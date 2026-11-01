@@ -25,6 +25,8 @@ md-5 = "0.10"
 open = "5"
 terminal-colorsaurus = "1"
 toml = "1.1.8"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]
 opt-level = 3

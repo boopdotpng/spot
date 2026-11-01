@@ -2,6 +2,13 @@
 
 use crate::*;
 
+/// How long typing has to stop for before searching; the launcher's wait.
+const SEARCH_SETTLE: Duration = Duration::from_millis(140);
+
+fn search_key(kind: Kind, q: &str) -> String {
+    format!("search:{}:{q}", kind.label())
+}
+
 impl App {
     pub fn new_view(&mut self, key: String, title: String, kind: Kind) -> View {
         self.view_seq += 1;
@@ -57,12 +64,44 @@ impl App {
         self.show(v, true);
     }
 
-    pub fn open_search(&mut self, q: String) {
+    /// Search for what's in the prompt, unless those are already the results on show.
+    pub fn run_search(&mut self) {
+        let Some(q) = self.input.as_deref().map(str::trim).map(String::from) else { return };
+        if q.is_empty() {
+            return self.end_live_search();
+        }
+        if !(self.live_search && self.view.key == search_key(self.search_kind, &q)) {
+            self.open_search(q, !self.live_search);
+            self.live_search = true;
+        }
+    }
+
+    /// Search once typing has stopped for a moment.
+    pub fn search_soon(&mut self) {
+        self.search_at = Some(Instant::now() + SEARCH_SETTLE);
+    }
+
+    /// Back to what was open before the prompt's results.
+    pub fn end_live_search(&mut self) {
+        if let Some(task) = self.search_task.take() {
+            task.abort();
+        }
+        if std::mem::take(&mut self.live_search) {
+            self.back();
+        }
+    }
+
+    /// `back` keeps the current view for esc; otherwise the results replace it. A search still
+    /// paging is stopped: each page is a request, and nobody's waiting for those results now.
+    pub fn open_search(&mut self, q: String, back: bool) {
+        if let Some(task) = self.search_task.take() {
+            task.abort();
+        }
         let kind = self.search_kind;
         let title = format!("Search {}: {q}", kind.label());
-        let v = self.new_view(format!("search:{}:{q}", kind.label()), title, kind);
+        let v = self.new_view(search_key(kind, &q), title, kind);
         let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
-        self.rt.spawn(async move {
+        let task = self.rt.spawn(async move {
             let res = search(&api, &q, kind.ty(), 50, |items, done| {
                 let _ = tx.send(match kind {
                     Kind::Tracks => Msg::Tracks { view, tracks: items.iter().filter_map(parse_track).collect(), done },
@@ -75,7 +114,8 @@ impl App {
                 let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
             }
         });
-        self.show(v, true);
+        self.search_task = Some(task.abort_handle());
+        self.show(v, back);
         self.focus = Focus::Tracks;
     }
 

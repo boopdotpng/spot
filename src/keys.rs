@@ -18,7 +18,6 @@ impl App {
             KeyCode::Up => self.move_sel(-1),
             KeyCode::Char('n') if ctrl => self.move_sel(1),
             KeyCode::Char('p') if ctrl => self.move_sel(-1),
-            KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Backspace => {
                 if let Some(f) = &mut self.find {
                     f.pop();
@@ -37,7 +36,45 @@ impl App {
         }
     }
 
+    /// The `/` prompt. Results come as you type: enter keeps them, esc goes back to what was open.
+    pub fn on_search_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => {
+                self.search_at = None;
+                self.run_search();
+                self.input = None;
+                self.live_search = false;
+            }
+            KeyCode::Esc => {
+                self.input = None;
+                self.search_at = None;
+                self.end_live_search();
+            }
+            KeyCode::Tab => {
+                self.search_kind = self.search_kind.next();
+                self.search_at = Some(Instant::now()); // nothing being typed to wait for
+            }
+            KeyCode::Up if self.live_search => self.move_sel(-1),
+            KeyCode::Down if self.live_search => self.move_sel(1),
+            KeyCode::Backspace => {
+                self.input.as_mut().map(String::pop);
+                self.search_soon();
+            }
+            KeyCode::Char(c) => {
+                if let Some(buf) = &mut self.input {
+                    buf.push(c);
+                }
+                self.search_soon();
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_key(&mut self, k: KeyEvent) {
+        // wherever you are: like closing the terminal, not like q
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.detach_terminal_saying("detached; `spot` brings it back");
+        }
         if self.help {
             // any key closes the key help
             self.help = false;
@@ -46,30 +83,13 @@ impl App {
         if self.find.is_some() {
             return self.on_find_key(k);
         }
-        if let Some(buf) = &mut self.input {
-            match k.code {
-                KeyCode::Enter => {
-                    let q = buf.trim().to_string();
-                    self.input = None;
-                    if !q.is_empty() {
-                        self.open_search(q);
-                    }
-                }
-                KeyCode::Esc => self.input = None,
-                KeyCode::Tab => self.search_kind = self.search_kind.next(),
-                KeyCode::Backspace => {
-                    buf.pop();
-                }
-                KeyCode::Char(c) => buf.push(c),
-                _ => {}
-            }
-            return;
+        if self.input.is_some() {
+            return self.on_search_key(k);
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('d') if !ctrl => self.detach_terminal_saying("detached; `spot` brings it back"),
-            KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('/') => self.input = Some(String::new()),
             KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Char('t') if ctrl => {

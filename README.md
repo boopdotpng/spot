@@ -76,7 +76,7 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 
 | key | action |
 |---|---|
-| `/` | search (`tab` in the prompt cycles songs / albums / artists) |
+| `/` | search as you type (`tab` in the prompt cycles songs / albums / artists, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
 | `enter` | play song (the rest of the list plays after it) · open album / artist |
 | `ctrl+t` | next theme (desert, lagoon, moss, iris, blossom, mint, sorbet); remembered, light/dark still follows the terminal |
 | `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
@@ -89,7 +89,7 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | `+` / `-` | volume |
 | `o` | jump to the list that's playing |
 | `e` | add the highlighted song to the queue (queued songs play before the list carries on) |
-| `Q` | show the queue: `enter` plays a song from it now, `x` removes one |
+| `Q` | up next: the queue, then the rest of the list. `enter` plays a song from it now, `x` removes a queued one |
 | `a` / `A` | go to the album / artist of the highlighted song (or the playing one, from the playlist pane) |
 | `v` | on an artist page: all songs ↔ albums & singles (remembered) |
 | `f` | on an artist's releases: all → albums (incl. EPs) → singles (remembered) |
@@ -99,7 +99,7 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 | `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
 | `?` | key help (any key closes it) |
 | `q` | quit |
-| `d` | detach the TUI; music keeps playing (`spot` brings it back) |
+| `d`, `ctrl+c` | detach the TUI; music keeps playing (`spot` brings it back) |
 
 Media keys and the macOS Now Playing widget work too.
 
@@ -140,7 +140,7 @@ and then goes on with the queue. Spotify links work
 anywhere a uri does. Exit code 3 means spot isn't running.
 
 `spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
-`skip` (a media key skipped or seeked), `end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
+`modes` (shuffle or repeat changed), `skip` (a media key skipped or seeked), `end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
 what's next, so there's time to `spot queue add` something. It works as a monitor target
 for agents. `spot wait ending` blocks until the next one and exits.
 
@@ -185,8 +185,8 @@ it anywhere; it opens there next time. Type to search, `tab` cycles songs / albu
 `↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the first one), `⌘enter`
 adds to the queue, `⌘c` copies the selected result's open.spotify.com link (with no results, the
 playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the icons beside what's playing; the play icon pauses),
-`esc` closes. Skipping or seeking with the media keys shows what's playing for a moment, in a small
-popup right under the notch (or the menu bar; `popup` in [config.toml](docs/config.md) turns it off). It's a separate program that talks to the
+`esc` closes. Skipping or seeking with the media keys, or pressing return before the results are in, shows what's playing for a moment, in a small
+popup that grows out of the notch (or under the menu bar on a screen without one). `popup` in [config.toml](docs/config.md) can show it on every new song instead, or turn it off. `hotkey` there changes `⌥Space`. It's a separate program that talks to the
 running spot over its socket, and starts it (`spot start`) if it isn't running. About 18 MB of
 memory, no CPU while hidden.
 
@@ -239,10 +239,10 @@ It needs spot 1.3.0 or newer: after updating spot, quit and restart the player.
   (OSC 11; Ghostty, iTerm2, kitty, WezTerm, …) and follows live changes where the terminal
   reports them (Ghostty). Force one with `SPOT_THEME=light` / `dark`.
   `ctrl+t` cycles color themes, each with a light and dark variant.
-  The status line sits on a faint tint of the terminal's own background (needs truecolor).
+  The status line sits on a faint tint of the terminal's own background (needs truecolor) when it has a prompt or notice to show.
 - **Layout**: playlists on the left, the open list (numbered rows) on the right, the player under
   a rule across the bottom, and a vim-style status line last: it holds the search / find prompts,
-  notices, key hints for the focused pane, the cursor position and the volume. `?` swaps it for
+  notices, what's next, the cursor position and the volume. `?` swaps it for
   a key cheatsheet.
 
 ## Releasing

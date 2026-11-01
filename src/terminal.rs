@@ -8,6 +8,7 @@ use std::{
 };
 
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui_image::picker::Picker;
 use crate::*;
 
 type Screen = Terminal<CrosstermBackend<UnixStream>>;
@@ -22,12 +23,20 @@ pub struct Attachment {
     area: Rect,
     light: bool,
     bg: u32,
+    picker: Picker,
 }
 
 pub struct Display {
     id: u64,
     screen: Screen,
     conn: UnixStream,
+    picker: Picker,
+}
+
+impl Display {
+    pub fn picker(&self) -> Picker {
+        self.picker.clone()
+    }
 }
 
 impl Drop for Display {
@@ -57,19 +66,20 @@ fn screen(mut out: UnixStream, area: Rect) -> io::Result<Screen> {
 /// raw input, or R + width + height (all integers big endian). Downstream is terminal output.
 pub fn serve(mut conn: UnixStream, args: &[String], tx: mpsc::Sender<Msg>) {
     let parsed = || -> Option<_> {
-        if args.len() != 6 || args[1] != "1" { return None; }
+        if args.len() != 8 || args[1] != "1" { return None; }
         Some((area(args[2].parse().ok()?, args[3].parse().ok()?), args[4] == "1", args[5].parse().ok()?))
     };
     let Some((area, light, bg)) = parsed() else {
         let _ = writeln!(conn, "2\nunsupported attach protocol; update spot and restart the player");
         return;
     };
+    let picker = art::picker(&args[6], &args[7]);
     let Ok(out) = conn.try_clone() else { return };
     // A terminal that stops reading must never hold up playback indefinitely.
     let _ = out.set_write_timeout(Some(Duration::from_millis(200)));
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let id = NEXT.fetch_add(1, Relaxed);
-    if tx.send(Msg::Attach(Attachment { id, out, area, light, bg })).is_err() { return; }
+    if tx.send(Msg::Attach(Attachment { id, out, area, light, bg, picker })).is_err() { return; }
     while let Ok(event) = read_event(&mut conn) {
         if tx.send(Msg::Terminal { id, event }).is_err() { return; }
     }
@@ -108,7 +118,7 @@ impl App {
             Ok(screen) => {
                 LIGHT.store(a.light, Relaxed);
                 BG.store(a.bg, Relaxed);
-                self.terminal = Some(Display { id: a.id, screen, conn });
+                self.terminal = Some(Display { id: a.id, screen, conn, picker: a.picker });
             }
             Err(e) => {
                 let _ = conn.shutdown(Shutdown::Both);
@@ -119,6 +129,7 @@ impl App {
 
     pub fn detach_terminal(&mut self) {
         self.terminal = None;
+        self.art = Default::default();
     }
 
     /// Detach, leaving `note` printed in that terminal.
@@ -158,6 +169,7 @@ impl App {
     }
 
     pub fn draw_terminal(&mut self) {
+        self.sync_art();
         let Some(mut t) = self.terminal.take() else { return };
         match t.screen.draw(|f| draw(f, self)) {
             Ok(_) => self.terminal = Some(t),
@@ -185,9 +197,14 @@ pub fn launch() -> i32 {
 }
 
 /// Restore the terminal even if the server disconnects or a local write fails.
-struct Restore;
+struct Restore {
+    kitty: bool, // it was showing kitty graphics, which outlive the alternate screen in some terminals
+}
 impl Drop for Restore {
     fn drop(&mut self) {
+        if self.kitty {
+            let _ = io::stdout().write_all(b"\x1b_Ga=d,d=A,q=2\x1b\\");
+        }
         let _ = io::stdout().write_all(b"\x1b[?2031l\x1b[?25h\x1b[?1049l");
         let _ = io::stdout().flush();
         let _ = ratatui::crossterm::terminal::disable_raw_mode();
@@ -219,8 +236,12 @@ pub fn client() -> i32 {
 fn attach(mut conn: UnixStream) -> Result<Option<String>, String> {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
     probe_terminal();
+    let mut restore = Restore { kitty: false };
+    io::stdout().write_all(b"\x1b[?1049h\x1b[?25l").and_then(|_| io::stdout().flush()).map_err(|e| e.to_string())?;
+    let [protocol, cell] = art::query_terminal();
+    restore.kitty = protocol == "kitty";
     let (w, h) = ratatui::crossterm::terminal::size().map_err(|e| e.to_string())?;
-    writeln!(conn, "attach\t1\t{w}\t{h}\t{}\t{}", u8::from(LIGHT.load(Relaxed)), BG.load(Relaxed)).map_err(|e| e.to_string())?;
+    writeln!(conn, "attach\t1\t{w}\t{h}\t{}\t{}\t{protocol}\t{cell}", u8::from(LIGHT.load(Relaxed)), BG.load(Relaxed)).map_err(|e| e.to_string())?;
     let mut output = BufReader::new(conn.try_clone().map_err(|e| e.to_string())?);
     let mut reply = String::new();
     output.read_line(&mut reply).map_err(|e| e.to_string())?;
@@ -231,8 +252,6 @@ fn attach(mut conn: UnixStream) -> Result<Option<String>, String> {
     }
     let _ = conn.set_read_timeout(None);
     ratatui::crossterm::terminal::enable_raw_mode().map_err(|e| e.to_string())?;
-    let _restore = Restore;
-    io::stdout().write_all(b"\x1b[?1049h\x1b[?25l").map_err(|e| e.to_string())?;
     if std::env::var_os("SPOT_THEME").is_none() {
         io::stdout().write_all(b"\x1b[?2031h\x1b[?996n").map_err(|e| e.to_string())?;
     }
@@ -306,11 +325,11 @@ mod tests {
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             let tx = tx.clone();
             let thread = std::thread::spawn(move || {
-                serve(server, &["attach", "1", "80", "24", "0", "0"].map(String::from), tx);
+                serve(server, &["attach", "1", "80", "24", "0", "0", "halfblocks", "10x20"].map(String::from), tx);
             });
             let Msg::Attach(a) = rx.recv_timeout(Duration::from_secs(2)).unwrap() else { panic!("expected attach") };
             let conn = a.out.try_clone().unwrap();
-            let mut display = Display { id: a.id, screen: screen(a.out, a.area).unwrap(), conn };
+            let mut display = Display { id: a.id, screen: screen(a.out, a.area).unwrap(), conn, picker: a.picker };
             display.screen.draw(|f| f.render_widget(Paragraph::new("attached"), f.area())).unwrap();
             let mut bytes = [0; 4096];
             let n = client.read(&mut bytes).unwrap();

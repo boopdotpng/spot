@@ -13,7 +13,9 @@ const TEMPLATE: &str = "\
 
 # quality = 320         # 96, 160 or 320 kbps
 # audio_cache_gb = 1    # played songs kept on disk; 0 turns it off
-# popup = true          # macOS launcher: show what's playing on media keys
+# normalize = true      # play every song at about the same loudness
+# hotkey = \"option+space\"  # macOS launcher: what opens it
+# popup = \"skip\"        # macOS launcher: show what's playing on media keys (skip), every new song (track), or never (off)
 # popup_seconds = 3     # how long it stays up
 
 # Your own colors for the TUI: change a built-in theme, or add one to ctrl+t.
@@ -21,18 +23,38 @@ const TEMPLATE: &str = "\
 # accent = \"#88cc55\"
 ";
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Popup {
+    Off,
+    Skip,  // media keys
+    Track, // those, and every new song
+}
+
+impl Popup {
+    /// How the launcher hears it: empty is off.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Popup::Off => "",
+            Popup::Skip => "skip",
+            Popup::Track => "track",
+        }
+    }
+}
+
 pub struct Settings {
     pub client_id: Option<String>, // your Spotify app's; the first run saves it here
     pub quality: u16, // kbps: 96, 160 or 320
-    pub popup: bool,  // the launcher's popup on media keys
+    pub popup: Popup, // when the launcher shows what's playing
     pub popup_seconds: f64,
     pub audio_cache_gb: f64, // played songs kept on disk; 0 = off
+    pub normalize: bool, // Spotify's loudness data evens out songs
+    pub hotkey: String, // the launcher's, as hotkey() writes it
     pub themes: Vec<Family>, // added to the built-in ones, or replacing them by name
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { client_id: None, quality: 320, popup: true, popup_seconds: 3.0, audio_cache_gb: 1.0, themes: vec![] }
+        Settings { client_id: None, quality: 320, popup: Popup::Skip, popup_seconds: 3.0, audio_cache_gb: 1.0, normalize: true, hotkey: "option+space".into(), themes: vec![] }
     }
 }
 
@@ -83,8 +105,12 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
             ("client_id", _) => bad.push("client_id: your Spotify app's client id, in quotes".into()),
             ("quality", Value::Integer(q @ (96 | 160 | 320))) => s.quality = *q as u16,
             ("quality", _) => bad.push("quality: 96, 160 or 320".into()),
-            ("popup", Value::Boolean(b)) => s.popup = *b,
-            ("popup", _) => bad.push("popup: true or false".into()),
+            ("popup", v) => match v.as_str() {
+                Some("skip") => s.popup = Popup::Skip,
+                Some("track") => s.popup = Popup::Track,
+                Some("off") => s.popup = Popup::Off,
+                _ => bad.push("popup: skip, track or off".into()),
+            },
             ("popup_seconds", v) => match v.as_float().or(v.as_integer().map(|i| i as f64)) {
                 Some(x) if x > 0.0 && x.is_finite() => s.popup_seconds = x,
                 _ => bad.push("popup_seconds: a number above 0".into()),
@@ -92,6 +118,12 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
             ("audio_cache_gb", v) => match v.as_float().or(v.as_integer().map(|i| i as f64)) {
                 Some(x) if x >= 0.0 && x.is_finite() => s.audio_cache_gb = x,
                 _ => bad.push("audio_cache_gb: a number, 0 or above".into()),
+            },
+            ("normalize", Value::Boolean(b)) => s.normalize = *b,
+            ("normalize", _) => bad.push("normalize: true or false".into()),
+            ("hotkey", v) => match v.as_str().and_then(hotkey) {
+                Some(h) => s.hotkey = h,
+                None => bad.push("hotkey: modifiers and a key, like \"ctrl+option+space\"".into()),
             },
             ("themes", Value::Table(themes)) => {
                 for (name, t) in themes {
@@ -140,6 +172,35 @@ fn colors(name: &str, mode: &str, t: &Table, palette: &mut [u32; 10], bad: &mut 
     }
 }
 
+/// A hotkey the launcher can register, written one way: its modifiers in a fixed order, then the
+/// key (a letter, digit, space, return, tab or f1-f12). Only f-keys work without a modifier.
+fn hotkey(s: &str) -> Option<String> {
+    let s = s.to_lowercase();
+    let mut parts: Vec<&str> = s.split('+').map(str::trim).collect();
+    let key = parts.pop()?;
+    let f_key = key.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n));
+    let single = key.len() == 1 && key.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    if !(f_key || single || matches!(key, "space" | "return" | "tab")) {
+        return None;
+    }
+    let mut mods = [false; 4]; // ctrl, option, cmd, shift
+    for m in parts {
+        let i = match m {
+            "ctrl" | "control" => 0,
+            "option" | "opt" | "alt" => 1,
+            "cmd" | "command" => 2,
+            "shift" => 3,
+            _ => return None,
+        };
+        mods[i] = true;
+    }
+    if !f_key && !mods.contains(&true) {
+        return None;
+    }
+    let names = ["ctrl", "option", "cmd", "shift"].iter().zip(mods).filter(|(_, on)| *on).map(|(n, _)| *n);
+    Some(names.chain([key]).collect::<Vec<_>>().join("+"))
+}
+
 fn hex(s: &str) -> Option<u32> {
     let h = s.strip_prefix('#')?;
     if h.len() == 6 { u32::from_str_radix(h, 16).ok() } else { None }
@@ -153,22 +214,23 @@ mod tests {
     fn the_template_is_the_defaults() {
         let (s, bad) = parse(TEMPLATE);
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!((s.quality, s.popup), (320, true));
+        assert_eq!((s.quality, s.popup), (320, Popup::Skip));
         // uncommented, it says what the defaults really are, and every key is a real one
         let on: String = TEMPLATE.lines().map(|l| format!("{}\n", l.strip_prefix("# ").filter(|l| l.contains(" = ") || l.starts_with('[')).unwrap_or(""))).collect();
         let (s, bad) = parse(&on);
         let d = Settings::default();
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!((s.quality, s.popup, s.popup_seconds, s.audio_cache_gb), (d.quality, d.popup, d.popup_seconds, d.audio_cache_gb));
+        assert_eq!((s.normalize, &s.hotkey), (d.normalize, &d.hotkey));
         assert_eq!(s.themes.len(), 1);
     }
 
     #[test]
     fn client_id_lands_above_any_section() {
-        let (s, bad) = parse(&with_client_id("popup = false\n[themes.mine.dark]\nerr = \"#ff0000\"\n", "abc123"));
+        let (s, bad) = parse(&with_client_id("popup = \"off\"\n[themes.mine.dark]\nerr = \"#ff0000\"\n", "abc123"));
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(s.client_id.as_deref(), Some("abc123"));
-        assert!(!s.popup);
+        assert_eq!(s.popup, Popup::Off);
         assert_eq!(s.themes.len(), 1);
     }
 
@@ -176,14 +238,18 @@ mod tests {
     fn empty_is_the_defaults() {
         let (s, bad) = parse("");
         assert!(bad.is_empty());
-        assert_eq!((s.quality, s.popup, s.popup_seconds), (320, true, 3.0));
+        assert_eq!((s.quality, s.popup, s.popup_seconds), (320, Popup::Skip, 3.0));
     }
 
     #[test]
     fn reads_settings() {
-        let (s, bad) = parse("quality = 160\npopup = false\npopup_seconds = 5\n");
+        let (s, bad) = parse("quality = 160\npopup = \"off\"\npopup_seconds = 5\n");
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!((s.quality, s.popup, s.popup_seconds), (160, false, 5.0));
+        assert_eq!((s.quality, s.popup, s.popup_seconds), (160, Popup::Off, 5.0));
+        assert_eq!(parse("popup = true").1.len(), 1);
+        assert_eq!(parse("popup = \"track\"").0.popup, Popup::Track);
+        assert_eq!(parse("popup = \"off\"").0.popup, Popup::Off);
+        assert_eq!(parse("popup = \"loud\"").1.len(), 1);
         assert_eq!(parse("popup_seconds = 1.5").0.popup_seconds, 1.5);
         assert_eq!(parse("audio_cache_gb = 0").0.audio_cache_gb, 0.0);
         assert_eq!(parse("audio_cache_gb = 2.5").0.audio_cache_gb, 2.5);
@@ -193,11 +259,28 @@ mod tests {
     #[test]
     fn bad_values_keep_defaults_and_say_so() {
         let (s, bad) = parse("quality = 128\npopup = 1\npopup_seconds = 0\nnope = 1\n");
-        assert_eq!((s.quality, s.popup, s.popup_seconds), (320, true, 3.0));
+        assert_eq!((s.quality, s.popup, s.popup_seconds), (320, Popup::Skip, 3.0));
         assert_eq!(bad.len(), 4, "{bad:?}");
         let (s, bad) = parse("this isn't toml");
         assert_eq!(s.quality, 320);
         assert_eq!(bad.len(), 1);
+    }
+
+    #[test]
+    fn normalize_and_hotkey() {
+        let d = Settings::default();
+        assert!(d.normalize);
+        assert!(!parse("normalize = false").0.normalize);
+        assert_eq!(parse("normalize = 1").1.len(), 1);
+        assert_eq!(parse("hotkey = \"Space + ALT + Cmd\"").1.len(), 1); // the key goes last
+        assert_eq!(parse("hotkey = \"Cmd + ALT + Space\"").0.hotkey, "option+cmd+space");
+        assert_eq!(parse("hotkey = \"control+shift+m\"").0.hotkey, "ctrl+shift+m");
+        assert_eq!(parse("hotkey = \"f13\"").1.len(), 1);
+        assert_eq!(parse("hotkey = \"f5\"").0.hotkey, "f5");
+        for bad in ["\"space\"", "\"m\"", "\"hyper+space\"", "\"option+\"", "\"option+pgup\"", "3"] {
+            let (s, errs) = parse(&format!("hotkey = {bad}"));
+            assert_eq!((s.hotkey.as_str(), errs.len()), (d.hotkey.as_str(), 1), "{bad}");
+        }
     }
 
     #[test]

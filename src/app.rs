@@ -83,6 +83,9 @@ pub struct App {
     pub tr_state: TableState,
     pub focus: Focus,
     pub input: Option<String>,
+    pub live_search: bool, // the open view is this prompt's results, so the next ones replace it
+    pub search_at: Option<Instant>, // typing stopped: search then
+    pub search_task: Option<tokio::task::AbortHandle>, // the last search, while its pages come in
     pub find: Option<String>, // ctrl+f filter over the open track list
     pub matches: Vec<usize>,  // view indices matching `find`, kept current by refilter()
     pub search_kind: Kind,
@@ -114,6 +117,7 @@ pub struct App {
     pub ctl: ctl::State,
     pub quit: bool,
     pub terminal: Option<terminal::Display>,
+    pub art: art::Art,
 }
 
 impl App {
@@ -246,6 +250,7 @@ impl App {
             Msg::Ctl(req, reply) => self.on_ctl(req, reply),
             Msg::Loaded(reply, then, list) => self.on_loaded(reply, then, list),
             Msg::Watch(w) => self.watch(w),
+            Msg::Art(url, image) => self.on_art(url, image),
             Msg::Quit => self.quit = true,
         }
     }
