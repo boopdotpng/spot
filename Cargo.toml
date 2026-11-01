@@ -1,6 +1,6 @@
 [package]
 name = "spot"
-version = "1.3.2"
+version = "1.3.4"
 edition = "2024"
 description = "Tiny Spotify TUI"
 repository = "https://github.com/boopdotpng/spot"
