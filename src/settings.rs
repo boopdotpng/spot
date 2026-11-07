@@ -80,6 +80,51 @@ fn with_client_id(text: &str, id: &str) -> String {
     format!("client_id = \"{id}\"\n\n{text}")
 }
 
+/// Save one setting from the settings page, keeping the rest of the file: `value` is TOML (a
+/// string in quotes), or None to drop the line and go back to the default.
+pub fn set(key: &str, value: Option<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(path()).unwrap_or_else(|_| TEMPLATE.into());
+    fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+    fs::write(path(), with_key(&text, key, value)).map_err(|e| e.to_string())
+}
+
+pub fn quoted(s: &str) -> String {
+    Value::String(s.into()).to_string()
+}
+
+/// The file with `key` set: its line replaced (or its commented-out one from the template), else
+/// a new one at the top, above any [section] it would otherwise belong to.
+fn with_key(text: &str, key: &str, value: Option<&str>) -> String {
+    let names = |l: &str| l.strip_prefix(key).is_some_and(|r| r.trim_start().starts_with('='));
+    let mut section = false;
+    let mut lines: Vec<(bool, bool, &str)> = vec![]; // (top level, commented out, line)
+    for l in text.lines() {
+        let t = l.trim_start();
+        section |= t.starts_with('[');
+        let off = t.strip_prefix('#').map(str::trim_start);
+        lines.push((!section && names(off.unwrap_or(t)), off.is_some(), l));
+    }
+    let set = |out: &mut Vec<String>| value.map(|v| out.push(format!("{key} = {v}")));
+    let active = lines.iter().any(|(k, off, _)| *k && !off);
+    let mut done = value.is_none();
+    let mut out = vec![];
+    for (k, off, l) in lines {
+        // the live line, or else the template's commented-out one, takes the value; others stay
+        if k && (!off || !active) && !done {
+            set(&mut out);
+            done = true;
+        } else if !(k && !off) {
+            out.push(l.to_string());
+        }
+    }
+    if !done {
+        let mut top = vec![];
+        set(&mut top);
+        out.splice(0..0, top);
+    }
+    out.join("\n") + "\n"
+}
+
 fn parse(text: &str) -> (Settings, Vec<String>) {
     let mut s = Settings::default();
     let mut bad = vec![];
@@ -162,7 +207,7 @@ fn colors(name: &str, mode: &str, t: &Table, palette: &mut [u32; 10], bad: &mut 
 
 /// A hotkey spot can register, written one way: its modifiers in a fixed order, then the
 /// key (a letter, digit, space, return, tab or f1-f12). Only f-keys work without a modifier.
-fn hotkey(s: &str) -> Option<String> {
+pub fn hotkey(s: &str) -> Option<String> {
     let s = s.to_lowercase();
     let mut parts: Vec<&str> = s.split('+').map(str::trim).collect();
     let key = parts.pop()?;
@@ -219,6 +264,26 @@ mod tests {
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(s.client_id.as_deref(), Some("abc123"));
         assert_eq!(s.popup, Popup::Off);
+        assert_eq!(s.themes.len(), 1);
+    }
+
+    #[test]
+    fn settings_page_edits_keep_the_rest() {
+        let t = with_key(TEMPLATE, "quality", Some("160"));
+        assert!(t.contains("\nquality = 160\n") && !t.contains("# quality"), "{t}");
+        assert_eq!(parse(&t).0.quality, 160);
+        let t = with_key(&t, "quality", Some("96"));
+        assert_eq!(t.matches("quality =").count(), 1);
+        let t = with_key(&t, "popup", Some(&quoted("off")));
+        assert_eq!(parse(&t).0.popup, Popup::Off);
+        assert_eq!(parse(&t).0.popup_seconds, 3.0); // popup_seconds isn't popup
+        let t = with_key(&t, "quality", None);
+        assert_eq!(parse(&t).0.quality, 320);
+        // no line for it at all: it goes on top, above any section
+        let t = with_key("[themes.mine.dark]\naccent = \"#112233\"\n", "normalize", Some("false"));
+        let (s, bad) = parse(&t);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(!s.normalize);
         assert_eq!(s.themes.len(), 1);
     }
 

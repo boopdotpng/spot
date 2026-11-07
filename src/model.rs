@@ -134,6 +134,8 @@ pub enum Repeat {
 pub struct Playlist {
     pub id: Option<String>, // None = Liked Songs
     pub name: String,
+    pub image: Option<String>, // its cover, the smallest Spotify has
+    pub rank: usize,           // where Spotify lists it, to go back to when it's unpinned
 }
 
 impl Playlist {

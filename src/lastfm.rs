@@ -76,11 +76,40 @@ pub fn lastfm_creds() -> Option<(String, String)> {
     Some((lines.next()?.into(), lines.next()?.into()))
 }
 
+/// The API key and shared secret, as the settings page saves them.
+pub fn save_lastfm_creds(key: &str, secret: &str) -> Result<(), String> {
+    fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
+    let path = config_dir().join("lastfm");
+    save_refresh(&path, &format!("{}\n{}\n", key.trim(), secret.trim()));
+    if path.exists() { Ok(()) } else { Err(format!("couldn't write {}", path.display())) }
+}
+
+fn session_path() -> PathBuf {
+    cache_dir().join("lastfm_session")
+}
+
+/// Stop scrobbling: forget the login (the keys stay, to connect again).
+pub fn lastfm_disconnect() {
+    let _ = fs::remove_file(session_path());
+}
+
+/// The settings page's Connect: the browser login, then a session. Blocks until the browser
+/// comes back (or five minutes pass), so run it off the window's thread.
+pub fn lastfm_connect(rt: &tokio::runtime::Handle, redirect: &str, tx: mpsc::Sender<Msg>) -> Result<Arc<LastFm>, String> {
+    let (key, secret) = lastfm_creds().ok_or("add your API key and shared secret first")?;
+    let http = reqwest::Client::new();
+    let token = lastfm_token(&key, redirect)?;
+    let v = rt.block_on(lastfm_call(&http, &key, &secret, "auth.getSession", vec![("token".into(), token)])).map_err(|(_, e)| e)?;
+    let sk = v["session"]["key"].as_str().ok_or("no session key in reply")?.to_string();
+    save_refresh(&session_path(), &sk);
+    Ok(LastFm::new(http, key, secret, sk, tx))
+}
+
 /// Scrobbling, if set up. Logs in through the browser the first time; a failed or skipped login
 /// just means no scrobbling this run.
 pub fn lastfm_setup(rt: &tokio::runtime::Runtime, http: &reqwest::Client, redirect: &str, tx: mpsc::Sender<Msg>) -> Option<Arc<LastFm>> {
     let (key, secret) = lastfm_creds()?;
-    let path = cache_dir().join("lastfm_session");
+    let path = session_path();
     let sk = match fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         Some(sk) => sk,
         None if !std::io::stdin().is_terminal() => {
@@ -109,16 +138,7 @@ pub fn lastfm_setup(rt: &tokio::runtime::Runtime, http: &reqwest::Client, redire
             }
         }
     };
-    Some(Arc::new(LastFm {
-        http: http.clone(),
-        key,
-        secret,
-        sk,
-        queue: cache_dir().join("scrobbles"),
-        file: Default::default(),
-        draining: Default::default(),
-        tx,
-    }))
+    Some(LastFm::new(http.clone(), key, secret, sk, tx))
 }
 
 /// Browser approval: Last.fm redirects to <redirect host>/lastfm?token=…, caught here.
@@ -186,6 +206,10 @@ pub fn lastfm_token(key: &str, redirect: &str) -> Result<String, String> {
 }
 
 impl LastFm {
+    pub fn new(http: reqwest::Client, key: String, secret: String, sk: String, tx: mpsc::Sender<Msg>) -> Arc<LastFm> {
+        Arc::new(LastFm { http, key, secret, sk, queue: cache_dir().join("scrobbles"), file: Default::default(), draining: Default::default(), tx })
+    }
+
     pub async fn call(&self, method: &str, mut params: Vec<(String, String)>) -> Result<Value, (i64, String)> {
         params.push(("sk".into(), self.sk.clone()));
         lastfm_call(&self.http, &self.key, &self.secret, method, params).await

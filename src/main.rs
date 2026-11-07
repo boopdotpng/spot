@@ -76,7 +76,7 @@ const API: &str = "https://api.spotify.com/v1";
 const SKIP_SETTLE: Duration = Duration::from_millis(500);
 /// View key of the queue (`Q`); has a colon, so it's never a playlist id.
 const QUEUE_KEY: &str = "queue:";
-const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal to log in";
+const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal, or open Spot.app, to log in";
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -160,7 +160,7 @@ fn player(show: bool) {
     };
     init_log();
     rune::prewarm_gpu();
-    match start(false) {
+    match start(false, show) {
         Ok(Some((app, rx))) => gui::run(app, rx, show, lock),
         Ok(None) => {}
         Err(e) => {
@@ -179,7 +179,7 @@ fn player(show: bool) {
 /// interactive first-run approvals in a terminal, then stops (None), before `spot` starts the app.
 /// Call it on the main thread: macOS sends Control Center the supported commands from there, once;
 /// attaching media controls from another, it snapshots them part way and the rest stay greyed out.
-pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, String> {
+pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -214,7 +214,9 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
 
     // Web API token: refreshed lazily from the saved refresh token; browser login only the first time.
     let saved = fs::read_to_string(&refresh_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    let interactive = std::io::stdin().is_terminal();
+    // a terminal, or the window (opened by hand, so a browser tab is expected), can log in;
+    // `spot start` and the login item can't
+    let interactive = std::io::stdin().is_terminal() || window;
     let tok = match saved {
         Some(refresh) => Tok { access: String::new(), refresh, exp: Instant::now(), failed_login: None },
         None if !interactive => return Err(NOT_SET_UP.into()),
@@ -332,6 +334,7 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         mixer,
         media,
         playlists: read_playlists(),
+        pinned: read_pinned(),
         pl_state: Sel::with(Some(0)),
         shows: podcast_home().into_iter().chain(read_links(&shows_path())).collect(),
         sh_state: Sel::with(Some(0)),
@@ -435,6 +438,27 @@ impl App {
     }
 
     /// Stop: save where it was, send the last scrobble, and exit.
+    /// Quit, and open the window again once this process is gone (it holds the player's lock):
+    /// for settings that only apply at start, and logging in again.
+    pub fn restart(&mut self) -> ! {
+        use std::os::unix::process::CommandExt;
+        if let Ok(exe) = std::env::current_exe() {
+            let r = std::process::Command::new("/bin/sh")
+                .args(["-c", "while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; exec \"$1\" --app --show"])
+                .arg(std::process::id().to_string())
+                .arg(exe)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .process_group(0) // outlives this one, and a login item's job
+                .spawn();
+            if let Err(e) = r {
+                log::warn!("restart: {e}");
+            }
+        }
+        self.shutdown()
+    }
+
     pub fn shutdown(&mut self) -> ! {
         ctl::unlink();
         self.save_last();

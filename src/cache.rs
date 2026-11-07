@@ -168,11 +168,34 @@ pub fn save_tracks(path: &std::path::Path, tracks: &[Track]) {
 /// Saved playlist list (Liked Songs first, which is never stored).
 pub fn read_playlists() -> Vec<Playlist> {
     let s = fs::read_to_string(cache_dir().join("playlists")).unwrap_or_default();
-    let saved = s.lines().filter_map(|l| {
-        let (id, name) = l.split_once('\t')?;
-        Some(Playlist { id: Some(id.into()), name: name.into() })
+    let saved = s.lines().enumerate().filter_map(|(rank, l)| {
+        let mut f = l.split('\t');
+        let (id, name) = (f.next()?, f.next()?);
+        let image = f.next().filter(|u| !u.is_empty()).map(String::from);
+        Some(Playlist { id: Some(id.into()), name: name.into(), image, rank: rank + 1 })
     });
-    std::iter::once(liked()).chain(saved).collect()
+    let mut all: Vec<Playlist> = std::iter::once(liked()).chain(saved).collect();
+    pin_order(&mut all, &read_pinned());
+    all
+}
+
+/// The playlists pinned to the top of the sidebar, by id, in the order they were pinned.
+pub fn read_pinned() -> Vec<String> {
+    let s = fs::read_to_string(cache_dir().join("pinned")).unwrap_or_default();
+    s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+pub fn save_pinned(ids: &[String]) {
+    write_atomic(&cache_dir().join("pinned"), &ids.iter().map(|i| format!("{i}\n")).collect::<String>());
+}
+
+/// Liked Songs, then the pinned playlists in the order they were pinned, then the rest as Spotify
+/// lists them.
+pub fn pin_order(pls: &mut [Playlist], pinned: &[String]) {
+    pls.sort_by_key(|p| match &p.id {
+        None => (0, 0),
+        Some(id) => pinned.iter().position(|x| x == id).map_or((2, p.rank), |i| (1, i)),
+    });
 }
 
 pub fn save_playlists(pls: &[Playlist]) {
@@ -180,7 +203,7 @@ pub fn save_playlists(pls: &[Playlist]) {
     let mut s = String::new();
     for p in pls {
         if let Some(id) = &p.id {
-            let _ = writeln!(s, "{id}\t{}", clean(&p.name));
+            let _ = writeln!(s, "{id}\t{}\t{}", clean(&p.name), p.image.as_deref().unwrap_or(""));
         }
     }
     write_atomic(&cache_dir().join("playlists"), &s);

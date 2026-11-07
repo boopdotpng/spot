@@ -142,7 +142,15 @@ pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
 }
 
 pub fn liked() -> Playlist {
-    Playlist { id: None, name: "♥  Liked Songs".into() } // the heart overhangs its cell in many fonts
+    Playlist { id: None, name: "♥  Liked Songs".into(), image: None, rank: 0 } // the heart overhangs its cell in many fonts
+}
+
+/// The smallest of a list of images that's still sharp in the sidebar (Spotify lists them
+/// largest first; an uploaded cover comes in one size, with no width).
+fn smallest_image(images: &Value) -> Option<String> {
+    let all = images.as_array()?;
+    let width = |i: &Value| i["width"].as_u64().unwrap_or(u64::MAX);
+    all.iter().filter(|i| width(i) >= 60).min_by_key(|i| width(i)).or(all.first())?["url"].as_str().map(String::from)
 }
 
 pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
@@ -156,6 +164,8 @@ pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
                     out.push(Playlist {
                         id: Some(id.into()),
                         name: p["name"].as_str().unwrap_or("?").into(),
+                        image: smallest_image(&p["images"]),
+                        rank: out.len(),
                     });
                 }
                 url = v["next"].as_str().map(String::from);

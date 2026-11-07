@@ -1,12 +1,15 @@
 # Config
 
 spot reads `~/.config/spot/config.toml` (`$XDG_CONFIG_HOME/spot/config.toml` if that's set). The
-file is optional, and so is every key in it.
+file is optional, and so is every key in it. The Settings page (`⌘,`) changes every key here
+except themes, writing just that line and keeping the rest of the file.
 
 The first launch writes it with every setting commented out; uncomment one to change it. Leaving
 them commented means you pick up new defaults.
 
-spot reads it when the player starts, so run `spot quit` and start it again after a change. A
+spot reads it when the player starts, so run `spot quit` and start it again after editing it by
+hand. From Settings, `popup` and `popup_seconds` apply at once, and the page offers a restart for
+the rest. A
 mistake in the file shows on the status line and in the log, and that setting keeps its default.
 
 ## Settings

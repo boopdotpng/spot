@@ -91,6 +91,7 @@ pub struct App {
 
     pub playlists: Vec<Playlist>,
     pub pl_state: Sel,
+    pub pinned: Vec<String>, // playlist ids kept at the top of the sidebar
     pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
     pub sh_state: Sel,
     pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
@@ -155,8 +156,9 @@ impl App {
     pub fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Player(ev) => self.on_player(ev),
-            Msg::Playlists(p) => {
+            Msg::Playlists(mut p) => {
                 let n = p.len();
+                pin_order(&mut p, &self.pinned);
                 self.playlists = p;
                 self.pl_state.select(Some(self.pl_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
             }
@@ -277,6 +279,28 @@ impl App {
             Msg::Show => self.show = true,
             Msg::Tick => {}
             Msg::Quit => self.quit = true,
+        }
+    }
+
+    pub fn is_pinned(&self, p: &Playlist) -> bool {
+        p.id.as_ref().is_some_and(|id| self.pinned.contains(id))
+    }
+
+    /// Pin a playlist to the top of the sidebar, or put it back where Spotify lists it. The
+    /// selection stays on the same playlist.
+    pub fn toggle_pin(&mut self, i: usize) {
+        let Some(id) = self.playlists.get(i).and_then(|p| p.id.clone()) else { return };
+        let selected = self.pl_state.selected().and_then(|s| self.playlists.get(s)).map(Playlist::key);
+        match self.pinned.iter().position(|x| *x == id) {
+            Some(at) => {
+                self.pinned.remove(at);
+            }
+            None => self.pinned.push(id),
+        }
+        save_pinned(&self.pinned);
+        pin_order(&mut self.playlists, &self.pinned);
+        if let Some(k) = selected {
+            self.pl_state.select(self.playlists.iter().position(|p| p.key() == k));
         }
     }
 }

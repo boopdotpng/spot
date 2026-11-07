@@ -1,7 +1,7 @@
 // The main window: a quiet frame (sidebar, list, player) on near-neutral surfaces, with the color
 // coming from the music: each list's header takes its covers' colors, the player its song's.
 
-use rune::{Color, Cursor, Cx, El, Phase, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
+use rune::{Color, Cursor, Cx, El, Phase, PopupItem, PopupMenu, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
 
 use super::{Ui, icons, player, rows};
 use crate::*;
@@ -81,6 +81,9 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     if ui.app.help {
         root = root.child(help(&th));
     }
+    if ui.prefs.open {
+        root = root.child(super::prefs::page(ui, &th));
+    }
     root
 }
 
@@ -94,6 +97,35 @@ pub fn theme_now() -> Theme {
 }
 
 // ---------- sidebar ----------
+
+/// What can be done with a playlist in the sidebar, as the system's menu.
+fn playlist_menu(ui: &Ui, i: usize, at: rune::PopupAnchor, tx: &mut rune::Tx) {
+    let Some(p) = ui.app.playlists.get(i) else { return };
+    let pin = if ui.app.is_pinned(p) { PopupItem::new("pin", "Unpin").symbol("pin.slash") } else { PopupItem::new("pin", "Pin to top").symbol("pin") };
+    let m = PopupMenu::new()
+        .item(PopupItem::new("open", "Open").symbol("music.note.list"))
+        .item(pin)
+        .separator()
+        .item(PopupItem::new("copy", "Copy link").symbol("link"));
+    tx.popup_menu(m, at, move |ui: &mut Ui, picked, tx| {
+        match picked {
+            Some("open") => {
+                ui.app.focus = Focus::Playlists;
+                ui.app.pl_state.select(Some(i));
+                ui.app.enter();
+            }
+            Some("pin") => ui.app.toggle_pin(i),
+            Some("copy") => {
+                if let Some(id) = ui.app.playlists.get(i).and_then(|p| p.id.clone()) {
+                    tx.copy(format!("https://open.spotify.com/playlist/{id}"));
+                    ui.app.note = Some(("link copied".into(), Instant::now() + Duration::from_millis(1500)));
+                }
+            }
+            _ => {}
+        }
+        ui.after(tx);
+    });
+}
 
 fn sidebar(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
@@ -113,7 +145,7 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
         .child(tab("Playlists", !a.podcasts, false))
         .child(tab("Podcasts", a.podcasts, true));
     let playing_key = a.queue.as_ref().map(|q| q.key.as_str());
-    let row_for = |i: usize, name: &str, key: &str, tile: El, selected: bool| {
+    let row_for = |i: usize, name: &str, key: &str, tile: El, selected: bool, pinned: bool| {
         let open = a.view.key == key;
         let playing = Some(key) == playing_key;
         let fill = if selected && focused { th.sel } else if open { th.wash } else { Color::TRANSPARENT };
@@ -131,6 +163,8 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
                 .help_when_truncated(name.to_string()));
         if playing {
             r = r.child(eq(th.accent, a.playing, &format!("side-eq-{i}")));
+        } else if pinned {
+            r = r.child(icon(&icons::PIN, 12.0).color(th.dim));
         }
         r
     };
@@ -144,7 +178,7 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             } else {
                 swatch_tile("t".into(), swatch(&s.name, th), 20.0, 6.0, Some(&icons::MIC))
             };
-            list = list.child(row_for(i, &s.name, &s.uri, tile, a.sh_state.selected() == Some(i)));
+            list = list.child(row_for(i, &s.name, &s.uri, tile, a.sh_state.selected() == Some(i), false));
         }
     } else {
         for (i, p) in a.playlists.iter().enumerate() {
@@ -153,9 +187,17 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             let tile = if liked {
                 swatch_tile("t".into(), (th.pink, th.accent), 20.0, 6.0, Some(&icons::HEART))
             } else {
-                swatch_tile("t".into(), swatch(&p.name, th), 20.0, 6.0, None)
+                match p.image.as_deref().and_then(|u| ui.thumb(u)) {
+                    Some(img) => cover("t".into(), Some(&img), 20.0, 5.0, th, &icons::NOTE),
+                    None => swatch_tile("t".into(), swatch(&p.name, th), 20.0, 6.0, None),
+                }
             };
-            list = list.child(row_for(i, name, &p.key(), tile, a.pl_state.selected() == Some(i)));
+            let pinned = a.is_pinned(p);
+            let mut r = row_for(i, name, &p.key(), tile, a.pl_state.selected() == Some(i), pinned);
+            if !liked {
+                r = r.on_secondary_press(move |ui: &mut Ui, at, tx| playlist_menu(ui, i, at.into(), tx));
+            }
+            list = list.child(r);
         }
     }
     let scroller = col().key("side-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0).child(list);
@@ -177,7 +219,8 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
     }
     let footer = row().key("side-foot").w_full().h(44.0).px(14.0).gap(8.0).center_y()
         .child(dots).child(spacer())
-        .child(icon_button("keys", &icons::KEYS, 16.0, th.dim, th, "Keyboard shortcuts  ?", |ui| ui.app.help = true));
+        .child(icon_button("keys", &icons::KEYS, 16.0, th.dim, th, "Keyboard shortcuts  ?", |ui| ui.app.help = true))
+        .child(icon_button("prefs", &icons::GEAR, 16.0, th.dim, th, "Settings  ⌘,", |ui| ui.prefs.show()));
 
     let rule = el().key("side-rule").pin(None, Some(0.0), Some(0.0), Some(0.0)).w(1.0).fill(th.line);
     // the edge drags the sidebar wider or narrower
@@ -382,11 +425,12 @@ fn hero_actions(ui: &Ui, th: &Theme, c1: Color, c2: Color) -> El {
 fn field(th: &Theme, key: &str, edit: &rune::TextEdit, w: f32, i: &'static rune::Icon, placeholder: &str, wire: impl FnOnce(El) -> El) -> El {
     let focused = edit.focused;
     row().key(format!("{key}-box")).w(w).h(30.0).px(10.0).gap(8.0).center_y().radius(15.0)
-        .fill(if focused { th.raised } else { th.text.alpha(if th.dark { 0.07 } else { 0.05 }) })
+        // solid enough that its words read over any cover's tint behind it
+        .fill(if focused { th.raised } else { th.raised.alpha(0.82) })
         .border(1.0, if focused { th.accent.alpha(0.65) } else { th.line })
         .shadow(1.0, if focused { 10.0 } else { 0.0 }, th.accent.alpha(if focused { 0.18 } else { 0.0 }))
         .child(icon(i, 14.0).color(if focused { th.accent } else { th.dim }))
-        .child(wire(text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).placeholder(placeholder.to_string(), th.dim)))
+        .child(wire(text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).placeholder(placeholder.to_string(), th.sub)))
 }
 
 fn search_field(ui: &Ui, th: &Theme) -> El {
@@ -509,6 +553,7 @@ fn help(th: &Theme) -> El {
         ("tab", "switch pane"),
         ("g  M  G", "top / middle / bottom"),
         ("⌘T", "next theme"),
+        ("⌘,", "settings"),
         ("⌘W", "close (keeps playing)"),
         ("⌘Q", "quit"),
     ];

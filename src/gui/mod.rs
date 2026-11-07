@@ -25,6 +25,7 @@ mod icons;
 mod panel;
 mod player;
 mod rows;
+mod prefs;
 mod toast;
 mod view;
 
@@ -72,6 +73,7 @@ const THUMBS: usize = 600;
 pub struct Ui {
     pub app: App,
     pub search: TextEdit,
+    pub prefs: prefs::Page, // the settings page
     pub find: TextEdit,
     images: Option<ImageCache>,
     pub cover: Option<(String, Image)>, // the playing song's cover, by url
@@ -100,6 +102,7 @@ impl Ui {
         Ui {
             app,
             search: TextEdit::new(""),
+            prefs: prefs::Page::default(),
             find: TextEdit::new(""),
             images: None,
             cover: None,
@@ -144,13 +147,23 @@ impl Ui {
     }
 
     fn quit(&mut self) -> ! {
+        self.hide_all();
+        self.app.shutdown()
+    }
+
+    /// Quit and come back, for settings that apply at start.
+    pub fn restart(&mut self) -> ! {
+        self.hide_all();
+        self.app.restart()
+    }
+
+    fn hide_all(&self) {
         if let Some(me) = &self.me {
             me.hide();
         }
         if let Some(p) = &self.panel {
             p.hide();
         }
-        self.app.shutdown()
     }
 
     pub fn open_window(&mut self) {
@@ -366,7 +379,23 @@ impl Ui {
 
 /// The view's key events, as the player's keys. Typing in a field never gets here.
 fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if ui.prefs.open {
+        // the page takes the keys, but for esc and the window's own (⌘Q, ⌘W)
+        match &ev.key {
+            rune::Key::Escape => ui.prefs.open = false,
+            rune::Key::Command('q' | 'w') => {}
+            _ => return !matches!(ev.key, rune::Key::Command(_)),
+        }
+        if matches!(ev.key, rune::Key::Escape) {
+            return true;
+        }
+    }
     let took = match &ev.key {
+        rune::Key::Command(',') => {
+            ui.app.help = false;
+            ui.prefs.show();
+            true
+        }
         rune::Key::Command(c) => match c {
             'f' => {
                 ui.open_find();

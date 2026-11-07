@@ -40,9 +40,10 @@ spot needs a Spotify app of your own (free, takes a minute). On first start it a
 3. Tick **Web API** and save.
 4. Paste the app's Client ID when spot asks for it.
 
-It's saved as `client_id` in `~/.config/spot/config.toml` (delete that line to set up again, or set
+It's saved as `client_id` in `~/.config/spot/config.toml` (change it in Settings, `⌘,`, or set
 `SPOT_CLIENT_ID` to override). Using a different redirect URI? Set `SPOT_REDIRECT` to match.
 Then log in through the browser; there's one more one-time approval for the audio session.
+**Log out** in Settings (`⌘,`) forgets both logins and restarts spot, which asks again.
 
 ## Last.fm (optional)
 
@@ -51,9 +52,10 @@ spot can scrobble what you play to Last.fm:
 
 1. Create an API account at https://www.last.fm/api/account/create with callback URL
    `http://127.0.0.1:19872/lastfm` (same host and port as `SPOT_REDIRECT`, if you changed it).
-2. Put the API key and shared secret in `~/.config/spot/lastfm`, one per line (or set
-   `LASTFM_API_KEY` and `LASTFM_SECRET`).
-3. Start spot and approve it in the browser (once; the session is kept in `~/.cache/spot/lastfm_session`).
+2. Open Settings (`⌘,`), paste the API key and shared secret under Last.fm, and press **Connect**.
+   Approve spot in the browser (once; the session is kept in `~/.cache/spot/lastfm_session`).
+   The keys are saved to `~/.config/spot/lastfm`, one per line; `LASTFM_API_KEY` and
+   `LASTFM_SECRET` work too. **Disconnect** stops scrobbling and keeps the keys.
    Press `enter` to skip the approval and start without scrobbling.
 
 To turn scrobbling off without deleting the keys, set `SPOT_LASTFM=off`.
@@ -111,8 +113,8 @@ first one), `⌘enter` adds to the queue, `⌘c` copies the selected result's op
 (with no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or
 click the icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc`
 closes. Skipping or seeking with the media keys shows what's playing for a moment at the top of
-the screen, unless spot's window is in front. `popup` in [config.toml](docs/config.md) can show
-it on every new song instead, or turn it off; `hotkey` there changes `⌥Space`.
+the screen, unless spot's window is in front. Settings (`⌘,`) can show it on every new song
+instead, or turn it off, and change `⌥Space`.
 
 ## Command line
 
@@ -195,8 +197,12 @@ Video podcasts play as audio if Spotify has an audio version.
 
 ## Config
 
-`~/.config/spot/config.toml` is written on first launch with everything commented out: audio quality, the song cache's size, the `⌥Space`
-key and popup, and colors for your own themes. See [docs/config.md](docs/config.md) for every key.
+Settings (`⌘,`, or the gear under the playlists) covers audio quality, the song cache's size, the
+`⌥Space` key, the popup, and the Spotify and Last.fm logins. They're saved in
+`~/.config/spot/config.toml`, which also holds colors for your own themes. See
+[docs/config.md](docs/config.md) for every key.
+
+Right-click a playlist in the sidebar to pin it to the top.
 
 ## Notes
 

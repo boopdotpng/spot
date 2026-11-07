@@ -142,7 +142,7 @@ pub fn open() -> i32 {
     if send(&["show"]).is_ok() {
         return 0;
     }
-    if let Err(e) = crate::start(true) {
+    if let Err(e) = crate::start(true, false) {
         eprintln!("spot: {e}");
         return 1;
     }
