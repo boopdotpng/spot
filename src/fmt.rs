@@ -102,6 +102,28 @@ pub fn added(secs: u64, now: u64) -> String {
     }
 }
 
+/// Words as a search compares them: lowercase letters and digits, single spaces.
+pub fn plain(s: &str) -> String {
+    let s: String = s.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How well `name` matches the words typed: 3 exactly, 2 starting with them, 1 containing them.
+pub fn match_score(q: &str, name: &str) -> u8 {
+    let (q, name) = (plain(q), plain(name));
+    if q.is_empty() {
+        0
+    } else if name == q {
+        3
+    } else if name.starts_with(&q) || name.strip_prefix("the ").is_some_and(|n| n.starts_with(&q)) {
+        2
+    } else if name.contains(&q) {
+        1
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

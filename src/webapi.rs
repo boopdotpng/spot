@@ -215,6 +215,12 @@ pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
     Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single, image })
 }
 
+/// One search for songs, albums and artists together, up to `n` of each.
+pub async fn search_all(api: &Api, q: &str, n: usize) -> Result<Value, String> {
+    let url = reqwest::Url::parse_with_params(&format!("{API}/search"), &[("q", q), ("type", "track,album,artist"), ("limit", &n.to_string())]).map_err(|e| e.to_string())?;
+    api.get(url.as_str()).await.map_err(|e| format!("search: {e}"))
+}
+
 /// Search Spotify for `n` results of a type (track, album, artist, playlist, show or episode), each page handed
 /// to `page` as it comes, with whether it's the last. Dev-mode apps get 10 results per call.
 pub async fn search(api: &Api, q: &str, ty: &str, n: usize, mut page: impl FnMut(&[Value], bool)) -> Result<(), String> {

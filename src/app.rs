@@ -127,6 +127,7 @@ pub struct App {
     pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
     pub sh_state: Sel,
     pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
+    pub recent: Vec<Link>,   // what was played lately, newest first: the ⌥Space panel's empty bar
     pub view: View,
     pub view_seq: u64,                  // last view id handed out
     pub history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row

@@ -11,6 +11,7 @@ use crate::*;
 pub const COMMANDS: &[&str] = &[
     "start", "quit", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
     "search", "playlists", "podcasts", "watch", "wait",
+    "songs", // the ⌥Space panel's, as `search --tsv` rows; not in the help
 ];
 
 pub const USAGE: &str = "\

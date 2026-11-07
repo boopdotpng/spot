@@ -199,6 +199,12 @@ impl Playlist {
     }
 }
 
+/// A song (or an episode) as the recently played keep it.
+pub fn song_link(t: &Track) -> Link {
+    let kind = if t.uri.starts_with("spotify:episode:") { "Episode" } else { "Song" };
+    Link { uri: t.uri.clone(), name: t.name.clone(), sub: format!("{kind} · {}", t.artists), single: false, image: t.cover.clone() }
+}
+
 pub enum Msg {
     Player(PlayerEvent),
     Playlists(Vec<Playlist>),

@@ -369,7 +369,9 @@ impl App {
                 Some(m) => return Err(usage(&format!("repeat: off, all or one, not '{m}'"))),
             },
             "queue" => return self.queue_cmd(args, reply),
+            "search" if flag(&mut args, "--mixed") => return self.mixed_search(args, reply),
             "search" => return self.search_cmd(args, reply),
+            "songs" => return self.songs_cmd(args, reply),
             "playlists" => {
                 let uris: Vec<String> = self.playlists.iter().map(Playlist::uri).collect();
                 let rows: Vec<String> = self.playlists.iter().zip(&uris).map(|(p, u)| format!("{}  {u}", playlist_name(p))).collect();
@@ -497,6 +499,57 @@ impl App {
         Ok(None)
     }
 
+    /// `search --mixed <words>`, for the ⌥Space panel: one search for songs, albums and artists,
+    /// as `--tsv` rows with a seventh field, the section ("Top result", "Songs", "Albums",
+    /// "Artists"). The top result is whichever of the first artist, song and album the words
+    /// name best, and isn't repeated in its section.
+    fn mixed_search(&mut self, mut args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
+        flag(&mut args, "--tsv"); // the only way it answers
+        if args.is_empty() {
+            return Err(usage("search: for what?"));
+        }
+        let (api, q, reply) = (self.api.clone(), args.join(" "), reply.clone());
+        self.rt.spawn(async move {
+            let _ = reply.send(match search_all(&api, &q, 5).await {
+                Err(e) => fail(e),
+                Ok(v) => (0, mixed_rows(&q, &v).join("\n")),
+            });
+        });
+        Ok(None)
+    }
+
+    /// `songs <uri>`, for the panel's → on an album, playlist or artist: its songs (an artist's
+    /// popular ones) as `--tsv` rows.
+    fn songs_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
+        let Some(uri) = args.first().cloned() else { return Err(usage("songs: of what?")) };
+        let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
+        self.rt.spawn(async move {
+            let tracks = if uri.starts_with("spotify:artist:") {
+                let mut info = read_artist(&uri);
+                if info.is_none() {
+                    let (nobody, _) = mpsc::channel();
+                    artist_overview(sess, nobody, 0, uri.clone(), None).await;
+                    info = read_artist(&uri);
+                }
+                info.map(|i| i.top).ok_or_else(|| "couldn't get their songs".to_string())
+            } else {
+                resolve(api, sess, &uri, None).await.map(|(_, t)| t)
+            };
+            let _ = reply.send(match tracks {
+                Err(e) => fail(e),
+                Ok(t) => {
+                    let artist = uri.starts_with("spotify:artist:");
+                    let row = |t: &Track| {
+                        let sub = if artist { t.album.clone() } else { t.artists.clone() };
+                        tsv_row(&[&t.uri, &t.name, &sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }])
+                    };
+                    (0, t.iter().map(row).collect::<Vec<_>>().join("\n"))
+                }
+            });
+        });
+        Ok(None)
+    }
+
     /// What `t` names: `liked`, a Spotify uri, one of their playlists, or failing those words to
     /// search for (`song` / `album` / `artist` / `playlist` first picks what to search; songs
     /// otherwise). Several matching playlists is an error that lists them, numbered.
@@ -590,6 +643,9 @@ impl App {
             Then::Play { from, show } => {
                 if (uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")) && self.queue.is_some() {
                     // a single song plays now, then the queue and the list carry on
+                    if let Some(t) = tracks.first() {
+                        self.remember(song_link(t));
+                    }
                     self.queued = tracks.into_iter().next();
                     self.play_fresh();
                 } else {
@@ -767,6 +823,55 @@ impl App {
 
 /// Spotify's top hit of a type for some words: its uri, its name if it's a playlist, and what
 /// was searched (to say so). Asks for 10 like `spot search`: Spotify ranks differently for 1.
+/// Of the first artist, song and album (in that order of preference on a tie), the one the
+/// words name best; the song when none of them matches.
+fn top_pick(q: &str, names: [Option<&str>; 3]) -> Option<usize> {
+    let best = names.iter().enumerate().filter_map(|(i, n)| Some((i, match_score(q, (*n)?)))).fold(None, |b: Option<(usize, u8)>, (i, sc)| match b {
+        Some((_, bs)) if bs >= sc => b,
+        _ => Some((i, sc)),
+    });
+    match best {
+        Some((i, sc)) if sc > 0 => Some(i),
+        _ => names[1].is_some().then_some(1).or(names.iter().position(Option::is_some)),
+    }
+}
+
+/// The panel's mixed results from one search's tracks, albums and artists.
+fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
+    let items = |k: &str| v[k]["items"].as_array().cloned().unwrap_or_default();
+    let (tracks, albums, artists) = (items("tracks"), items("albums"), items("artists"));
+    let track_row = |i: &Value, section: &str, kind: bool| {
+        let t = parse_track(i)?;
+        let sub = if kind { format!("Song · {}", t.artists) } else { format!("{} · {}", t.artists, t.album) };
+        Some(tsv_row(&[&t.uri, &t.name, &sub, &cover(&i["album"]), &t.ms.to_string(), if t.explicit { "1" } else { "" }, section]))
+    };
+    let album_row = |i: &Value, section: &str, kind: bool| {
+        let l = parse_link("album", i)?;
+        let sub = if kind { format!("Album · {}", l.sub) } else { l.sub };
+        Some(tsv_row(&[&l.uri, &l.name, &sub, &cover(i), "", "", section]))
+    };
+    let artist_row = |i: &Value, section: &str| {
+        let l = parse_link("artist", i)?;
+        Some(tsv_row(&[&l.uri, &l.name, "Artist", &cover(i), "", "", section]))
+    };
+    fn name(l: &[Value]) -> Option<&str> {
+        l.first().and_then(|i| i["name"].as_str())
+    }
+    let top = top_pick(q, [name(&artists), name(&tracks), name(&albums)]);
+    let mut rows = vec![];
+    rows.extend(match top {
+        Some(0) => artist_row(&artists[0], "Top result"),
+        Some(1) => track_row(&tracks[0], "Top result", true),
+        Some(2) => album_row(&albums[0], "Top result", true),
+        _ => None,
+    });
+    let skip = |k: usize| usize::from(top == Some(k));
+    rows.extend(tracks.iter().skip(skip(1)).take(3).filter_map(|i| track_row(i, "Songs", false)));
+    rows.extend(albums.iter().skip(skip(2)).take(2).filter_map(|i| album_row(i, "Albums", false)));
+    rows.extend(artists.iter().skip(skip(0)).take(2).filter_map(|i| artist_row(i, "Artists")));
+    rows
+}
+
 async fn top_hit(api: &Api, ty: &'static str, q: &str) -> Result<(String, Option<String>, Option<String>), Fail> {
     let what = if ty == "track" { "song" } else { ty };
     let mut hit = None;
@@ -852,6 +957,20 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_top_result_is_what_the_words_name() {
+        let names = [Some("The Weeknd"), Some("Blinding Lights"), Some("After Hours")];
+        assert_eq!(top_pick("the weeknd", names), Some(0));
+        assert_eq!(top_pick("weeknd", names), Some(0));
+        assert_eq!(top_pick("blinding", names), Some(1));
+        assert_eq!(top_pick("after hours", names), Some(2));
+        assert_eq!(top_pick("something else", names), Some(1));
+        // a single shares its song's name: the song
+        assert_eq!(top_pick("blinding lights", [Some("Nobody"), Some("Blinding Lights"), Some("Blinding Lights")]), Some(1));
+        assert_eq!(top_pick("x", [Some("Artist"), None, None]), Some(0));
+        assert_eq!(top_pick("x", [None, None, None]), None);
     }
 
     #[test]

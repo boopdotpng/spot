@@ -112,6 +112,11 @@ pub fn save_progress(progress: &HashMap<String, u64>) {
     write_atomic(&episodes_path(), &s);
 }
 
+/// Lists and songs played lately, newest first, for the ⌥Space panel. Not a cache either.
+pub fn recent_path() -> PathBuf {
+    cache_dir().join("recent")
+}
+
 /// Episodes part way through, last played first. Not a cache either.
 pub fn continuing_path() -> PathBuf {
     cache_dir().join("continuing")

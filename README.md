@@ -106,12 +106,15 @@ Media keys and the macOS Now Playing widget work too.
 ## ⌥Space
 
 Searches and plays from any app: `⌥Space` opens a Liquid Glass bar near the top of the screen
-you're on, with what's playing under the results. Type to search, `tab` cycles songs / albums /
-artists, `↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the
-first one), `⌘enter` adds to the queue, `⌘c` copies the selected result's open.spotify.com link
-(with no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or
-click the icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc`
-closes. Settings (`⌘,`) changes `⌥Space`.
+you're on, with what's playing under the results. Empty, it lists what you played lately. Typed
+in, your playlists that match come first, at once, then Spotify's top result, songs, albums and
+artists. `↑`/`↓` move, `tab` jumps to the next section, `→` opens the selected album, playlist
+or artist's songs right there (`←` or `esc` goes back), `enter` plays (pressed before the
+results are in, it plays the top one; a song opened from an album or playlist plays on through
+it), `⌘enter` adds to the queue, `⌘c` copies the selected result's open.spotify.com link (with
+no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the
+icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc` closes.
+Settings (`⌘,`) changes `⌥Space`.
 
 ## Command line
 
@@ -223,7 +226,8 @@ Right-click a playlist in the sidebar to pin it to the top.
   replaying them starts instantly without the network. Capped at 1 GB, least recently played
   dropped first; set `audio_cache_gb` in [config.toml](docs/config.md) to change the cap (`0` turns it off).
 - **Clear cache** (in Settings) clears the caches (songs, playlist / album / artist lists) and
-  restarts spot. Login, settings, the resume point and unsent scrobbles are kept.
+  restarts spot. Login, settings, the resume point, the recently played and unsent scrobbles are
+  kept.
 - **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song
   paused and preloads it once connected, so `space` starts it right away.
 - **Colors**: light or dark follows macOS. The one accent comes from the playing cover, quietened,

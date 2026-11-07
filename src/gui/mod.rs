@@ -91,6 +91,7 @@ pub struct Ui {
     panel: Option<AppHandle<Panel>>,
     wake: Arc<Mutex<Wake>>,
     told: Option<Now>, // what the panel last heard
+    told_lists: String, // and of the recently played and the playlists, as their uris and names
     seen: (u64, bool, bool, Option<usize>), // view, focus, sidebar, cursor: scrolled to when it moves
 }
 
@@ -117,6 +118,7 @@ impl Ui {
             panel: None,
             wake,
             told: None,
+            told_lists: String::new(),
             seen: (0, false, false, None),
         }
     }
@@ -135,6 +137,7 @@ impl Ui {
         self.sync_bar();
         self.sync_clock();
         self.tell_now();
+        self.tell_lists();
         self.scroll(tx);
         self.rearm();
     }
@@ -233,6 +236,25 @@ impl Ui {
         self.told = now.clone();
         if let Some(p) = &self.panel {
             p.update(move |p, _| p.now = now);
+        }
+    }
+
+    /// Tell the panel the recently played and the playlists when they've changed, so it has them
+    /// (and is the right size) while hidden, and opens on them in its first frame.
+    fn tell_lists(&mut self) {
+        let a = &self.app;
+        let seen: String = a.recent.iter().map(|l| (&l.uri, &l.name)).chain(a.playlists.iter().map(|p| (&p.name, &p.name))).map(|(u, n)| format!("{u}\t{n}\n")).collect();
+        if seen == self.told_lists {
+            return;
+        }
+        self.told_lists = seen;
+        let recent = a.recent.clone();
+        let playlists: Vec<Link> = a.playlists.iter().map(|l| {
+            let name = if l.id.is_none() { "Liked Songs".into() } else { l.name.clone() }; // not the sidebar's heart
+            Link { uri: l.uri(), name, sub: "Playlist".into(), single: false, image: l.image.clone() }
+        }).collect();
+        if let Some(p) = &self.panel {
+            p.update(move |p, tx| p.set_lists(&recent, &playlists, tx));
         }
     }
 
@@ -360,8 +382,10 @@ impl Ui {
         }
         let now = self.now_info();
         let now_shown = now.is_some();
-        p.update(move |p, _| {
+        let recent_n = self.app.recent.len();
+        p.update(move |p, tx| {
             p.opened(now);
+            p.fit(tx);
             if *TIMING {
                 eprintln!("timing: panel state reset {:.1} ms after show hotkey", started.elapsed().as_secs_f64() * 1e3);
             }
@@ -369,7 +393,7 @@ impl Ui {
         // where it was last dragged to, else near the top of the screen the pointer's on
         match launcher::home() {
             Some((x, y)) => {
-                let height = panel::opened_height(now_shown);
+                let height = panel::opened_height(now_shown, recent_n);
                 p.place(DisplayTarget::Primary, OverlayPlacement::Rect { x, y, width: panel::WIDTH, height });
             }
             None => p.place(DisplayTarget::UnderPointer, OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 180.0, align: Align::Center, inset: 0.0 }),
@@ -605,6 +629,7 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
     panel.update(move |p, _| {
         p.me = Some(pm);
         p.main = Some(mm);
+        p.want_thumbs(); // the recently played's, if they were told first
     });
     launcher::watch_spaces(panel.clone());
     std::thread::spawn(move || drive(rx, me, wake));

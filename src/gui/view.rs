@@ -56,7 +56,7 @@ pub fn tile(key: String, size: f32, radius: f32, glyph: Option<&'static rune::Ic
 }
 
 /// Liked Songs keeps its recognizable cover in both the sidebar and the list header.
-fn liked_cover(key: &str, size: f32, radius: f32) -> El {
+pub(super) fn liked_cover(key: &str, size: f32, radius: f32) -> El {
     row().key(key.to_string()).size(size, size).radius(radius).clip_rounded(radius).center()
         .linear_gradient(135.0_f32.to_radians(), [(0.0, crate::theme::rgb(0x450af5)), (1.0, crate::theme::rgb(0xc4efd9))])
         .child(icon(&icons::HEART, size * 0.72).color(Color::WHITE))

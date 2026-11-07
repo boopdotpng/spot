@@ -359,6 +359,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         cur: None,
         episode: None,
         continuing: read_tracks(&continuing_path()),
+        recent: read_links(&recent_path()),
         progress: read_progress(),
         loaded: false,
         load_at: None,
