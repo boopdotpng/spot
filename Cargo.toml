@@ -23,8 +23,10 @@ md-5 = "0.10"
 open = "5"
 toml = "1.1.8"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-# Rune is pre-release: pinned to a rev of its dev branch, which is never rewritten.
-rune = { git = "https://github.com/anomalyco/rune", rev = "d03349e25189ce1edc8c26ada6bf6d4aac72c826", default-features = false, features = ["metal-backend", "accessibility", "embedded-fonts"] }
+# Rune is pre-release. spot builds its own fork: upstream's dev branch plus spot's fixes, on the
+# fork's `spot` branch (boopdotpng/rune), pinned to a rev. To change Rune, commit to that branch
+# and bump the rev; to try a change first, point a local `[patch]` at a checkout.
+rune = { git = "https://github.com/boopdotpng/rune", rev = "e4e97b1d44c3ad6f85e3612a10fff44a5aac8dbb", default-features = false, features = ["metal-backend", "accessibility", "embedded-fonts"] }
 
 # AppKit for what Rune doesn't cover: the menu bar's order (src/gui/menus.rs), the quick search
 # panel's Space and position (src/gui/launcher.rs). The versions Rune uses.
