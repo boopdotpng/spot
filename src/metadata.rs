@@ -48,6 +48,14 @@ pub fn gid_uri(kind: &str, gid: &[u8]) -> Option<String> {
     Some(format!("spotify:{kind}:{b62}"))
 }
 
+/// The largest of a metadata image group, as an i.scdn.co url.
+pub fn image_url(images: &[librespot_protocol::metadata::Image]) -> Option<String> {
+    images.iter().max_by_key(|i| i.width()).map(|i| {
+        let hex: String = i.file_id().iter().map(|b| format!("{b:02x}")).collect();
+        format!("https://i.scdn.co/image/{hex}")
+    })
+}
+
 /// spotify:<kind>:<base62> for a stored SpotifyId (0 = unknown).
 pub fn id_uri(kind: &str, id: u128) -> Option<String> {
     if id == 0 {
@@ -64,15 +72,13 @@ pub fn pb_track(uri: &str, t: &PbTrack) -> Track {
         artists: t.artist.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "),
         lead: t.artist.first().map_or(0, |a| a.name().len()),
         album: t.album.name().to_string(),
-        cover: t.album.cover_group.image.iter().max_by_key(|i| i.width()).map(|i| {
-            let hex: String = i.file_id().iter().map(|b| format!("{b:02x}")).collect();
-            format!("https://i.scdn.co/image/{hex}")
-        }),
+        cover: image_url(&t.album.cover_group.image),
         ms: t.duration() as u64,
         album_id: id(t.album.gid()),
         artist_id: t.artist.first().map_or(0, |a| id(a.gid())),
         disc: t.disc_number().max(0) as u32,
         explicit: t.explicit(),
+        added: 0,
     }
 }
 

@@ -591,9 +591,7 @@ impl App {
                 if (uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")) && self.queue.is_some() {
                     // a single song plays now, then the queue and the list carry on
                     self.queued = tracks.into_iter().next();
-                    self.retried = false;
-                    self.load_at = None;
-                    self.play_current();
+                    self.play_fresh();
                 } else {
                     let start = match from {
                         Some(f) => match tracks.iter().position(|t| t.uri == f) {
@@ -604,7 +602,7 @@ impl App {
                     };
                     // the same key the window uses, so the sidebar marks it playing
                     let key = uri.strip_prefix("spotify:playlist:").unwrap_or(&uri).into();
-                    self.play_queue(Queue { key, name, tracks: Arc::new(tracks), order: vec![], pos: 0 }, start);
+                    self.play_queue(Queue { key, name, tracks: Arc::new(tracks), order: vec![], pos: 0, sorted: vec![] }, start);
                 }
                 if show {
                     self.show_queue();
@@ -721,7 +719,6 @@ impl App {
         let toggled = std::mem::replace(&mut self.ctl.playing, self.want_play) != self.want_play;
         let modes = std::mem::replace(&mut self.ctl.modes, (self.shuffle, self.repeat)) != (self.shuffle, self.repeat);
         let skipped = std::mem::take(&mut self.ctl.skipped);
-        self.moved = Moved { track: new_track, skipped };
         if self.ctl.watchers.is_empty() {
             return;
         }
@@ -815,7 +812,7 @@ async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> 
             format!("{} · all songs", by.map_or("artist", |t| &t.artists[..t.lead]))
         }
         None if is_show(uri) => tracks.first().map_or("podcast".into(), |t| t.artists.clone()),
-        None => tracks.first().map_or("album".into(), |t| format!("{} — {}", t.album, t.artists)),
+        None => tracks.first().map_or("album".into(), |t| t.album.clone()),
     };
     if tracks.is_empty() {
         return Err(format!("{name} has no songs to play"));
@@ -840,6 +837,7 @@ mod tests {
             artist_id: 0,
             disc: 0,
             explicit: false,
+            added: 0,
         };
         (1..=n).map(track).collect()
     }

@@ -26,11 +26,29 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # Rune is pre-release: pinned to a rev of its dev branch, which is never rewritten.
 rune = { git = "https://github.com/anomalyco/rune", rev = "d03349e25189ce1edc8c26ada6bf6d4aac72c826", default-features = false, features = ["metal-backend", "accessibility", "embedded-fonts"] }
 
+# AppKit for what Rune doesn't cover: the menu bar's order (src/gui/menus.rs), the quick search
+# panel's Space and position (src/gui/launcher.rs). The versions Rune uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5.2"
+block2 = "0.5"
+objc2-foundation = { version = "0.2.2", features = ["block2", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSThread"] }
+objc2-app-kit = { version = "0.2.2", features = ["block2", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSWindow", "NSWorkspace"] }
+
+# Local release builds (bundle.sh, `cargo build --release`) are incremental: an edit rebuilds in
+# seconds rather than minutes. Published builds use the dist profile below.
 [profile.release]
 opt-level = 3
+codegen-units = 16
+incremental = true
+strip = true
+
+# What the release workflow ships: whole-program optimization, for a smaller, slightly faster
+# binary. A full rebuild on every change, a few minutes each: `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
 lto = true
 codegen-units = 1
-strip = true
+incremental = false
 
 # librespot-core 0.8.0 plus a retry for audio keys Spotify refuses at random (vendor/README.md)
 [patch.crates-io]

@@ -9,7 +9,7 @@ use std::{
 use crate::*;
 
 pub const COMMANDS: &[&str] = &[
-    "start", "quit", "show", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
+    "start", "quit", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
     "search", "playlists", "podcasts", "watch", "wait",
 ];
 
@@ -19,12 +19,9 @@ spot: tiny Spotify player, and a command line for the one that's running
   spot                       open spot's window, starting spot if needed (the first time, it
                              logs you in here); closing the window keeps the music playing
   spot start                 start it in the background, without a window, and return once
-                             it's ready (what scripts and agents should use); ⌥Space or the
-                             menu bar item opens it
-  spot show                  open the window of the spot that's running
-  spot --headless            start it in the foreground without a window, for a launchd service
+                             it's ready (what scripts and agents should use); ⌥Space
+                             opens the search, `spot` the window
   spot quit                  stop the player (it resumes where it was next start)
-  spot clean                 clear cached songs and lists (keeps login)
   spot -v, --version         which spot this is
 
 Control the running player, from any terminal, script or agent:
@@ -95,7 +92,7 @@ fn wait_for(secs: u64, ok: impl Fn() -> bool) -> bool {
 /// `watch` and `wait` keep printing event lines as they come.
 pub fn client(args: Vec<String>) -> i32 {
     match args[0].as_str() {
-        "start" => return start(true),
+        "start" => return launch(false, true),
         "quit" => return quit(),
         _ => {}
     }
@@ -160,12 +157,7 @@ pub fn send(args: &[&str]) -> Result<String, String> {
     if code == 0 { Ok(text) } else { Err(text) }
 }
 
-/// `spot start`: start spot in the background without its window, and return once it answers.
-pub fn start(say: bool) -> i32 {
-    launch(false, say)
-}
-
-/// Run `spot --app` detached from this terminal (its own process group, no stdio, so whatever
+/// `spot start`, or `spot` after first-run setup: run `spot --app` detached from this terminal (its own process group, no stdio, so whatever
 /// started it can exit or close), with its window if `show`, and wait until it answers. `say`
 /// prints how that went.
 fn launch(show: bool, say: bool) -> i32 {

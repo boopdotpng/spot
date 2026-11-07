@@ -28,6 +28,7 @@ use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, M
 
 mod app;
 mod art;
+mod artist;
 mod fmt;
 mod gui;
 mod auth;
@@ -125,8 +126,6 @@ fn main() {
         None if std::io::stdin().is_terminal() => std::process::exit(cli::open()),
         None => player(true),
         Some("--app") if args.len() <= 2 && args.get(1).is_none_or(|a| a == "--show") => player(args.len() == 2),
-        Some("--headless") if args.len() == 1 => player(false),
-        Some("clean") => clean_cache(),
         Some("-v" | "--version") if args.len() == 1 => println!("spot {}", env!("CARGO_PKG_VERSION")),
         Some(c) if cli::COMMANDS.contains(&c) => std::process::exit(cli::client(args)),
         Some(a) => {
@@ -137,7 +136,7 @@ fn main() {
     }
 }
 
-/// The player, with its window (shown now if `show`) and its menu bar item. Returns only to quit.
+/// The player, with its window (shown now if `show`). Returns only to quit.
 fn player(show: bool) {
     // One player at a time: a second would fight the first over the audio session and the
     // resume point. The lock goes when the process does, crash or not.
@@ -192,7 +191,6 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
 
     settings::write_template();
     let (mut settings, problems) = settings::load();
-    use_themes(std::mem::take(&mut settings.themes));
     problems.iter().for_each(|p| log::warn!("{p}"));
 
     let dir = cache_dir();
@@ -289,8 +287,6 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
     rt.spawn(load_playlists(api.clone(), tx.clone()));
     rt.spawn(load_shows(api.clone(), tx.clone()));
 
-    load_family();
-
     let mut events = player.get_player_event_channel();
     let ptx = tx.clone();
     rt.spawn(async move {
@@ -342,7 +338,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },
         view_seq: 0,
         history: vec![],
-        artist_songs: true,
+        grid_cols: std::cell::Cell::new(4),
         releases: Releases::All,
         tr_state: Sel::default(),
         focus: Focus::Playlists,
@@ -352,6 +348,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         search_task: None,
         find: None,
         matches: vec![],
+        sort: Sort::from_name(&fs::read_to_string(cache_dir().join("sort")).unwrap_or_default()),
         search_kind: Kind::Tracks,
         shuffle: false,
         repeat: Repeat::Off,
@@ -385,7 +382,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         quit: false,
         art: Default::default(),
         show: false,
-        moved: Moved::default(),
+        shuffle_on_load: None,
     };
 
     if let Some(last) = read_last() {
@@ -437,7 +434,6 @@ impl App {
         next
     }
 
-    /// Stop: save where it was, send the last scrobble, and exit.
     /// Quit, and open the window again once this process is gone (it holds the player's lock):
     /// for settings that only apply at start, and logging in again.
     pub fn restart(&mut self) -> ! {
@@ -459,6 +455,7 @@ impl App {
         self.shutdown()
     }
 
+    /// Stop: save where it was, send the last scrobble, and exit.
     pub fn shutdown(&mut self) -> ! {
         ctl::unlink();
         self.save_last();

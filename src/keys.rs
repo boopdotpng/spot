@@ -99,11 +99,14 @@ impl App {
         }
         self.status.clear();
         match k {
-            Key::Char('t') if cmd => {
-                self.note = Some((format!("theme: {}", cycle_family()), Instant::now() + Duration::from_millis(1500)))
-            }
             _ if cmd => return false,
-            Key::Char('?') => self.help = true,
+            Key::Char('d') if self.dated() => self.set_sort(self.sort.next()),
+            // cards: left and right go card to card, up and down line to line
+            Key::Left | Key::Char('h') if self.focus == Focus::Tracks && self.grid_move(-1, 0) == Some(true) => {}
+            Key::Right | Key::Char('l') if self.focus == Focus::Tracks && self.grid_move(1, 0).is_some() => {}
+            Key::Down | Key::Char('j') if self.focus == Focus::Tracks && self.grid_move(0, 1).is_some() => {}
+            Key::Up | Key::Char('k') if self.focus == Focus::Tracks && self.grid_move(0, -1).is_some() => {}
+            Key::Char('P') if self.view.info.is_some() => self.play_artist(),
             Key::Tab | Key::BackTab | Key::Left | Key::Right | Key::Char('h') | Key::Char('l') => {
                 self.focus = match (&self.focus, k) {
                     (_, Key::Left | Key::Char('h')) => Focus::Playlists,

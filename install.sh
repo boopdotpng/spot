@@ -57,7 +57,7 @@ if [ "$login" = 1 ]; then
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.github.boopdotpng.spot</string>
-  <key>ProgramArguments</key><array><string>$apps/Spot.app/Contents/MacOS/spot</string><string>--headless</string></array>
+  <key>ProgramArguments</key><array><string>$apps/Spot.app/Contents/MacOS/spot</string><string>--app</string></array>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Interactive</string>
 </dict></plist>

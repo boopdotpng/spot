@@ -305,6 +305,18 @@ impl App {
     }
 
     /// Queue the whole open list. `start` = chosen track; None = from the top (or a random track if shuffling).
+    /// Shuffle the open list and play it: now if it's here, or once it's loaded.
+    pub fn shuffle_play_view(&mut self) {
+        if !self.shuffle {
+            self.toggle_shuffle();
+        }
+        if self.view.loading || self.view.tracks.is_empty() {
+            self.shuffle_on_load = Some(self.view.id);
+        } else {
+            self.play_from_view(None);
+        }
+    }
+
     pub fn play_from_view(&mut self, start: Option<usize>) {
         if self.view.kind != Kind::Tracks || self.view.tracks.is_empty() {
             return;
@@ -317,11 +329,12 @@ impl App {
             };
         }
         let q = Queue {
-            key: self.view.key.clone(),
-            name: self.view.title.clone(),
+            key: self.view.queue_key(),
+            name: self.view.queue_name(),
             tracks: self.view.tracks.clone(),
             order: vec![],
             pos: 0,
+            sorted: self.view.order.clone(),
         };
         self.play_queue(q, start);
     }
@@ -331,6 +344,11 @@ impl App {
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
         self.queued = None;
+        self.play_fresh();
+    }
+
+    /// Play what's now current, as a new choice: no retry spent on it, no skip still settling.
+    pub fn play_fresh(&mut self) {
         self.retried = false;
         self.load_at = None;
         self.play_current();
@@ -343,9 +361,7 @@ impl App {
         }
         self.queued = Some(self.upnext.remove(i));
         self.queue_changed();
-        self.retried = false;
-        self.load_at = None;
-        self.play_current();
+        self.play_fresh();
     }
 
     /// Jump ahead in the list to the song `i` after the one it's on (the queue stays queued).
@@ -356,9 +372,7 @@ impl App {
         }
         q.pos += 1 + i;
         self.queued = None;
-        self.retried = false;
-        self.load_at = None;
-        self.play_current();
+        self.play_fresh();
     }
 
     /// Add songs to the end of the queue; with nothing playing (or everything played), the first starts.
@@ -389,12 +403,8 @@ impl App {
 
     /// `Q`: what's coming, as a list (enter plays a song from it, x removes a queued one).
     pub fn open_queue(&mut self) {
-        let mut v = self.new_view(QUEUE_KEY.into(), "Up next".into(), Kind::Tracks);
-        v.tracks = Arc::new(self.coming_up());
-        v.loading = false;
         let back = self.view.key != QUEUE_KEY;
-        self.show(v, back);
-        self.focus = Focus::Tracks;
+        self.show_ready(QUEUE_KEY.into(), "Up next".into(), Arc::new(self.coming_up()), back);
     }
 
     /// Keep up next views (open or in the history) showing what's coming as it changes.
@@ -421,21 +431,21 @@ impl App {
             return;
         }
         let Some(t) = self.selected_track().and_then(|i| self.view.tracks.get(i)).cloned() else { return };
-        self.note = Some((format!("queued {}", t.name), Instant::now() + Duration::from_millis(1500)));
+        self.flash(format!("queued {}", t.name));
         self.enqueue([t]);
     }
 
     /// `x` in the queue: drop the highlighted song.
     pub fn dequeue_selected(&mut self) {
         if self.view.key != QUEUE_KEY {
-            self.note = Some(("x removes songs from the queue (Q)".into(), Instant::now() + Duration::from_millis(1500)));
+            self.flash("x removes songs from the queue (Q)");
             return;
         }
         let note = match self.selected_track().and_then(|i| self.dequeue(i)) {
             Some(t) => format!("removed {}", t.name),
             None => "only queued songs can be removed".into(),
         };
-        self.note = Some((note, Instant::now() + Duration::from_millis(1500)));
+        self.flash(note);
     }
 
     /// What plays after the current song, if that's known (a shuffled wrap picks a new order later).
@@ -459,20 +469,12 @@ impl App {
     pub fn show_queue(&mut self) {
         let Some(q) = &self.queue else { return };
         let (idx, key, name, tracks) = (q.idx(), q.key.clone(), q.name.clone(), q.tracks.clone());
-        let mut v = self.new_view(key, name, Kind::Tracks);
-        v.tracks = tracks;
-        v.loading = false;
-        self.show(v, true);
-        self.tr_state = Sel::with(idx);
-        self.focus = Focus::Tracks;
+        self.show_ready(key, name, tracks, true);
+        self.tr_state = Sel::with(self.row_of(idx).unwrap_or(0));
     }
 
     pub fn cycle_repeat(&mut self) {
-        self.repeat = match self.repeat {
-            Repeat::Off => Repeat::All,
-            Repeat::All => Repeat::One,
-            Repeat::One => Repeat::Off,
-        }
+        self.repeat = self.repeat.next();
     }
 
     pub fn skip(&mut self, d: isize) {
@@ -485,12 +487,8 @@ impl App {
         // off a queued song: on to the list's next, or back to where the list is (prev)
         let d = if self.queued.take().is_some() && d < 0 { 0 } else { d };
         let Some(q) = &mut self.queue else {
-            self.player.stop();
-            self.playing = false;
-            self.want_play = false;
-            self.finished = true;
             self.cur = None;
-            return;
+            return self.stop_finished();
         };
         let len = q.order.len() as isize;
         let mut n = q.pos as isize + d;
@@ -508,19 +506,28 @@ impl App {
             }
         }
         if n < 0 || n >= len {
-            self.player.stop();
-            self.playing = false;
-            self.want_play = false;
-            self.finished = true;
-            return;
+            return self.stop_finished();
         }
         q.pos = n as usize;
         self.retried = false;
         self.play_current();
     }
 
+    /// Nothing left to play.
+    fn stop_finished(&mut self) {
+        self.player.stop();
+        self.playing = false;
+        self.want_play = false;
+        self.finished = true;
+    }
+
     pub fn position(&self) -> u64 {
         self.pos_ms + self.pos_at.map_or(0, |t| t.elapsed().as_millis() as u64)
+    }
+
+    /// A brief popup note.
+    pub fn flash(&mut self, note: impl Into<String>) {
+        self.note = Some((note.into(), Instant::now() + Duration::from_millis(1500)));
     }
 
     /// Volume in percent.
@@ -564,7 +571,7 @@ impl App {
                     l.since.get_or_insert_with(Instant::now);
                     if !l.announced {
                         l.announced = true;
-                        l.started = unix_now();
+                        l.started = now_secs();
                         if let Some(fm) = &self.lastfm {
                             fm.now_playing(&self.rt, &l.track);
                         }
@@ -664,7 +671,7 @@ mod tests {
     #[test]
     fn a_shows_episodes_never_shuffle() {
         let tracks = Arc::new(parse_tracks(5));
-        let mut q = Queue { key: "spotify:show:x".into(), name: String::new(), tracks: tracks.clone(), order: vec![], pos: 0 };
+        let mut q = Queue { key: "spotify:show:x".into(), name: String::new(), tracks: tracks.clone(), order: vec![], pos: 0, sorted: vec![] };
         q.reorder(true, Some(2));
         assert_eq!((q.order.as_slice(), q.pos), (&[0, 1, 2, 3, 4][..], 2));
     }

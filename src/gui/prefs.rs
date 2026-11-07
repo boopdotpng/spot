@@ -1,13 +1,12 @@
-// The settings page (⌘, or the gear by the theme dots): what config.toml holds, minus themes,
+// The settings page (⌘,), in place of the open list: what config.toml holds,
 // plus the Spotify and Last.fm logins. Each change is written to config.toml as it's made,
-// keeping the rest of the file. The popup's apply at once; the rest when spot restarts, which
-// the page offers to do.
+// keeping the rest of the file. Most apply when spot restarts, which the page offers to do.
 
-use rune::{Color, Cursor, El, ScrollSpec, TextEdit, Transition, col, el, icon, row, spacer, text, text_input};
+use rune::{Color, Cursor, El, ScrollSpec, TextEdit, Transition, col, el, row, text, text_input};
 
-use super::view::{BODY, BODY_MED, LABEL, SMALL, ts};
+use super::view::{BODY, BODY_MED, LABEL, SMALL, TITLE, ts};
 use super::{Ui, icons};
-use crate::settings::{Popup, Settings};
+use crate::settings::Settings;
 use crate::*;
 
 #[derive(Default)]
@@ -23,6 +22,7 @@ pub struct Page {
     fm: Fm,
     logout: bool, // asked to log out: waiting for the second press
     note: Option<String>, // a save that failed
+    cached: u64, // bytes of songs and lists on disk, as of opening the page
 }
 
 #[derive(Default, PartialEq)]
@@ -47,6 +47,7 @@ impl Page {
         self.bad = None;
         self.logout = false;
         self.note = None;
+        self.cached = cache_size();
         if self.fm != Fm::Waiting {
             self.fm = Fm::Idle;
         }
@@ -68,12 +69,9 @@ fn save(ui: &mut Ui, key: &str, value: Option<String>) {
 
 fn section(key: &str, title: &str, rows: Vec<El>) -> El {
     let th = super::view::theme_now();
-    let mut c = col().key(key.to_string()).w_full().gap(2.0)
-        .child(text(title.to_uppercase()).font(LABEL).color(th.accent2).mb(6.0));
-    for r in rows {
-        c = c.child(r);
-    }
-    c
+    col().key(key.to_string()).w_full().gap(2.0)
+        .child(text(title.to_uppercase()).font(LABEL).color(th.dim).mb(6.0))
+        .children(rows)
 }
 
 /// A setting: what it is on the left, a line on what it does under that, its control on the right.
@@ -109,20 +107,20 @@ fn choice(key: &str, options: Vec<(String, bool)>, pick: impl Fn(&mut Ui, usize)
 fn switch(key: &str, on: bool, flip: impl Fn(&mut Ui) + 'static) -> El {
     let th = super::view::theme_now();
     row().key(key.to_string()).size(38.0, 22.0).padding(2.0).radius(11.0)
-        .fill(if on { th.accent } else { th.text.alpha(0.16) })
+        .fill(if on { th.text } else { th.text.alpha(0.16) })
         .cursor(Cursor::Pointer).label(key.to_string())
         .on_press_tx(move |ui: &mut Ui, tx| {
             flip(ui);
             ui.after(tx);
         })
         .child(el().key("gap").w(if on { 16.0 } else { 0.0 }).h(1.0))
-        .child(el().key("knob").size(18.0, 18.0).radius(9.0).fill(Color::WHITE).shadow(1.0, 3.0, Color::BLACK.alpha(0.25)))
+        .child(el().key("knob").size(18.0, 18.0).radius(9.0).fill(if on { th.bg } else { Color::WHITE }).shadow(1.0, 3.0, Color::BLACK.alpha(0.25)))
 }
 
 pub fn button(key: &str, label: &str, kind: Kind, f: impl Fn(&mut Ui) + 'static) -> El {
     let th = super::view::theme_now();
     let (fill, color) = match kind {
-        Kind::Primary => (th.accent, th.on_accent),
+        Kind::Primary => (th.text, th.bg),
         Kind::Plain => (th.wash, th.text),
         Kind::Danger => (th.err.alpha(0.16), th.err),
     };
@@ -157,7 +155,7 @@ fn input(key: &'static str, edit: &TextEdit, w: f32, placeholder: &str, bad: boo
     if secure {
         field = field.secure();
     }
-    let border = if bad { th.err } else if focused { th.accent.alpha(0.65) } else { th.line };
+    let border = if bad { th.err } else if focused { th.text.alpha(0.3) } else { th.line };
     row().key(format!("{key}-box")).w(w).h(30.0).px(10.0).center_y().radius(8.0)
         .fill(th.raised).border(1.0, border)
         .child(field)
@@ -191,23 +189,6 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
         save(ui, "audio_cache_gb", Some(g.to_string()));
     });
 
-    const POPUPS: [(Popup, &str, &str); 3] = [(Popup::Skip, "skip", "Media keys"), (Popup::Track, "track", "Every song"), (Popup::Off, "off", "Never")];
-    let popup = choice("popup", POPUPS.iter().map(|(v, _, l)| (l.to_string(), s.popup == *v)).collect(), |ui, i| {
-        let (v, name, _) = POPUPS[i];
-        ui.prefs.saved.popup = v;
-        ui.app.settings.popup = v; // at once
-        save(ui, "popup", Some(settings::quoted(name)));
-    });
-    let mut secs = vec![2.0, 3.0, 5.0, 8.0];
-    if !secs.contains(&s.popup_seconds) {
-        secs.push(s.popup_seconds);
-    }
-    let popup_for = choice("popup-for", secs.iter().map(|x| (format!("{x} s"), s.popup_seconds == *x)).collect(), move |ui, i| {
-        let x = secs[i];
-        ui.prefs.saved.popup_seconds = x;
-        ui.app.settings.popup_seconds = x;
-        save(ui, "popup_seconds", Some(x.to_string()));
-    });
     let hotkey = input("hotkey", &p.hotkey, 170.0, "option+space", p.bad == Some("hotkey"), false, |ui| &mut ui.prefs.hotkey, |ui| {
         match settings::hotkey(&ui.prefs.hotkey.text) {
             Some(h) => {
@@ -282,10 +263,11 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
             line("l-quality", "Quality", "kbps. 320 is the most Spotify streams to spot.", quality),
             line("l-normalize", "Even out loudness", "Plays every song at about the same volume.", normalize),
             line("l-cache", "Keep played songs", "On disk, so replays start at once and skip the network.", cache),
-        ]))
-        .child(section("s-popup", "Now playing popup", vec![
-            line("l-popup", "Show it on", "At the top of the screen, while spot's window isn't in front.", popup),
-            line("l-popup-for", "For", "How long it stays up.", popup_for),
+            line("l-clear", "Clear cache", &format!("{:.0} MB of songs and lists. Your login and settings stay; spot restarts.", p.cached as f64 / 1e6),
+                button("clear", "Clear", Kind::Plain, |ui| {
+                    clean_cache();
+                    ui.restart();
+                })),
         ]))
         .child(section("s-keys", "Quick search", vec![
             line("l-hotkey", "Hotkey", "Opens the search from any app. Modifiers and a key, like ctrl+option+s. Return saves.", hotkey),
@@ -300,17 +282,17 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
             line("l-fm-secret", "Shared secret", "Saved to ~/.config/spot/lastfm.", fm_secret),
         ]));
 
-    let mut card = col().key("prefs-card").w(620.0).h_full().max_h(820.0).radius(18.0).clip_rounded(18.0)
-        .fill(th.raised).border(1.0, th.line)
-        .shadow(18.0, 60.0, Color::BLACK.alpha(if th.dark { 0.5 } else { 0.18 }))
-        .transition(Transition::opacity().combined(Transition::offset(0.0, 10.0)))
-        .on_press(|_: &mut Ui| {}) // clicks inside stay inside
-        .child(row().key("prefs-head").w_full().h(64.0).px(28.0).gap(10.0).center_y()
-            .child(icon(&icons::GEAR, 18.0).color(th.accent))
-            .child(text("Settings").font(ts(18.0, 700.0)).color(th.text))
-            .child(spacer())
-            .child(button("done", "Done", Kind::Plain, |ui| ui.prefs.open = false)))
-        .child(col().key("prefs-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0).child(body));
+    // a page of its own, where the open list goes: the sidebar stays, so a click there leaves
+    let top = row().key("prefs-top").w_full().h(52.0).px(16.0).gap(8.0).center_y().window_drag()
+        .child(super::view::icon_button("prefs-back", &icons::BACK, 18.0, th.sub, th, "Back  esc", |ui| ui.prefs.open = false));
+    let head = col().key("prefs-head").w_full().px(28.0).pt(4.0).pb(18.0)
+        .child(text("Settings").font(TITLE).color(th.text));
+    let column = col().key("prefs-col").w_full().max_w(720.0).child(head).child(body);
+    let mut page = col().key("prefs-page").grow(1.0).h_full().min_w(0.0).fill(th.bg)
+        .transition(Transition::opacity())
+        .child(top)
+        .child(col().key("prefs-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0)
+            .child(row().key("prefs-center").w_full().justify_center().child(column)));
     let note = p.note.clone().or_else(|| p.needs_restart(&a.settings).then(|| "Some changes apply when spot restarts.".to_string()));
     if let Some(n) = note {
         let failed = p.note.is_some();
@@ -319,12 +301,9 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
         if !failed {
             foot = foot.child(button("restart", "Restart now", Kind::Primary, |ui| ui.restart()));
         }
-        card = card.child(el().key("foot-rule").h(1.0).w_full().fill(th.line)).child(foot);
+        page = page.child(el().key("foot-rule").h(1.0).w_full().fill(th.line)).child(foot);
     }
-    row().key("prefs-page").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).padding(36.0).center().fill(Color::BLACK.alpha(0.35))
-        .transition(Transition::opacity())
-        .on_press(|ui: &mut Ui| ui.prefs.open = false)
-        .child(card)
+    page
 }
 
 /// Save the keys, then log in to Last.fm in the browser, off the window's thread.

@@ -4495,6 +4495,7 @@ dependencies = [
 name = "spot"
 version = "1.3.5"
 dependencies = [
+ "block2 0.5.1",
  "env_logger",
  "image",
  "librespot-core",
@@ -4504,6 +4505,9 @@ dependencies = [
  "librespot-protocol",
  "log",
  "md-5",
+ "objc2 0.5.3",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
  "open",
  "protobuf",
  "rand 0.9.5",

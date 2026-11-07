@@ -49,41 +49,51 @@ pub async fn load_list(api: Arc<Api>, sess: Sess, tx: mpsc::Sender<Msg>, view: u
     let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
 }
 
+/// Albums as openable links, newest first: their covers, and "2024 album · 12 songs" (or, `by`,
+/// whose they are, for releases an artist only appears on).
+async fn release_links(session: &Session, albums: &[String], by: bool) -> Result<Vec<Link>, String> {
+    use librespot_protocol::metadata::album::Type;
+    let found = batch_meta::<PbAlbum>(session, albums, ExtensionKind::ALBUM_V4).await?;
+    let mut links: Vec<_> = albums
+        .iter()
+        .filter_map(|u| {
+            let a = found.get(u)?;
+            let kind = match a.type_() {
+                Type::SINGLE => "single",
+                Type::EP => "EP",
+                Type::COMPILATION => "compilation",
+                _ => "album",
+            };
+            let year = if a.date.year() > 0 { format!("{} ", a.date.year()) } else { String::new() };
+            let sub = if by {
+                let names: Vec<&str> = a.artist.iter().map(|x| x.name()).collect();
+                format!("{year}· {}", names.join(", "))
+            } else {
+                let n: usize = a.disc.iter().map(|d| d.track.len()).sum();
+                format!("{year}{kind} · {n} song{}", if n == 1 { "" } else { "s" })
+            };
+            let d = &a.date;
+            let single = a.type_() == Type::SINGLE;
+            let image = image_url(&a.cover_group.image);
+            Some(((d.year(), d.month(), d.day()), Link { uri: u.clone(), name: a.name().into(), sub, single, image }))
+        })
+        .collect();
+    // Newest release first, mixing albums, EPs and singles.
+    links.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
+    Ok(links.into_iter().map(|(_, l)| l).collect())
+}
+
 /// An artist's releases as openable album links.
 pub async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, cached: Vec<Link>) {
-    use librespot_protocol::metadata::album::Type;
     let res = async {
         let session = ready(sess).await?;
         let albums = artist_albums(&session, &uri).await?;
-        let found = batch_meta::<PbAlbum>(&session, &albums, ExtensionKind::ALBUM_V4).await?;
-        let mut links: Vec<_> = albums
-            .iter()
-            .filter_map(|u| {
-                let a = found.get(u)?;
-                let kind = match a.type_() {
-                    Type::SINGLE => "single",
-                    Type::EP => "EP",
-                    Type::COMPILATION => "compilation",
-                    _ => "album",
-                };
-                let n: usize = a.disc.iter().map(|d| d.track.len()).sum();
-                let year = if a.date.year() > 0 { format!("{} ", a.date.year()) } else { String::new() };
-                let sub = format!("{year}{kind} · {n} song{}", if n == 1 { "" } else { "s" });
-                let d = &a.date;
-                let single = a.type_() == Type::SINGLE;
-                Some(((d.year(), d.month(), d.day()), Link { uri: u.clone(), name: a.name().into(), sub, single }))
-            })
-            .collect();
-        // Newest release first, mixing albums, EPs and singles.
-        links.sort_by_key(|(date, _)| std::cmp::Reverse(*date));
-        let links: Vec<Link> = links.into_iter().map(|(_, l)| l).collect();
+        let links = release_links(&session, &albums, false).await?;
         save_links(&releases_path(&uri), &links);
         if cached.is_empty() {
             let _ = tx.send(Msg::Links { view, links, done: true });
         } else {
-            if !same_uris(links.iter().map(|l| &l.uri), cached.iter().map(|l| &l.uri))
-                || links.iter().zip(&cached).any(|(a, b)| a.name != b.name || a.sub != b.sub)
-            {
+            if changed(&links, &cached) {
                 let _ = tx.send(Msg::ReplaceLinks { view, links });
             }
             let _ = tx.send(Msg::Links { view, links: vec![], done: true });
@@ -97,18 +107,106 @@ pub async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: 
     }
 }
 
+fn changed(a: &[Link], b: &[Link]) -> bool {
+    !same_uris(a.iter().map(|l| &l.uri), b.iter().map(|l| &l.uri)) || a.iter().zip(b).any(|(a, b)| a.name != b.name || a.sub != b.sub || a.image != b.image)
+}
+
+/// The first (canonical) album of each group: each lists regional/edition variants of one release.
+fn group_uris(groups: &[librespot_protocol::metadata::AlbumGroup]) -> impl Iterator<Item = String> + '_ {
+    groups.iter().filter_map(|g| g.album.first()).filter_map(|al| gid_uri("album", al.gid()))
+}
+
+/// Spotify's bios are a little HTML (links to other artists, line breaks): plain text.
+fn plain_bio(html: &str) -> String {
+    let s = html.replace("<br/>", "\n").replace("<br>", "\n").replace("<br />", "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => tag = true,
+            '>' if tag => tag = false,
+            _ if !tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out.replace("&amp;", "&").replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">");
+    out.lines().map(str::trim).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+/// How many of the releases an artist appears on the overview looks up.
+const APPEARS: usize = 12;
+
+/// An artist's overview, fresh: sent to `view` (and saved) if it differs from what it showed.
+pub async fn artist_overview(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, cached: Option<Arc<ArtistInfo>>) {
+    let res = async {
+        let session = ready(sess).await?;
+        let a = batch_meta::<PbArtist>(&session, &[uri.clone()], ExtensionKind::ARTIST_V4)
+            .await?
+            .remove(&uri)
+            .ok_or("artist not found")?;
+        // popular where the account is, else wherever Spotify lists first
+        let country = session.country();
+        let top = a.top_track.iter().find(|t| t.country() == country).or_else(|| a.top_track.first());
+        let top_uris: Vec<String> = top.into_iter().flat_map(|t| t.track.iter()).filter_map(|t| gid_uri("track", t.gid())).take(10).collect();
+        let found = batch_meta::<PbTrack>(&session, &top_uris, ExtensionKind::TRACK_V4).await?;
+        let top: Vec<Track> = tracks_in_order(&top_uris, &found).collect();
+        let albums: Vec<String> = group_uris(&a.album_group).chain(group_uris(&a.single_group)).chain(group_uris(&a.compilation_group)).collect();
+        let releases = release_links(&session, &albums, false).await?;
+        let appears_uris: Vec<String> = group_uris(&a.appears_on_group).take(APPEARS).collect();
+        let appears = release_links(&session, &appears_uris, true).await?;
+        let related = a
+            .related
+            .iter()
+            .filter_map(|r| {
+                let image = image_url(&r.portrait_group.image).or_else(|| image_url(&r.portrait));
+                Some(Link { uri: gid_uri("artist", r.gid())?, name: r.name().into(), sub: "Artist".into(), single: false, image })
+            })
+            .collect();
+        let portrait = image_url(&a.portrait_group.image).or_else(|| image_url(&a.portrait));
+        let bio = a.biography.first().map(|b| plain_bio(b.text())).unwrap_or_default();
+        let info = ArtistInfo { portrait, top, releases, appears, related, bio };
+        // the discography page reads the same releases
+        save_links(&releases_path(&uri), &info.releases);
+        save_artist(&uri, &info);
+        let same = cached.as_deref().is_some_and(|c| {
+            c.portrait == info.portrait
+                && c.bio == info.bio
+                && same_uris(c.top.iter().map(|t| &t.uri), info.top.iter().map(|t| &t.uri))
+                && !changed(&c.releases, &info.releases)
+                && !changed(&c.appears, &info.appears)
+                && !changed(&c.related, &info.related)
+        });
+        if !same {
+            let _ = tx.send(Msg::Artist { view, info: Arc::new(info) });
+        }
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(e) = res {
+        let _ = tx.send(Msg::Error(e));
+    }
+    let _ = tx.send(Msg::Links { view, links: vec![], done: true });
+}
+
 pub async fn liked_page(api: Arc<Api>, offset: usize) -> Result<(Vec<Track>, usize), String> {
     let v = api.get(&format!("{API}/me/tracks?limit=50&offset={offset}")).await?;
-    let page = v["items"].as_array().into_iter().flatten().filter_map(|it| parse_track(&it["track"])).collect();
+    let page = v["items"].as_array().into_iter().flatten().filter_map(|it| {
+        let mut t = parse_track(&it["track"])?;
+        t.added = it["added_at"].as_str().map_or(0, iso_secs);
+        Some(t)
+    }).collect();
     Ok((page, v["total"].as_u64().unwrap_or(0) as usize))
 }
 
 /// The full Liked Songs list, or None if `cached` is still current.
 pub async fn liked_tracks(api: Arc<Api>, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
     let (mut got, total) = liked_page(api.clone(), 0).await?;
+    // cached before dates added were kept: fetched in full once, to fill them in
+    let undated = cached.iter().any(|t| t.added == 0);
     if cached.is_empty() {
         let _ = tx.send(Msg::Tracks { view, tracks: got.clone(), done: false });
-    } else if let Some(j) = (cached.len() + got.len()).checked_sub(total)
+    } else if !undated
+        && let Some(j) = (cached.len() + got.len()).checked_sub(total)
         && j > 0
         && j <= cached.len()
         && got.last().is_some_and(|t| t.uri == cached[j - 1].uri)
@@ -259,15 +357,27 @@ pub async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::
     let session = ready(sess).await?;
     let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
     let pl = librespot_metadata::Playlist::get(&session, &uri).await.map_err(|e| format!("playlist: {e}"))?;
-    let uris: Vec<String> = pl
-        .tracks()
-        .filter(|u| matches!(u, SpotifyUri::Track { .. }))
-        .filter_map(|u| u.to_uri().ok())
+    let items: Vec<(String, u64)> = pl
+        .contents
+        .items
+        .iter()
+        .filter(|it| matches!(it.id, SpotifyUri::Track { .. }))
+        .filter_map(|it| Some((it.id.to_uri().ok()?, (it.attributes.timestamp.as_timestamp_ms() / 1000).max(0) as u64)))
         .collect();
+    let uris: Vec<String> = items.iter().map(|(u, _)| u.clone()).collect();
+    let when: HashMap<&str, u64> = items.iter().map(|(u, t)| (u.as_str(), *t)).collect();
+    let dated = |mut t: Track| {
+        t.added = when.get(t.uri.as_str()).copied().unwrap_or(0);
+        t
+    };
     if cached.is_empty() {
-        return send_tracks(&session, &uris, false, true, tx, view).await.map(Some);
+        let tracks = send_tracks(&session, &uris, false, true, tx, view).await?;
+        let tracks: Vec<Track> = tracks.into_iter().map(dated).collect();
+        // the rows streamed in undated: hand over the dated list
+        let _ = tx.send(Msg::Replace { view, tracks: Arc::new(tracks.clone()) });
+        return Ok(Some(tracks));
     }
-    if uris.len() == cached.len() && uris.iter().zip(cached).all(|(u, t)| *u == t.uri) {
+    if uris.len() == cached.len() && uris.iter().zip(cached).all(|(u, t)| *u == t.uri && t.added == when[u.as_str()]) {
         return Ok(None);
     }
     let known: HashMap<&str, &Track> = cached.iter().map(|t| (t.uri.as_str(), t)).collect();
@@ -276,6 +386,7 @@ pub async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::
     Ok(Some(
         uris.iter()
             .filter_map(|u| known.get(u.as_str()).map(|t| (*t).clone()).or_else(|| found.get(u).map(|t| pb_track(u, t))))
+            .map(dated)
             .collect(),
     ))
 }
@@ -296,13 +407,7 @@ pub async fn artist_albums(session: &Session, uri: &str) -> Result<Vec<String>, 
         .await?
         .remove(uri)
         .ok_or("artist not found")?;
-    // each group lists regional/edition variants of one release; the first is the canonical one
-    Ok(a.album_group
-        .iter()
-        .chain(&a.single_group)
-        .filter_map(|g| g.album.first())
-        .filter_map(|al| gid_uri("album", al.gid()))
-        .collect())
+    Ok(group_uris(&a.album_group).chain(group_uris(&a.single_group)).collect())
 }
 
 #[cfg(test)]

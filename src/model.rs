@@ -15,6 +15,7 @@ pub struct Track {
     pub artist_id: u128,
     pub disc: u32, // disc number on its album; 0 = unknown
     pub explicit: bool,
+    pub added: u64, // when it went into the playlist (or Liked Songs), unix seconds; 0 = unknown
 }
 
 // A podcast episode is a Track too, so the queue, the player and the CLI work on it unchanged:
@@ -36,7 +37,7 @@ pub const NEW_KEY: &str = "podcasts:new";
 
 /// Above the followed shows in the podcast sidebar.
 pub fn podcast_home() -> [Link; 2] {
-    let link = |uri: &str, name: &str| Link { uri: uri.into(), name: name.into(), sub: String::new(), single: false };
+    let link = |uri: &str, name: &str| Link { uri: uri.into(), name: name.into(), sub: String::new(), single: false, image: None };
     [link(CONTINUE_KEY, "Continue listening"), link(NEW_KEY, "New episodes")]
 }
 
@@ -52,6 +53,45 @@ pub struct Link {
     pub name: String,
     pub sub: String,
     pub single: bool, // a single release (EPs and compilations count as albums)
+    pub image: Option<String>, // its cover or portrait, largest size
+}
+
+/// What an artist page shows, cycled with `v`: the overview (popular songs and cards), every
+/// song, or the discography as a grid.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ArtistMode {
+    Overview,
+    Songs,
+    Releases,
+}
+
+impl ArtistMode {
+    pub fn next(self) -> Self {
+        match self {
+            ArtistMode::Overview => ArtistMode::Songs,
+            ArtistMode::Songs => ArtistMode::Releases,
+            ArtistMode::Releases => ArtistMode::Overview,
+        }
+    }
+}
+
+/// An artist's overview, all from the one metadata lookup that also lists their releases.
+#[derive(Clone, Default)]
+pub struct ArtistInfo {
+    pub portrait: Option<String>,
+    pub top: Vec<Track>,     // popular songs, most played first
+    pub releases: Vec<Link>, // albums, singles and compilations, newest first
+    pub appears: Vec<Link>,  // others' releases they're on; `sub` names whose
+    pub related: Vec<Link>,  // fans also like (Spotify often leaves this empty)
+    pub bio: String,
+}
+
+/// The overview's sections of cards.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Section {
+    Releases,
+    Appears,
+    Related,
 }
 
 /// Which of an artist's releases their page lists, cycled with `f`.
@@ -130,6 +170,16 @@ pub enum Repeat {
     One, // replay the current song
 }
 
+impl Repeat {
+    pub fn next(self) -> Self {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Playlist {
     pub id: Option<String>, // None = Liked Songs
@@ -156,6 +206,7 @@ pub enum Msg {
     Replace { view: u64, tracks: Arc<Vec<Track>> }, // fresh copy of a list that was shown from cache
     Links { view: u64, links: Vec<Link>, done: bool },
     ReplaceLinks { view: u64, links: Vec<Link> }, // fresh copy of an artist's releases shown from cache
+    Artist { view: u64, info: Arc<ArtistInfo> },  // an artist's overview, fresh (or None came: see lists)
     Error(String),
     Media(MediaControlEvent),
     Relogin(bool), // true: waiting on browser login; false: it finished
@@ -184,6 +235,51 @@ pub struct Queue {
     pub tracks: Arc<Vec<Track>>,
     pub order: Vec<usize>, // play order (indices into tracks); shuffled when shuffle is on
     pub pos: usize,
+    pub sorted: Vec<usize>, // the list's order as it was sorted when played; empty = as listed
+}
+
+/// How a playlist is listed: as it is, or by when its songs were added.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Sort {
+    #[default]
+    List,
+    Newest,
+    Oldest,
+}
+
+impl Sort {
+    pub fn next(self) -> Sort {
+        match self {
+            Sort::List => Sort::Newest,
+            Sort::Newest => Sort::Oldest,
+            Sort::Oldest => Sort::List,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Sort::List => "list",
+            Sort::Newest => "newest",
+            Sort::Oldest => "oldest",
+        }
+    }
+    pub fn from_name(s: &str) -> Sort {
+        match s.trim() {
+            "newest" => Sort::Newest,
+            "oldest" => Sort::Oldest,
+            _ => Sort::List,
+        }
+    }
+    /// `tracks` in this order, as indices; empty for `List`. Songs with no date keep their
+    /// place relative to each other, after the dated ones.
+    pub fn order(self, tracks: &[Track]) -> Vec<usize> {
+        let mut o: Vec<usize> = (0..tracks.len()).collect();
+        match self {
+            Sort::List => return vec![],
+            Sort::Newest => o.sort_by_key(|&i| (tracks[i].added == 0, std::cmp::Reverse(tracks[i].added))),
+            Sort::Oldest => o.sort_by_key(|&i| (tracks[i].added == 0, tracks[i].added)),
+        }
+        o
+    }
 }
 
 impl Queue {
@@ -208,8 +304,8 @@ impl Queue {
             self.order = first.into_iter().chain(rest).collect();
             self.pos = 0;
         } else {
-            self.order = (0..n).collect();
-            self.pos = first.unwrap_or(0);
+            self.order = if self.sorted.len() == n { self.sorted.clone() } else { (0..n).collect() };
+            self.pos = first.and_then(|f| self.order.iter().position(|&i| i == f)).unwrap_or(0);
         }
     }
 }

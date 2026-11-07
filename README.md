@@ -68,8 +68,9 @@ wait in `~/.cache/spot/scrobbles` and go out later.
 ## The window
 
 `spot` opens it. The sidebar lists your playlists (or podcasts), the middle the open list with
-each song's cover, and the player runs along the bottom, over a glow in the colors of the cover
-that's playing. Click a playlist to open it, double-click a song to play it (the rest of the
+each song's cover (and, in playlists, when it was added), and the player runs along the bottom.
+The window is near-monochrome: the covers are its color, and a single accent, taken from the
+playing song's cover, marks what's playing and fills the progress bar. Click a playlist to open it, double-click a song to play it (the rest of the
 list plays after it); click the playing song's name for its album, the artist for their page.
 Closing the window (`⌘W`) keeps the music playing; `⌘Q` quits.
 
@@ -77,7 +78,7 @@ Closing the window (`⌘W`) keeps the music playing; `⌘Q` quits.
 |---|---|
 | `/`, `⌘K` | search as you type (`tab` in the field cycles songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
 | `enter` | play song (the rest of the list plays after it) · open album / artist |
-| `⌘T` | next theme (desert, lagoon, moss, iris, blossom, mint, sorbet); remembered, light/dark follows macOS |
+| `d` | playlists: sort by date added (newest first, oldest first, as listed); also the DATE ADDED column's head; remembered |
 | `⌘F` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
 | `space` | pause / resume (with a short volume fade); right after launch, resumes what was playing at quit |
 | `s` | shuffle on/off |
@@ -91,13 +92,13 @@ Closing the window (`⌘W`) keeps the music playing; `⌘Q` quits.
 | `Q` | up next: the queue, then the rest of the list. `enter` plays a song from it now, `x` removes a queued one |
 | `m` | switch the sidebar between playlists and podcasts |
 | `a` / `A` | go to the album / artist of the highlighted song (or the playing one, from the sidebar) |
-| `v` | on an artist page: all songs ↔ albums & singles (remembered) |
-| `f` | on an artist's releases: all → albums (incl. EPs) → singles (remembered) |
+| `v` | on an artist page: overview → all songs → discography |
+| `f` | on an artist's overview or discography: all → albums (incl. EPs) → singles (remembered) |
 | `esc`, `backspace` | back to the previous list |
-| `tab`, `h`/`l`, `←`/`→` | switch pane |
+| `tab`, `h`/`l`, `←`/`→` | switch pane (on cards, `h`/`l` move card to card; left off a line's first card goes to the sidebar) |
 | `j`/`k`, `↑`/`↓`, `ctrl+d`/`ctrl+u` | move |
 | `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
-| `?` | key help (any key closes it) |
+| `⌘?` | key help (any key closes it) |
 | `⌘O` | the `⌥Space` search |
 | `⌘W` | close the window; music keeps playing (`spot`, `⌥Space` then `⌘O`, or opening Spot.app brings it back) |
 | `⌘Q` | quit |
@@ -112,9 +113,7 @@ artists / podcasts, `↑`/`↓` move, `enter` plays (pressed before the results 
 first one), `⌘enter` adds to the queue, `⌘c` copies the selected result's open.spotify.com link
 (with no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or
 click the icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc`
-closes. Skipping or seeking with the media keys shows what's playing for a moment at the top of
-the screen, unless spot's window is in front. Settings (`⌘,`) can show it on every new song
-instead, or turn it off, and change `⌥Space`.
+closes. Settings (`⌘,`) changes `⌥Space`.
 
 ## Command line
 
@@ -173,9 +172,8 @@ Or from a clone: `mkdir -p ~/.claude/skills && cp -r docs/skills/spot ~/.claude/
 
 `spot start` starts spot in the background with no window and returns once it's ready, so a
 script or an agent (Claude Code's Bash tool, say) can start it and carry on; `⌥Space` works, and
-`spot show` (or `spot`) opens the window. `spot quit` stops it, keeping the resume point. Log in
-once by running `spot` in a terminal first. (`spot --headless` is the same in the foreground, for
-a launchd service; it's what the login item runs.) Media keys and Now Playing work without the
+`spot` opens the window. `spot quit` stops it, keeping the resume point. Log in once by running
+`spot` in a terminal first. (The login item runs `spot --app`, the same in the foreground.) Media keys and Now Playing work without the
 window too, and with it closed spot draws nothing: it uses about as little as before it had one.
 
 The CLI and the window drive the same player, so they work at the same time: the window shows
@@ -190,16 +188,16 @@ first), then the shows you follow, which you follow in Spotify itself. Opening a
 episodes, newest first, with their dates and what's left of them.
 
 Episodes pick up where you left off, and count as played in their last minute. That's kept in
-`~/.cache/spot/episodes` and isn't shared with Spotify's apps, and `spot clean` leaves it alone.
+`~/.cache/spot/episodes` and isn't shared with Spotify's apps, and Settings' Clear cache leaves it alone.
 They play in list order, so the next one is older, whatever shuffle says. They don't scrobble.
 `a` or `A` on one opens its show. Audio is what Spotify streams for podcasts, usually 96 kbps.
 Video podcasts play as audio if Spotify has an audio version.
 
 ## Config
 
-Settings (`⌘,`, or the gear under the playlists) covers audio quality, the song cache's size, the
-`⌥Space` key, the popup, and the Spotify and Last.fm logins. They're saved in
-`~/.config/spot/config.toml`, which also holds colors for your own themes. See
+Settings (`⌘,`) covers audio quality, the song cache's size, the
+`⌥Space` key, and the Spotify and Last.fm logins. They're saved in
+`~/.config/spot/config.toml`. See
 [docs/config.md](docs/config.md) for every key.
 
 Right-click a playlist in the sidebar to pin it to the top.
@@ -209,8 +207,9 @@ Right-click a playlist in the sidebar to pin it to the top.
 - **Shuffle** is a uniform Fisher–Yates shuffle of the whole list (OS-seeded ChaCha RNG):
   every order is equally likely, no artist/popularity weighting. The playing song stays first.
   With repeat on, each pass through the list gets a fresh shuffle.
-- **Artists** open as every song (`v` switches to their albums & singles, to pick one) and play their full discography (albums + singles/EPs, newest first, duplicate
-  single/album versions removed). Shuffle + `P` = shuffle the whole discography.
+- **Artists** open on an overview: their portrait, popular songs, discography, what they appear on, related artists and their bio. Its play
+  button (or `P`) shuffles every song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate single/album versions
+  removed: find, sort and play from here) and to the discography as a grid of covers. `⌘F` on the overview finds in every song.
 - **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
   isn't exposed to third-party/Connect players, so librespot can't select it.
 - Audio: librespot (no Spotify app needed).
@@ -228,12 +227,12 @@ Right-click a playlist in the sidebar to pin it to the top.
 - **Audio cache**: played songs are kept in `~/.cache/spot/audio` (as streamed, encrypted), so
   replaying them starts instantly without the network. Capped at 1 GB, least recently played
   dropped first; set `audio_cache_gb` in [config.toml](docs/config.md) to change the cap (`0` turns it off).
-- **`spot clean`** clears the caches (songs, playlist / album / artist lists) and prints how much
-  it freed. Login, settings, the resume point and unsent scrobbles are kept.
+- **Clear cache** (in Settings) clears the caches (songs, playlist / album / artist lists) and
+  restarts spot. Login, settings, the resume point and unsent scrobbles are kept.
 - **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song
   paused and preloads it once connected, so `space` starts it right away.
-- **Theme**: light or dark follows macOS. `⌘T` cycles color themes, each with a light and dark
-  variant; the playing cover tints the top of the window.
+- **Colors**: light or dark follows macOS. The one accent comes from the playing cover, quietened,
+  and falls back to grey with nothing playing.
 - **Battery**: with the window closed spot draws nothing. Open, it draws only when something
   changes: once a second while playing (the clock and the progress bar), never while paused.
 
@@ -245,7 +244,8 @@ write the release notes (markdown) and tag with them, and push:
     git tag -a v1.1.0 --cleanup=verbatim -F notes.md && git push origin master v1.1.0
 
 (`--cleanup=verbatim` keeps the `## ` headings, which git would otherwise strip as comments.)
-GitHub Actions builds `Spot.app` for Apple Silicon and publishes the release
+GitHub Actions builds `Spot.app` for Apple Silicon (with `cargo build --profile dist`: the fully
+optimized build, which `bundle.sh` skips to rebuild in seconds) and publishes the release
 with the tag's message as its notes (a tag without one fails the release); `install.sh` always
 fetches the latest one. Pushes to master also build (no release) to keep the Rust cache warm;
 changes to only `.md` files skip CI.

@@ -1,59 +1,63 @@
-// The main window: a quiet frame (sidebar, list, player) on near-neutral surfaces, with the color
-// coming from the music: each list's header takes its covers' colors, the player its song's.
+// The main window: a quiet, near-monochrome frame (sidebar, list, player) where the covers are
+// the only color, and one accent, taken from the playing cover, marks what's playing.
 
 use rune::{Color, Cursor, Cx, El, Phase, PopupItem, PopupMenu, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
 
-use super::{Ui, icons, player, rows};
+use super::{Ui, artist, icons, player, rows};
 use crate::*;
 
 pub const ROW: f32 = 50.0; // a song's row (with its cover)
 pub const LINK_ROW: f32 = 46.0;
-const HERO_ART: f32 = 112.0;
+const HERO_ART: f32 = 76.0;
 
 pub const fn ts(size: f32, weight: f32) -> TextStyle {
     TextStyle::new(size, weight)
 }
-pub const TITLE: TextStyle = ts(30.0, 760.0).lh(36.0).tracking(-0.6);
+pub const TITLE: TextStyle = ts(24.0, 720.0).lh(30.0).tracking(-0.4);
 pub const BODY: TextStyle = ts(13.0, 450.0).lh(17.0);
 pub const BODY_MED: TextStyle = ts(13.0, 560.0).lh(17.0);
 pub const SMALL: TextStyle = ts(12.0, 450.0).lh(16.0);
-pub const LABEL: TextStyle = ts(10.5, 650.0).lh(13.0).tracking(0.9);
+pub const LABEL: TextStyle = ts(9.5, 600.0).lh(13.0).tracking(1.4);
+/// Numbers, times and dates: the window's own face, with tabular figures so columns of them line up.
 pub const NUM: TextStyle = ts(12.0, 450.0).lh(16.0).features("'tnum' 1");
 
-/// Right angle for `linear_gradient`: CSS degrees as radians.
-pub fn deg(d: f32) -> f32 {
-    d.to_radians()
-}
-
-/// A button that's just an icon: quiet until hovered, with a tooltip saying what it does.
+/// A button that's just an icon: quiet (a little faded) until hovered, with a tooltip saying what
+/// it does.
 pub fn icon_button(key: &str, i: &'static rune::Icon, size: f32, color: Color, th: &Theme, help: &str, f: impl Fn(&mut Ui) + 'static) -> El {
     row().key(key.to_string()).size(size + 14.0, size + 14.0).center().radius((size + 14.0) / 2.0)
-        .hover(th.text.alpha(0.08)).cursor(Cursor::Pointer).press_scale(0.9)
+        .hover(th.text.alpha(0.06)).hover_group().cursor(Cursor::Pointer).press_scale(0.9)
         .help(help.to_string()).label(help.to_string())
         .on_press_tx(move |ui: &mut Ui, tx| {
             f(ui);
             ui.after(tx);
         })
-        .child(icon(i, size).color(color))
+        .child(icon(i, size).color(color).group_opacity(0.75, 1.0))
 }
 
 /// A cover, or its stand-in while there's none.
 pub fn cover(key: String, image: Option<&rune::Image>, size: f32, radius: f32, th: &Theme, fallback: &'static rune::Icon) -> El {
-    let base = el().key(key).size(size, size).radius(radius).clip_rounded(radius);
+    let base = el().key(key).size(size, size).radius(radius).clip_rounded(radius).fill(th.wash);
     match image {
-        Some(i) => base.fill(th.wash).pixels_fit(i.pixels(), SurfaceFit::Fill),
-        None => base.fill(th.wash).center().child(icon(fallback, size * 0.4).color(th.dim)),
+        Some(i) => base.pixels_fit(i.pixels(), SurfaceFit::Fill),
+        None => base.center().child(icon(fallback, size * 0.4).color(th.dim)),
     }
 }
 
-/// A tile in two colors for what has no art: a playlist, a show, an artist.
-pub fn swatch_tile(key: String, (a, b): (Color, Color), size: f32, radius: f32, glyph: Option<&'static rune::Icon>) -> El {
-    let mut t = row().key(key).size(size, size).radius(radius).center()
-        .fill(a).linear_gradient(deg(135.0), [(0.0, a), (1.0, b)]);
+/// A plain tile for what has no art (a playlist, a show, an artist): a flat square
+/// with a quiet glyph, so the covers stay the only color on screen.
+pub fn tile(key: String, size: f32, radius: f32, glyph: Option<&'static rune::Icon>, th: &Theme) -> El {
+    let mut t = row().key(key).size(size, size).radius(radius).center().fill(th.wash).border(1.0, th.line);
     if let Some(g) = glyph {
-        t = t.child(icon(g, size * 0.5).color(Color::WHITE.alpha(0.92)));
+        t = t.child(icon(g, (size * 0.48).max(11.0)).color(th.sub));
     }
     t
+}
+
+/// Liked Songs keeps its recognizable cover in both the sidebar and the list header.
+fn liked_cover(key: &str, size: f32, radius: f32) -> El {
+    row().key(key.to_string()).size(size, size).radius(radius).clip_rounded(radius).center()
+        .linear_gradient(135.0_f32.to_radians(), [(0.0, crate::theme::rgb(0x450af5)), (1.0, crate::theme::rgb(0xc4efd9))])
+        .child(icon(&icons::HEART, size * 0.72).color(Color::WHITE))
 }
 
 /// Three bars, the mark for what's playing: the accent while it plays, faded while paused. They
@@ -69,9 +73,10 @@ pub fn eq(color: Color, playing: bool, key: &str) -> El {
 pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     DARK.store(cx.system_dark(), std::sync::atomic::Ordering::Relaxed);
     let th = theme(cx.system_dark());
+    let pane = if ui.prefs.open { super::prefs::page(ui, &th) } else { main_pane(ui, &th, cx) };
     let body = row().key("body").w_full().grow(1.0).min_h(0.0)
         .child(sidebar(ui, &th))
-        .child(main_pane(ui, &th, cx));
+        .child(pane);
     let mut root = col().key("root").w_full().h_full().fill(th.bg)
         .child(body)
         .child(player::player(ui, &th));
@@ -80,9 +85,6 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     }
     if ui.app.help {
         root = root.child(help(&th));
-    }
-    if ui.prefs.open {
-        root = root.child(super::prefs::page(ui, &th));
     }
     root
 }
@@ -116,10 +118,8 @@ fn playlist_menu(ui: &Ui, i: usize, at: rune::PopupAnchor, tx: &mut rune::Tx) {
             }
             Some("pin") => ui.app.toggle_pin(i),
             Some("copy") => {
-                if let Some(id) = ui.app.playlists.get(i).and_then(|p| p.id.clone()) {
-                    tx.copy(format!("https://open.spotify.com/playlist/{id}"));
-                    ui.app.note = Some(("link copied".into(), Instant::now() + Duration::from_millis(1500)));
-                }
+                let uri = ui.app.playlists.get(i).map(Playlist::uri);
+                rows::copy_link(&mut ui.app, tx, uri);
             }
             _ => {}
         }
@@ -130,41 +130,56 @@ fn playlist_menu(ui: &Ui, i: usize, at: rune::PopupAnchor, tx: &mut rune::Tx) {
 fn sidebar(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
     let focused = a.focus == Focus::Playlists;
+    // the tabs: the open one in full weight and white, the other grey
     let tab = |label: &'static str, on: bool, podcasts: bool| {
-        col().key(format!("tab-{label}")).gap(5.0).cursor(Cursor::Pointer)
+        row().key(format!("tab-{label}")).cursor(Cursor::Pointer).hover_group()
             .on_press_tx(move |ui: &mut Ui, tx| {
+                ui.prefs.open = false;
                 if ui.app.podcasts != podcasts {
                     ui.app.toggle_podcasts();
                 }
                 ui.after(tx);
             })
-            .child(text(label).font(ts(13.0, if on { 650.0 } else { 550.0 })).color(if on { th.text } else { th.dim }))
-            .child(el().key("under").h(2.0).w_full().radius(1.0).fill(if on { th.accent } else { Color::TRANSPARENT }))
+            .child(text(label).font(ts(13.0, if on { 650.0 } else { 500.0 })).color(if on { th.text } else { th.dim }).group_color(th.text))
     };
-    let tabs = row().key("side-tabs").px(18.0).gap(18.0)
+    let tabs = row().key("side-tabs").px(18.0).gap(16.0)
         .child(tab("Playlists", !a.podcasts, false))
         .child(tab("Podcasts", a.podcasts, true));
     let playing_key = a.queue.as_ref().map(|q| q.key.as_str());
     let row_for = |i: usize, name: &str, key: &str, tile: El, selected: bool, pinned: bool| {
         let open = a.view.key == key;
         let playing = Some(key) == playing_key;
-        let fill = if selected && focused { th.sel } else if open { th.wash } else { Color::TRANSPARENT };
-        let mut r = row().key(format!("side-{i}")).h(32.0).w_full().px(8.0).gap(10.0).center_y().radius(8.0)
-            .fill(fill).hover(th.text.alpha(0.05)).cursor(Cursor::Pointer)
+        let key_owned = key.to_string();
+        // the open list and the keyboard's cursor are lit as the song list's cursor is
+        let fill = if open || (selected && focused) { th.sel } else { Color::TRANSPARENT };
+        let mut r = row().key(format!("side-{i}")).h(32.0).w_full().px(8.0).gap(10.0).center_y().radius(7.0)
+            .fill(fill).hover(if open { th.sel } else { th.wash }).hover_group().cursor(Cursor::Pointer)
             .on_press_tx(move |ui: &mut Ui, tx| {
+                ui.prefs.open = false;
                 ui.app.focus = Focus::Playlists;
                 if ui.app.podcasts { ui.app.sh_state.select(Some(i)) } else { ui.app.pl_state.select(Some(i)) }
                 ui.app.enter();
                 ui.after(tx);
             })
+            // a double click shuffles it and plays (the first click has opened it)
+            .on_double_press_tx(move |ui: &mut Ui, tx| {
+                ui.prefs.open = false;
+                ui.app.focus = Focus::Playlists;
+                if ui.app.podcasts { ui.app.sh_state.select(Some(i)) } else { ui.app.pl_state.select(Some(i)) }
+                if ui.app.view.key != key_owned {
+                    ui.app.enter();
+                }
+                ui.app.shuffle_play_view();
+                ui.after(tx);
+            })
+            // drawn as the song list's rows are: the highlight marks the open list, the bars the playing one
             .child(tile)
-            .child(text(name.to_string()).font(if open || playing { BODY_MED } else { BODY })
-                .color(if playing { th.accent } else if open { th.text } else { th.sub }).truncate().grow(1.0).shrink()
+            .child(text(name.to_string()).font(BODY).color(th.text).truncate().grow(1.0).shrink()
                 .help_when_truncated(name.to_string()));
         if playing {
             r = r.child(eq(th.accent, a.playing, &format!("side-eq-{i}")));
         } else if pinned {
-            r = r.child(icon(&icons::PIN, 12.0).color(th.dim));
+            r = r.child(icon(&icons::PIN, 12.0).color(th.sub));
         }
         r
     };
@@ -172,24 +187,23 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
     if a.podcasts {
         for (i, s) in a.shows.iter().enumerate() {
             let pinned = !is_show(&s.uri);
-            let tile = if pinned {
-                let ic = if s.uri == NEW_KEY { &icons::SPARK } else { &icons::QUEUE };
-                swatch_tile("t".into(), (th.accent, th.accent2), 20.0, 6.0, Some(ic))
-            } else {
-                swatch_tile("t".into(), swatch(&s.name, th), 20.0, 6.0, Some(&icons::MIC))
+            let ic = if !pinned { &icons::MIC } else if s.uri == NEW_KEY { &icons::SPARK } else { &icons::QUEUE };
+            let tile = match s.image.as_deref().map(art::small).and_then(|u| ui.thumb(&u)) {
+                Some(img) => cover("t".into(), Some(&img), 20.0, 4.0, th, ic),
+                None => tile("t".into(), 20.0, 5.0, Some(ic), th),
             };
             list = list.child(row_for(i, &s.name, &s.uri, tile, a.sh_state.selected() == Some(i), false));
         }
     } else {
         for (i, p) in a.playlists.iter().enumerate() {
             let liked = p.id.is_none();
-            let name = if liked { "Liked Songs" } else { p.name.as_str() };
+            let name = if liked { "Liked Songs" } else if p.name.trim().is_empty() { "Untitled playlist" } else { p.name.as_str() };
             let tile = if liked {
-                swatch_tile("t".into(), (th.pink, th.accent), 20.0, 6.0, Some(&icons::HEART))
+                liked_cover("t", 20.0, 5.0)
             } else {
                 match p.image.as_deref().and_then(|u| ui.thumb(u)) {
-                    Some(img) => cover("t".into(), Some(&img), 20.0, 5.0, th, &icons::NOTE),
-                    None => swatch_tile("t".into(), swatch(&p.name, th), 20.0, 6.0, None),
+                    Some(img) => cover("t".into(), Some(&img), 20.0, 4.0, th, &icons::NOTE),
+                    None => tile("t".into(), 20.0, 5.0, Some(&icons::NOTE), th),
                 }
             };
             let pinned = a.is_pinned(p);
@@ -201,26 +215,6 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
         }
     }
     let scroller = col().key("side-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0).child(list);
-
-    // the themes, as dots: click one to wear it
-    let current = FAMILY.load(std::sync::atomic::Ordering::Relaxed).min(families().len() - 1);
-    let mut dots = row().key("dots").gap(7.0).center_y();
-    for i in 0..families().len() {
-        let on = i == current;
-        let c = family_accent(i, th.dark);
-        dots = dots.child(row().key(format!("dot-{i}")).size(16.0, 16.0).radius(8.0).center().cursor(Cursor::Pointer)
-            .border(1.5, if on { c } else { Color::TRANSPARENT }).press_scale(0.8)
-            .help(families()[i].0.clone())
-            .on_press_tx(move |ui: &mut Ui, tx| {
-                set_family(i);
-                ui.after(tx);
-            })
-            .child(el().key("d").size(8.0, 8.0).radius(4.0).fill(c)));
-    }
-    let footer = row().key("side-foot").w_full().h(44.0).px(14.0).gap(8.0).center_y()
-        .child(dots).child(spacer())
-        .child(icon_button("keys", &icons::KEYS, 16.0, th.dim, th, "Keyboard shortcuts  ?", |ui| ui.app.help = true))
-        .child(icon_button("prefs", &icons::GEAR, 16.0, th.dim, th, "Settings  ⌘,", |ui| ui.prefs.show()));
 
     let rule = el().key("side-rule").pin(None, Some(0.0), Some(0.0), Some(0.0)).w(1.0).fill(th.line);
     // the edge drags the sidebar wider or narrower
@@ -235,10 +229,8 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
     col().key("sidebar").w(ui.side_w).h_full().fill(th.side)
         .child(row().key("side-drag").w_full().h(52.0).window_drag())
         .child(tabs)
-        .child(el().h(12.0))
+        .child(el().h(10.0))
         .child(scroller)
-        .child(el().key("foot-rule").h(1.0).mx(14.0).fill(th.line))
-        .child(footer)
         .child(rule)
         .child(grip)
 }
@@ -260,43 +252,35 @@ fn kicker(key: &str) -> &'static str {
     }
 }
 
-/// The colors and art over a list: the covers it opens with, or what stands in for them.
-fn hero_art(ui: &Ui, th: &Theme) -> (El, Color, Color) {
+/// The art over a list: its cover, the first four albums in it as a square, or a plain tile.
+fn hero_art(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
     let v = &a.view;
     let size = HERO_ART;
-    let r = 12.0;
-    let covers: Vec<&str> = {
-        let mut seen: Vec<&str> = vec![];
-        for t in v.tracks.iter() {
-            if let Some(c) = t.cover.as_deref()
-                && !seen.contains(&c)
-            {
-                seen.push(c);
-                if seen.len() == 4 {
-                    break;
-                }
-            }
-        }
-        seen
-    };
-    let tints: Vec<Color> = covers.iter().filter_map(|c| ui.thumb_and_tint(&art::small(c)).map(|(_, t)| cover_color(t, th))).collect();
-    let c1 = tints.first().copied();
-    let c2 = tints.get(1).copied().or(c1);
+    let r = 8.0;
     if v.key == "liked" {
-        return (swatch_tile("hero-art".into(), (th.pink, th.accent), size, r, Some(&icons::HEART)), th.pink, th.accent);
+        return liked_cover("hero-art", size, r);
+    }
+    if v.artist.is_some() {
+        let img = v.portrait.as_deref().and_then(|u| ui.thumb(&art::medium(u)));
+        return cover("hero-art".into(), img.as_ref(), size, size / 2.0, th, &icons::PERSON);
     }
     if v.key == QUEUE_KEY {
-        let now = ui.cover.as_ref().map(|(_, i)| i);
-        let tint = ui.tint.map(|t| cover_color(t, th)).unwrap_or(th.accent);
-        let art = match now {
+        return match ui.cover.as_ref().map(|(_, i)| i) {
             Some(i) => cover("hero-art".into(), Some(i), size, r, th, &icons::QUEUE),
-            None => swatch_tile("hero-art".into(), (th.accent, th.accent2), size, r, Some(&icons::QUEUE)),
+            None => tile("hero-art".into(), size, r, Some(&icons::QUEUE), th),
         };
-        return (art, tint, th.accent2);
+    }
+    let mut covers: Vec<&str> = vec![];
+    for c in v.tracks.iter().filter_map(|t| t.cover.as_deref()) {
+        if !covers.contains(&c) {
+            covers.push(c);
+            if covers.len() == 4 {
+                break;
+            }
+        }
     }
     if v.kind != Kind::Tracks || covers.is_empty() {
-        let pair = swatch(&v.title, th);
         let glyph = match v.kind {
             Kind::Artists => &icons::PERSON,
             Kind::Shows => &icons::MIC,
@@ -305,10 +289,10 @@ fn hero_art(ui: &Ui, th: &Theme) -> (El, Color, Color) {
             Kind::Tracks if is_episodes(&v.key) => &icons::MIC,
             Kind::Tracks => &icons::NOTE,
         };
-        return (swatch_tile("hero-art".into(), pair, size, r, Some(glyph)), pair.0, pair.1);
+        return tile("hero-art".into(), size, r, Some(glyph), th);
     }
     let one = covers.len() < 4 || v.key.starts_with("spotify:album:") || is_episodes(&v.key);
-    let art = if one {
+    if one {
         let img = ui.thumb(&art::medium(covers[0])).or_else(|| ui.thumb(&art::small(covers[0])));
         cover("hero-art".into(), img.as_ref(), size, r, th, &icons::NOTE)
     } else {
@@ -318,8 +302,7 @@ fn hero_art(ui: &Ui, th: &Theme) -> (El, Color, Color) {
         col().key("hero-art").size(size, size).radius(r).clip_rounded(r)
             .child(row().key("m-top").child(cell(0)).child(cell(1)))
             .child(row().key("m-bot").child(cell(2)).child(cell(3)))
-    };
-    (art, c1.unwrap_or(th.accent), c2.unwrap_or(th.accent2))
+    }
 }
 
 fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
@@ -331,10 +314,19 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         top = top.child(icon_button("back", &icons::BACK, 18.0, th.sub, th, "Back  esc", |ui| ui.app.back()));
     }
     top = top.child(spacer());
-    if a.find.is_some() {
-        top = top.child(find_field(ui, th));
+    // one field: ⌘F turns it to finding in the open list, until esc or it's left empty
+    top = top.child(if ui.finding() { find_field(ui, th) } else { search_field(ui, th) });
+    if v.info.is_some() && !(a.input.is_some() || a.live_search) {
+        // the bar floats over the header's backdrop, and takes the window's color (and a
+        // hairline) once the page scrolls under it
+        let bar_bg = col().key("top-bg").pin(Some(0.0), Some(0.0), Some(0.0), None).live_opacity(&ui.scrolled)
+            .child(el().key("top-fill").w_full().h(artist::TOP_BAR).fill(th.bg))
+            .child(el().key("top-rule").w_full().h(1.0).fill(th.line));
+        return col().key("main").grow(1.0).shrink().h_full().min_w(0.0)
+            .child(artist::overview(ui, th, cx))
+            .child(bar_bg)
+            .child(top.pin(Some(0.0), Some(0.0), Some(0.0), None));
     }
-    top = top.child(search_field(ui, th));
 
     // title, and what's in it
     let tracks = v.kind == Kind::Tracks;
@@ -345,7 +337,7 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         String::new()
     } else if tracks {
         let ms = v.tracks.iter().map(|t| t.ms).sum();
-        format!("{}  ·  {}", plural(v.len(), if episodes { "episode" } else { "song" }), hours(ms))
+        format!("{} · {}", plural(v.len(), if episodes { "episode" } else { "song" }), hours(ms))
     } else {
         let what = match v.kind {
             Kind::Artists => "artist",
@@ -359,31 +351,46 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         };
         plural(v.len(), what)
     };
-    let meta = if v.loading && v.len() > 0 { format!("{meta}  ·  loading…") } else { meta };
-    let (art, c1, c2) = hero_art(ui, th);
+    let meta = if v.loading && v.len() > 0 { format!("{meta} · loading…") } else { meta };
+    // a flat header: the art, then what it is, its title, and a line of what's in it with the
+    // things to do with it
     let title = v.title.trim_start_matches(['♥', ' ']).to_string();
-    let mut words = col().key("hero-words").grow(1.0).shrink().min_w(0.0).gap(4.0)
-        .child(text(kicker(&v.key).to_uppercase()).key("kicker").font(LABEL).color(c1.mix(th.text, 0.35)))
+    let mut line = row().key("hero-line").gap(14.0).center_y().min_w(0.0);
+    if let Some(by) = &v.by {
+        // an album's artist, as Spotify puts it: first on the line, and a way to their page
+        let name = text(by.names.clone()).font(ts(12.0, 650.0)).color(th.text).truncate();
+        let el = match by.artist.clone() {
+            Some((uri, n)) => row().key("by").min_w(0.0).shrink().hover_group().cursor(Cursor::Pointer).help("Go to artist")
+                .on_press_tx(move |ui: &mut Ui, tx| {
+                    ui.app.open_artist(uri.clone(), n.clone());
+                    ui.after(tx);
+                })
+                .child(name.group_color(th.text.alpha(0.75))),
+            None => row().key("by").min_w(0.0).shrink().child(name),
+        };
+        line = line.child(row().key("by-meta").gap(6.0).center_y().min_w(0.0).shrink()
+            .child(el)
+            .child(text("·").font(SMALL).color(th.sub))
+            .child(text(meta).key("meta").font(SMALL).color(th.sub).shrink().truncate()));
+    } else {
+        line = line.child(text(meta).key("meta").font(SMALL).color(th.sub).shrink().truncate());
+    }
+    if tracks && v.len() > 0 {
+        line = line.child(hero_actions(ui, th));
+    }
+    let mut words = col().key("hero-words").grow(1.0).shrink().min_w(0.0).gap(2.0)
+        .child(text(kicker(&v.key).to_uppercase()).key("kicker").font(LABEL).color(th.dim))
         .child(text(title.clone()).key("title").font(TITLE).color(th.text).truncate().help_when_truncated(title))
-        .child(text(meta).key("meta").font(SMALL).color(th.sub));
+        .child(line);
     if a.input.is_some() || a.live_search {
         words = words.child(kinds(ui, th));
+    } else if v.is_grid() {
+        words = words.child(row().key("chips-pad").pt(8.0).child(artist::release_chips(ui, th)));
     }
-    let mut hero_row = row().key("hero-row").w_full().px(28.0).pb(20.0).gap(22.0).items_end()
-        .child(art.shadow(10.0, 34.0, c1.alpha(if th.dark { 0.45 } else { 0.35 })).transition(Transition::blur_replace()))
+    let hero_row = row().key("hero-row").w_full().px(28.0).pt(2.0).pb(18.0).gap(18.0).items_end()
+        .child(hero_art(ui, th).transition(Transition::blur_replace()))
         .child(words);
-    if tracks && v.len() > 0 {
-        hero_row = hero_row.child(hero_actions(ui, th, c1, c2));
-    }
-    // the covers' colors, washed down from the top of the list and fading out before the rows
-    let (s1, s2) = if th.dark { (0.34, 0.22) } else { (0.30, 0.20) };
-    let wash = el().key("hero-wash").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .linear_gradient(deg(180.0), [(0.0, c1.alpha(s1)), (0.7, c1.alpha(s1 * 0.25)), (1.0, c1.alpha(0.0))])
-        .motion(rune::Spring::new(0.8, 0.0));
-    let glint = el().key("hero-glint").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .radial_gradient([0.92, 0.0], [520.0, 260.0], [(0.0, c2.alpha(s2)), (1.0, c2.alpha(0.0))])
-        .motion(rune::Spring::new(0.8, 0.0));
-    let hero = col().key("hero").w_full().child(wash).child(glint).child(top).child(hero_row);
+    let hero = col().key("hero").w_full().child(top).child(hero_row);
 
     let list: El = if v.len() == 0 && !v.loading && !v.key.is_empty() {
         col().key("empty").w_full().grow(1.0).center().gap(10.0)
@@ -391,6 +398,8 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
             .child(text(if a.find.is_some() { "nothing matches" } else { "nothing here yet" }).font(BODY).color(th.dim))
     } else if tracks {
         rows::track_list(ui, th, cx)
+    } else if v.is_grid() {
+        artist::grid(ui, cx)
     } else {
         rows::link_list(ui, th)
     };
@@ -398,26 +407,19 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         .child(hero).child(list)
 }
 
-/// Play the list, or play it shuffled; and find in it.
-fn hero_actions(ui: &Ui, th: &Theme, c1: Color, c2: Color) -> El {
+/// Play the list: an outlined button in white and grey, not a filled one, so the accent stays
+/// the playing song's. Sorting is the date column's header; finding, the search field's ⌘F.
+fn hero_actions(ui: &Ui, th: &Theme) -> El {
     let playing_here = ui.app.queue.as_ref().is_some_and(|q| q.key == ui.app.view.key) && ui.app.want_play;
-    let play = row().key("hero-play").size(48.0, 48.0).radius(24.0).center().cursor(Cursor::Pointer).press_scale(0.9)
-        .fill(th.accent).linear_gradient(deg(135.0), [(0.0, th.accent), (1.0, c2.mix(th.accent, 0.35))])
-        .shadow(6.0, 22.0, c1.alpha(0.45))
+    let play = row().key("hero-play").size(30.0, 30.0).radius(15.0).center().cursor(Cursor::Pointer).press_scale(0.9)
+        .border(1.0, th.text.alpha(0.3)).hover(th.text.alpha(0.08))
         .help(if playing_here { "Pause  space" } else { "Play  P" }).label("Play")
         .on_press_tx(move |ui: &mut Ui, tx| {
             if playing_here { ui.app.toggle() } else { ui.app.play_from_view(None) }
             ui.after(tx);
         })
-        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 22.0).color(th.on_accent));
-    let shuffled = icon_button("hero-shuffle", &icons::SHUFFLE, 18.0, th.sub, th, "Shuffle play", |ui| {
-        if !ui.app.shuffle {
-            ui.app.toggle_shuffle();
-        }
-        ui.app.play_from_view(None);
-    });
-    let find = icon_button("hero-find", &icons::FIND, 18.0, th.sub, th, "Find in list  ⌘F", |ui| ui.open_find());
-    row().key("hero-actions").gap(6.0).center_y().child(find).child(shuffled).child(play)
+        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 14.0).color(th.text));
+    row().key("hero-actions").center_y().child(play)
 }
 
 /// A rounded text field. `wire` binds the input inside it (its edit, change and key handlers
@@ -425,11 +427,9 @@ fn hero_actions(ui: &Ui, th: &Theme, c1: Color, c2: Color) -> El {
 fn field(th: &Theme, key: &str, edit: &rune::TextEdit, w: f32, i: &'static rune::Icon, placeholder: &str, wire: impl FnOnce(El) -> El) -> El {
     let focused = edit.focused;
     row().key(format!("{key}-box")).w(w).h(30.0).px(10.0).gap(8.0).center_y().radius(15.0)
-        // solid enough that its words read over any cover's tint behind it
-        .fill(if focused { th.raised } else { th.raised.alpha(0.82) })
-        .border(1.0, if focused { th.accent.alpha(0.65) } else { th.line })
-        .shadow(1.0, if focused { 10.0 } else { 0.0 }, th.accent.alpha(if focused { 0.18 } else { 0.0 }))
-        .child(icon(i, 14.0).color(if focused { th.accent } else { th.dim }))
+        .fill(if focused { th.raised } else { th.wash })
+        .border(1.0, if focused { th.text.alpha(0.22) } else { th.line })
+        .child(icon(i, 14.0).color(if focused { th.text } else { th.dim }))
         .child(wire(text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).placeholder(placeholder.to_string(), th.sub)))
 }
 
@@ -449,9 +449,8 @@ fn search_field(ui: &Ui, th: &Theme) -> El {
             let took = ui.app.on_search_key(k);
             if matches!(k, Key::Esc) {
                 ui.search.clear();
-                tx.blur();
             }
-            if matches!(k, Key::Enter) {
+            if matches!(k, Key::Esc | Key::Enter) {
                 tx.blur();
             }
             ui.after(tx);
@@ -461,7 +460,7 @@ fn search_field(ui: &Ui, th: &Theme) -> El {
 
 fn find_field(ui: &Ui, th: &Theme) -> El {
     let shown = ui.app.shown().len();
-    let f = field(th, "find", &ui.find, 200.0, &icons::FIND, "Find in list", |f| {
+    let f = field(th, "find", &ui.find, 260.0, &icons::FIND, "Find in list", |f| {
         f.on_edit(|ui: &mut Ui| &mut ui.find)
             .on_input_change(|ui: &mut Ui, tx| {
                 let t = ui.find.text.clone();
@@ -492,15 +491,15 @@ fn kinds(ui: &Ui, th: &Theme) -> El {
     for k in [Kind::Tracks, Kind::Albums, Kind::Artists, Kind::Shows] {
         let on = ui.app.search_kind == k;
         r = r.child(row().key(format!("kind-{}", k.label())).h(26.0).px(12.0).center().radius(13.0)
-            .fill(if on { th.accent } else { th.text.alpha(0.07) })
-            .hover(if on { th.accent } else { th.text.alpha(0.11) })
+            .fill(if on { th.text } else { th.text.alpha(0.06) })
+            .hover(if on { th.text } else { th.text.alpha(0.1) })
             .cursor(Cursor::Pointer).press_scale(0.94)
             .on_press_tx(move |ui: &mut Ui, tx| {
                 ui.app.search_kind = k;
                 ui.app.search_at = Some(Instant::now());
                 ui.after(tx);
             })
-            .child(text(k.label()).font(ts(12.0, 600.0)).color(if on { th.on_accent } else { th.sub })));
+            .child(text(k.label()).font(ts(12.0, 600.0)).color(if on { th.bg } else { th.sub })));
     }
     r
 }
@@ -513,7 +512,7 @@ fn message(ui: &Ui, th: &Theme) -> Option<El> {
     let (s, c) = if !a.status.is_empty() {
         (a.status.clone(), th.err)
     } else if let Some((n, _)) = &a.note {
-        (n.clone(), th.accent)
+        (n.clone(), th.sub)
     } else if a.sess.borrow().is_none() {
         ("connecting…".to_string(), th.sub)
     } else {
@@ -547,13 +546,14 @@ fn help(th: &Theme) -> El {
         ("x", "queue: remove song"),
         ("m", "playlists / podcasts"),
         ("a  A", "album / artist"),
-        ("v", "artist: songs / releases"),
+        ("v", "artist: overview / songs / releases"),
         ("f", "releases: all / albums / singles"),
         ("esc", "back"),
         ("tab", "switch pane"),
         ("g  M  G", "top / middle / bottom"),
-        ("⌘T", "next theme"),
+        ("d", "playlist: sort by date added"),
         ("⌘,", "settings"),
+        ("⌘?", "these keys"),
         ("⌘W", "close (keeps playing)"),
         ("⌘Q", "quit"),
     ];
@@ -579,7 +579,7 @@ fn help(th: &Theme) -> El {
         .shadow(18.0, 60.0, Color::BLACK.alpha(if th.dark { 0.5 } else { 0.18 }))
         .transition(Transition::opacity().combined(Transition::offset(0.0, 10.0)))
         .child(row().key("help-head").gap(10.0).center_y()
-            .child(icon(&icons::KEYS, 18.0).color(th.accent))
+            .child(icon(&icons::KEYS, 18.0).color(th.sub))
             .child(text("Keys").font(ts(18.0, 700.0)).color(th.text))
             .child(spacer())
             .child(text("any key closes").font(SMALL).color(th.dim)))

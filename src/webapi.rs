@@ -31,7 +31,7 @@ impl Api {
                         return Err("Spotify login expired; restart spot to log in".into());
                     }
                     let _ = self.tx.send(Msg::Relogin(true));
-                    let r = self.relogin().await;
+                    let r = browser_login(self.oauth.clone(), &self.redirect).await;
                     let _ = self.tx.send(Msg::Relogin(false));
                     t.failed_login = r.is_err().then(Instant::now);
                     r?
@@ -46,10 +46,6 @@ impl Api {
             t.exp = n.expires_at;
         }
         Ok(t.access.clone())
-    }
-
-    pub async fn relogin(&self) -> Result<librespot_oauth::OAuthToken, String> {
-        browser_login(self.oauth.clone(), &self.redirect).await
     }
 
     pub async fn get(&self, url: &str) -> Result<Value, String> {
@@ -112,6 +108,7 @@ pub fn parse_track(v: &Value) -> Option<Track> {
         artist_id: id(&v["artists"][0]),
         disc: v["disc_number"].as_u64().unwrap_or(0) as u32,
         explicit: v["explicit"].as_bool().unwrap_or(false),
+        added: 0,
     })
 }
 
@@ -138,6 +135,7 @@ pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
         artist_id: 0,
         disc: 0,
         explicit: v["explicit"].as_bool().unwrap_or(false),
+        added: 0,
     })
 }
 
@@ -153,53 +151,45 @@ fn smallest_image(images: &Value) -> Option<String> {
     all.iter().filter(|i| width(i) >= 60).min_by_key(|i| width(i)).or(all.first())?["url"].as_str().map(String::from)
 }
 
+/// Every item of a paged Web API list, a page at a time.
+async fn each_item(api: &Api, url: String, mut each: impl FnMut(&Value)) -> Result<(), String> {
+    let mut url = Some(url);
+    while let Some(u) = url {
+        let v = api.get(&u).await?;
+        v["items"].as_array().into_iter().flatten().for_each(&mut each);
+        url = v["next"].as_str().map(String::from);
+    }
+    Ok(())
+}
+
 pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
     let mut out = vec![liked()];
-    let mut url = Some(format!("{API}/me/playlists?limit=50"));
-    while let Some(u) = url {
-        match api.get(&u).await {
-            Ok(v) => {
-                for p in v["items"].as_array().into_iter().flatten() {
-                    let Some(id) = p["id"].as_str() else { continue };
-                    out.push(Playlist {
-                        id: Some(id.into()),
-                        name: p["name"].as_str().unwrap_or("?").into(),
-                        image: smallest_image(&p["images"]),
-                        rank: out.len(),
-                    });
-                }
-                url = v["next"].as_str().map(String::from);
-            }
-            Err(e) => {
-                // keep showing the cached list
-                let _ = tx.send(Msg::Error(format!("playlists: {e}")));
-                return;
-            }
+    let r = each_item(&api, format!("{API}/me/playlists?limit=50"), |p| {
+        let Some(id) = p["id"].as_str() else { return };
+        out.push(Playlist { id: Some(id.into()), name: p["name"].as_str().unwrap_or("?").into(), image: smallest_image(&p["images"]), rank: out.len() });
+    });
+    match r.await {
+        Ok(()) => {
+            save_playlists(&out);
+            let _ = tx.send(Msg::Playlists(out));
         }
+        // keep showing the cached list
+        Err(e) => drop(tx.send(Msg::Error(format!("playlists: {e}")))),
     }
-    save_playlists(&out);
-    let _ = tx.send(Msg::Playlists(out));
 }
 
 /// The podcasts the user follows, for the sidebar.
 pub async fn load_shows(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
     let mut out = vec![];
-    let mut url = Some(format!("{API}/me/shows?limit=50"));
-    while let Some(u) = url {
-        match api.get(&u).await {
-            Ok(v) => {
-                out.extend(v["items"].as_array().into_iter().flatten().filter_map(|i| parse_link("show", &i["show"])));
-                url = v["next"].as_str().map(String::from);
-            }
-            Err(e) => {
-                // keep showing the cached list
-                let _ = tx.send(Msg::Error(format!("podcasts: {e}")));
-                return;
-            }
+    let r = each_item(&api, format!("{API}/me/shows?limit=50"), |i| out.extend(parse_link("show", &i["show"])));
+    match r.await {
+        Ok(()) => {
+            save_links(&shows_path(), &out);
+            let _ = tx.send(Msg::Shows(out));
         }
+        // keep showing the cached list
+        Err(e) => drop(tx.send(Msg::Error(format!("podcasts: {e}")))),
     }
-    save_links(&shows_path(), &out);
-    let _ = tx.send(Msg::Shows(out));
 }
 
 /// An album, artist, playlist or show search result.
@@ -219,7 +209,8 @@ pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
         _ => v["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
     };
     let single = v["album_type"] == "single";
-    Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single })
+    let image = v["images"].as_array().and_then(|i| i.first()?["url"].as_str()).map(String::from);
+    Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single, image })
 }
 
 /// Search Spotify for `n` results of a type (track, album, artist, playlist, show or episode), each page handed

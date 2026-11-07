@@ -35,10 +35,6 @@ impl Listen {
     }
 }
 
-pub fn unix_now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
-}
-
 /// Signed POST to the Last.fm API. Errors carry Last.fm's error code (0 = network / bad reply).
 pub async fn lastfm_call(
     http: &reqwest::Client,
@@ -98,45 +94,41 @@ pub fn lastfm_disconnect() {
 pub fn lastfm_connect(rt: &tokio::runtime::Handle, redirect: &str, tx: mpsc::Sender<Msg>) -> Result<Arc<LastFm>, String> {
     let (key, secret) = lastfm_creds().ok_or("add your API key and shared secret first")?;
     let http = reqwest::Client::new();
-    let token = lastfm_token(&key, redirect)?;
-    let v = rt.block_on(lastfm_call(&http, &key, &secret, "auth.getSession", vec![("token".into(), token)])).map_err(|(_, e)| e)?;
+    let sk = lastfm_login(rt, &http, &key, &secret, redirect)?;
+    Ok(LastFm::new(http, key, secret, sk, tx))
+}
+
+/// The browser login, then the session key it gives, saved for next time.
+fn lastfm_login(rt: &tokio::runtime::Handle, http: &reqwest::Client, key: &str, secret: &str, redirect: &str) -> Result<String, String> {
+    let token = lastfm_token(key, redirect)?;
+    let v = rt.block_on(lastfm_call(http, key, secret, "auth.getSession", vec![("token".into(), token)])).map_err(|(_, e)| e)?;
     let sk = v["session"]["key"].as_str().ok_or("no session key in reply")?.to_string();
     save_refresh(&session_path(), &sk);
-    Ok(LastFm::new(http, key, secret, sk, tx))
+    Ok(sk)
 }
 
 /// Scrobbling, if set up. Logs in through the browser the first time; a failed or skipped login
 /// just means no scrobbling this run.
 pub fn lastfm_setup(rt: &tokio::runtime::Runtime, http: &reqwest::Client, redirect: &str, tx: mpsc::Sender<Msg>) -> Option<Arc<LastFm>> {
     let (key, secret) = lastfm_creds()?;
-    let path = session_path();
-    let sk = match fs::read_to_string(&path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    let sk = match fs::read_to_string(session_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
         Some(sk) => sk,
         None if !std::io::stdin().is_terminal() => {
             log::warn!("last.fm isn't connected yet, and there's no terminal to ask in; not scrobbling");
             return None;
         }
-        None => {
-            let r = lastfm_token(&key, redirect).and_then(|token| {
-                let v = rt
-                    .block_on(lastfm_call(http, &key, &secret, "auth.getSession", vec![("token".into(), token)]))
-                    .map_err(|(_, e)| e)?;
-                v["session"]["key"].as_str().map(String::from).ok_or_else(|| "no session key in reply".into())
-            });
-            match r {
-                Ok(sk) => {
-                    save_refresh(&path, &sk);
-                    println!("Last.fm connected.\n");
-                    sk
-                }
-                Err(e) => {
-                    log::warn!("last.fm login: {e}");
-                    println!("Last.fm login {}; not scrobbling this time (SPOT_LASTFM=off stops asking).\n",
-                        if e == "skipped" { e } else { format!("failed ({e})") });
-                    return None;
-                }
+        None => match lastfm_login(rt.handle(), http, &key, &secret, redirect) {
+            Ok(sk) => {
+                println!("Last.fm connected.\n");
+                sk
             }
-        }
+            Err(e) => {
+                log::warn!("last.fm login: {e}");
+                println!("Last.fm login {}; not scrobbling this time (SPOT_LASTFM=off stops asking).\n",
+                    if e == "skipped" { e } else { format!("failed ({e})") });
+                return None;
+            }
+        },
     };
     Some(LastFm::new(http.clone(), key, secret, sk, tx))
 }
@@ -233,7 +225,6 @@ impl LastFm {
     pub fn queue(&self, l: &Listen) {
         use std::io::Write;
         let t = &l.track;
-        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
         let line = format!("{}\t{}\t{}\t{}\t{}\n", l.started, clean(lead_artist(t)), clean(&t.name), clean(&t.album), t.ms / 1000);
         log::info!("scrobble {} - {}", lead_artist(t), t.name);
         let _g = self.file.lock().unwrap_or_else(|e| e.into_inner());
@@ -272,7 +263,7 @@ impl LastFm {
                     Err((9, e)) => {
                         // session revoked on last.fm: log in again next start, keep the queue
                         log::warn!("last.fm session rejected: {e}");
-                        let _ = fs::remove_file(cache_dir().join("lastfm_session"));
+                        let _ = fs::remove_file(session_path());
                         let _ = self.tx.send(Msg::Status("Last.fm login was revoked; restart spot to log in again".into()));
                         return;
                     }

@@ -26,6 +26,7 @@ impl App {
                 self.history.remove(0);
             }
         }
+        self.refilter();
         self.tr_state = Sel::with(0);
     }
 
@@ -33,7 +34,8 @@ impl App {
         let Some((v, sel)) = self.history.pop() else { return };
         self.view = v;
         self.find = None;
-        self.tr_state = Sel::with(sel);
+        self.refilter();
+        self.tr_state = Sel::with(self.row_of(sel).unwrap_or(0));
         self.focus = Focus::Tracks;
     }
 
@@ -49,33 +51,36 @@ impl App {
         self.sess.borrow().clone()
     }
 
+    /// The list with view key `key` as last seen: the playing queue's copy, else the disk cache's.
+    fn cached_list(&self, key: &str) -> Arc<Vec<Track>> {
+        match &self.queue {
+            Some(q) if q.key == key => q.tracks.clone(),
+            _ => Arc::new(read_tracks(&tracks_path(&list_key(key)))),
+        }
+    }
+
+    /// Show `v` with `cached` at once, refreshed from `uri` in the background.
+    fn show_list(&mut self, mut v: View, uri: String, cached: Arc<Vec<Track>>) {
+        v.tracks = cached.clone();
+        v.loading = cached.is_empty();
+        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
+        self.show(v, true);
+    }
+
     /// Opens instantly from the disk cache (or the playing queue), then refreshes in the background.
     pub fn open_playlist(&mut self, i: usize) {
         let Some(pl) = self.playlists.get(i).cloned() else { return };
-        let key = pl.key();
-        let mut v = self.new_view(key.clone(), pl.name.clone(), Kind::Tracks);
-        v.tracks = match &self.queue {
-            Some(q) if q.key == key => q.tracks.clone(),
-            _ => Arc::new(read_tracks(&tracks_path(&key))),
-        };
-        v.loading = v.tracks.is_empty();
-        let cached = v.tracks.clone();
-        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, pl.uri(), cached));
-        self.show(v, true);
+        let cached = self.cached_list(&pl.key());
+        let v = self.new_view(pl.key(), pl.name.clone(), Kind::Tracks);
+        self.show_list(v, pl.uri(), cached);
     }
 
     /// A show's episodes, newest first; `want` is an episode to land on.
     pub fn open_show(&mut self, uri: String, name: String, want: Option<String>) {
         let mut v = self.new_view(uri.clone(), name, Kind::Tracks);
         v.want = want;
-        v.tracks = match &self.queue {
-            Some(q) if q.key == uri => q.tracks.clone(),
-            _ => Arc::new(read_tracks(&tracks_path(&list_key(&uri)))),
-        };
-        v.loading = v.tracks.is_empty();
-        let cached = v.tracks.clone();
-        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
-        self.show(v, true);
+        let cached = self.cached_list(&uri);
+        self.show_list(v, uri, cached);
         self.focus = Focus::Tracks;
     }
 
@@ -88,13 +93,18 @@ impl App {
         }
     }
 
+    /// Show songs already at hand (nothing to fetch), with the keyboard on them.
+    pub fn show_ready(&mut self, key: String, title: String, tracks: Arc<Vec<Track>>, back: bool) {
+        let mut v = self.new_view(key, title, Kind::Tracks);
+        v.tracks = tracks;
+        v.loading = false;
+        self.show(v, back);
+        self.focus = Focus::Tracks;
+    }
+
     /// `Continue listening`: episodes part way through, last played first.
     fn open_continuing(&mut self, title: String) {
-        let mut v = self.new_view(CONTINUE_KEY.into(), title, Kind::Tracks);
-        v.tracks = Arc::new(self.continuing.clone());
-        v.loading = false;
-        self.show(v, true);
-        self.focus = Focus::Tracks;
+        self.show_ready(CONTINUE_KEY.into(), title, Arc::new(self.continuing.clone()), true);
     }
 
     /// `New episodes`: instantly from the cache, less what's been heard since, then refreshed.
@@ -172,76 +182,14 @@ impl App {
         self.focus = Focus::Tracks;
     }
 
-    pub fn open_album(&mut self, uri: String, title: String, want: Option<String>) {
-        let mut v = self.new_view(uri.clone(), title, Kind::Tracks);
+    /// An album, titled by its name; `by` shows under it (the artist goes to their page).
+    pub fn open_album(&mut self, uri: String, name: String, by: By, want: Option<String>) {
+        let mut v = self.new_view(uri.clone(), name, Kind::Tracks);
         v.want = want;
-        v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
-        v.loading = v.tracks.is_empty();
-        let cached = v.tracks.clone();
-        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
-        self.show(v, true);
+        v.by = Some(by);
+        let cached = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
+        self.show_list(v, uri, cached);
         self.focus = Focus::Tracks;
-    }
-
-    /// Artist page in the current mode: every song (newest release first), or albums & singles.
-    pub fn artist_view(&mut self, uri: String, name: String) -> View {
-        let (title, kind) = if self.artist_songs {
-            (format!("{name} · all songs"), Kind::Tracks)
-        } else {
-            (format!("{name} · {}", self.releases.label()), Kind::Albums)
-        };
-        let mut v = self.new_view(uri.clone(), title, kind);
-        v.artist = Some(name);
-        v.filter = self.releases;
-        let (s, tx, id) = (self.sess.subscribe(), self.tx.clone(), v.id);
-        if self.artist_songs {
-            v.tracks = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
-            v.loading = v.tracks.is_empty();
-            self.rt.spawn(load_list(self.api.clone(), s, tx, id, uri, v.tracks.clone()));
-        } else {
-            let cached = read_links(&releases_path(&uri));
-            v.loading = cached.is_empty();
-            v.links = cached.iter().filter(|l| v.filter.keeps(l)).cloned().collect();
-            v.releases = cached.clone();
-            self.rt.spawn(artist_releases(s, tx, id, uri, cached));
-        }
-        v
-    }
-
-    pub fn open_artist(&mut self, uri: String, name: String) {
-        let v = self.artist_view(uri, name);
-        self.show(v, true);
-        self.focus = Focus::Tracks;
-    }
-
-    /// `v` on an artist page: switch between all songs and albums & singles (remembered).
-    pub fn toggle_artist_mode(&mut self) {
-        let Some(name) = self.view.artist.clone() else {
-            self.note = Some(("v works on artist pages".into(), Instant::now() + Duration::from_millis(1500)));
-            return;
-        };
-        self.artist_songs = !self.artist_songs;
-        let v = self.artist_view(self.view.key.clone(), name);
-        self.show(v, false);
-    }
-
-    /// `f` on an artist's releases: cycle all / albums / singles (remembered).
-    pub fn cycle_releases(&mut self) {
-        let Some(name) = self.view.artist.clone().filter(|_| self.view.kind == Kind::Albums) else {
-            let msg = if self.view.artist.is_some() { "f works on releases (v)" } else { "f works on artist pages" };
-            self.note = Some((msg.into(), Instant::now() + Duration::from_millis(1500)));
-            return;
-        };
-        let keep = self.selected_track().and_then(|i| self.view.links.get(i)).map(|l| l.uri.clone());
-        self.releases = self.releases.next();
-        let v = &mut self.view;
-        v.filter = self.releases;
-        v.title = format!("{name} · {}", v.filter.label());
-        v.links = v.releases.iter().filter(|l| v.filter.keeps(l)).cloned().collect();
-        let sel = keep.and_then(|u| v.links.iter().position(|l| l.uri == u)).unwrap_or(0);
-        self.find = None;
-        self.matches.clear();
-        self.tr_state = Sel::with(sel);
     }
 
     /// Open an album or artist from a search result or an artist's releases.
@@ -252,8 +200,12 @@ impl App {
             Kind::Shows => return self.open_show(l.uri, l.name, None),
             _ => {}
         }
-        let by = self.view.artist.as_ref().unwrap_or(&l.sub);
-        self.open_album(l.uri.clone(), format!("{} — {by}", l.name), None);
+        // an artist's releases are theirs; a search result's line starts with whose it is
+        let by = match &self.view.artist {
+            Some(name) => By { names: name.clone(), artist: Some((self.view.key.clone(), name.clone())) },
+            None => By { names: l.sub.split(" · ").next().unwrap_or_default().to_string(), artist: None },
+        };
+        self.open_album(l.uri.clone(), l.name.clone(), by, None);
     }
 
     /// What goto album/artist acts on: the highlighted song, else the one playing.
@@ -273,7 +225,8 @@ impl App {
             return self.goto_show(t);
         }
         let Some(uri) = id_uri("album", t.album_id) else { return };
-        self.open_album(uri, format!("{} — {}", t.album, t.artists), Some(t.uri));
+        let artist = id_uri("artist", t.artist_id).map(|u| (u, t.artists[..t.lead].to_string()));
+        self.open_album(uri, t.album.clone(), By { names: t.artists.clone(), artist }, Some(t.uri));
     }
 
     pub fn goto_artist(&mut self) {
@@ -292,6 +245,9 @@ impl App {
 
     /// Enter on a row: play a track (queueing the whole list) or open an album/artist.
     pub fn activate(&mut self, i: usize) {
+        if self.view.info.is_some() && i >= self.view.tracks.len() {
+            return self.open_card(i);
+        }
         if self.view.kind == Kind::Tracks { self.play_from_view(Some(i)) } else { self.open_link(i) }
     }
 }
@@ -301,20 +257,54 @@ impl App {
     pub fn shown(&self) -> Shown<'_> {
         match self.find.as_deref() {
             Some(q) if !q.is_empty() => Shown::Matches(&self.matches),
+            _ if !self.view.order.is_empty() => Shown::Matches(&self.view.order),
+            _ if self.view.info.is_some() => Shown::All(self.overview_len()),
             _ => Shown::All(self.view.len()),
         }
     }
 
-    /// Recompute the ctrl+f matches; call when the query or the open list changes.
+    /// The row a view index is listed at, if it's listed.
+    pub fn row_of(&self, i: usize) -> Option<usize> {
+        match self.shown() {
+            Shown::All(n) => (i < n).then_some(i),
+            Shown::Matches(m) => m.iter().position(|&j| j == i),
+        }
+    }
+
+    /// The open list is a playlist (or Liked Songs): its songs have dates added, and it sorts.
+    pub fn dated(&self) -> bool {
+        let v = &self.view;
+        v.kind == Kind::Tracks && (v.key == "liked" || self.playlists.iter().any(|p| p.id.as_deref() == Some(v.key.as_str())))
+    }
+
+    /// Recompute the sorted order and the ctrl+f matches; call when the query, the sort or the
+    /// open list changes.
     pub fn refilter(&mut self) {
+        self.view.order = if self.dated() { self.sort.order(&self.view.tracks) } else { vec![] };
         self.matches.clear();
         let Some(q) = self.find.as_deref().filter(|q| !q.is_empty()) else { return };
         let words: Vec<String> = q.to_lowercase().split_whitespace().map(String::from).collect();
         let view = &self.view;
-        self.matches.extend((0..view.len()).filter(|&i| {
+        let rows: Box<dyn Iterator<Item = usize>> = if view.order.is_empty() { Box::new(0..view.len()) } else { Box::new(view.order.iter().copied()) };
+        self.matches.extend(rows.filter(|&i| {
             let hay = view.haystack(i);
             words.iter().all(|w| hay.contains(w.as_str()))
         }));
+    }
+
+    /// Sort playlists as listed, newest added first, or oldest first; the cursor stays on its song.
+    pub fn set_sort(&mut self, s: Sort) {
+        let cur = self.selected_track();
+        self.sort = s;
+        let _ = fs::write(cache_dir().join("sort"), s.name());
+        self.refilter();
+        self.tr_state.select(cur.and_then(|i| self.row_of(i)).or(Some(0)));
+        let what = match s {
+            Sort::List => "as listed",
+            Sort::Newest => "newest added first",
+            Sort::Oldest => "oldest added first",
+        };
+        self.flash(format!("sorted {what}"));
     }
 
     /// Original track index under the cursor.

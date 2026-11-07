@@ -1,38 +1,35 @@
 // The window, drawn with Rune: the player lives in its state (`Ui::app`), on the main thread. A
 // driver thread hands it the player's messages (Web API pages, player events, `spot` commands,
 // media keys) and wakes it for its timers. Closing the window keeps everything running; ⌥Space
-// opens the quick search panel (panel.rs) from any app, and a song you didn't see start can
-// pop up at the top of the screen (toast.rs).
+// opens the quick search panel (panel.rs) from any app.
 
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering::Relaxed},
-    },
+    sync::Mutex,
 };
 
 use rune::{
     Align, AppHandle, AppSpec, Chrome, DisplayTarget, Image, ImageCache, KeyEvent, Live, LiveText, Mods,
-    OverlayHandle, OverlayPlacement, OverlaySpec, ScreenEdge, TextEdit, Tx, Waker, WindowOptions,
+    OverlayPlacement, ScreenEdge, TextEdit, Tx, Waker, WindowOptions,
     WindowSpec,
 };
 
 use crate::*;
 
+mod artist;
 mod icons;
+mod launcher;
+mod menus;
 mod panel;
 mod player;
 mod rows;
 mod prefs;
-mod toast;
 mod view;
 
 use panel::Panel;
-use toast::Toast;
 
-/// What's playing, as the panel and the popup show it.
+/// What's playing, as the panel shows it.
 #[derive(Clone)]
 pub struct Now {
     pub uri: String,
@@ -45,12 +42,16 @@ pub struct Now {
 }
 
 impl Now {
-    /// Whether the panel or popup would draw something else.
+    /// Whether the panel would draw something else.
     fn same(&self, o: &Now) -> bool {
         (&self.uri, self.playing, self.shuffle, self.repeat, self.cover.as_ref().map(Image::id))
             == (&o.uri, o.playing, o.shuffle, o.repeat, o.cover.as_ref().map(Image::id))
     }
 }
+
+/// SPOT_TIMING=1: trace opening and frame encoding, not physical display presentation.
+static TIMING: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var_os("SPOT_TIMING").is_some());
+static OPENED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// When the driver should next wake the player for its timers, and when it's waiting until.
 #[derive(Default)]
@@ -59,11 +60,10 @@ struct Wake {
     waiting: Option<Instant>,
 }
 
-/// The small covers on a list's rows, by url, with the color each is mostly made of: None while
-/// one is on its way (or failed).
+/// The small covers on a list's rows, by url: None while one is on its way (or failed).
 #[derive(Default)]
 pub struct Thumbs {
-    map: HashMap<String, Option<(Image, [f32; 3])>>,
+    map: HashMap<String, Option<Image>>,
     order: VecDeque<String>,
 }
 
@@ -77,7 +77,6 @@ pub struct Ui {
     pub find: TextEdit,
     images: Option<ImageCache>,
     pub cover: Option<(String, Image)>, // the playing song's cover, by url
-    pub tint: Option<[f32; 3]>,          // and its color
     pub thumbs: RefCell<Thumbs>,
     pub clock: LiveText, // where the song is, "1:23"
     pub bar: Live<[f32; 4]>, // the progress bar's fill: set each second, so the view doesn't run
@@ -90,10 +89,8 @@ pub struct Ui {
     pub focused: bool, // the window has the keyboard
     pub me: Option<AppHandle<Ui>>,
     panel: Option<AppHandle<Panel>>,
-    toast: Option<OverlayHandle<Toast>>,
-    toast_gen: Arc<AtomicU64>,
     wake: Arc<Mutex<Wake>>,
-    told: Option<Now>, // what the panel and popup last heard
+    told: Option<Now>, // what the panel last heard
     seen: (u64, bool, bool, Option<usize>), // view, focus, sidebar, cursor: scrolled to when it moves
 }
 
@@ -106,7 +103,6 @@ impl Ui {
             find: TextEdit::new(""),
             images: None,
             cover: None,
-            tint: None,
             thumbs: RefCell::default(),
             clock: LiveText::new("0:00"),
             bar: Live::new([0.0; 4]),
@@ -119,8 +115,6 @@ impl Ui {
             focused: false,
             me: None,
             panel: None,
-            toast: None,
-            toast_gen: Arc::default(),
             wake,
             told: None,
             seen: (0, false, false, None),
@@ -141,7 +135,6 @@ impl Ui {
         self.sync_bar();
         self.sync_clock();
         self.tell_now();
-        self.popup();
         self.scroll(tx);
         self.rearm();
     }
@@ -177,7 +170,7 @@ impl Ui {
     fn sync_cover(&mut self) {
         let Some(c) = &self.app.art.cover else {
             self.cover = None;
-            self.tint = None;
+            set_art(None);
             return;
         };
         if self.cover.as_ref().is_some_and(|(u, _)| *u == c.url) {
@@ -185,7 +178,7 @@ impl Ui {
         }
         if let Some(images) = &self.images {
             self.cover = Some((c.url.clone(), images.load(c.bytes.as_slice().to_vec())));
-            self.tint = Some(c.tint);
+            set_art(Some(c.tint)); // the window's one accent follows the playing cover
         }
     }
 
@@ -201,8 +194,8 @@ impl Ui {
             None => 0.0,
         };
         let w = (self.bar_w * ratio).round();
-        self.bar.set([0.0, 0.0, w, 4.0]);
-        self.knob.set([w - 6.0, -4.0, 12.0, 12.0]);
+        self.bar.set([0.0, 0.0, w, 2.0]);
+        self.knob.set([w - 5.0, -4.0, 10.0, 10.0]);
     }
 
     pub fn sync_clock(&mut self) {
@@ -226,7 +219,7 @@ impl Ui {
         })
     }
 
-    /// Tell the panel and the popup what's playing, when that's changed.
+    /// Tell the panel what's playing, when that's changed.
     fn tell_now(&mut self) {
         let now = self.now_info();
         let same = match (&now, &self.told) {
@@ -239,41 +232,8 @@ impl Ui {
         }
         self.told = now.clone();
         if let Some(p) = &self.panel {
-            let now = now.clone();
             p.update(move |p, _| p.now = now);
         }
-        if let Some(t) = &self.toast
-            && let Some(now) = now
-        {
-            t.update(move |t, _| t.now = Some(now));
-        }
-    }
-
-    /// A media key skipped, or (with popup = "track") a song started: say what's playing, at
-    /// the top of the screen, unless spot's window is in front already.
-    fn popup(&mut self) {
-        let m = std::mem::take(&mut self.app.moved);
-        let want = match self.app.settings.popup {
-            settings::Popup::Off => false,
-            settings::Popup::Skip => m.skipped,
-            settings::Popup::Track => m.skipped || m.track,
-        };
-        let panel_up = self.panel.as_ref().is_some_and(|p| p.is_visible());
-        if !want || self.focused || panel_up || self.app.now().is_none() {
-            return;
-        }
-        let Some(toast) = self.toast.clone() else { return };
-        toast.update(|t, _| t.shows += 1);
-        toast.show();
-        toast.fade_in(Duration::from_millis(180));
-        let generation = self.toast_gen.fetch_add(1, Relaxed) + 1;
-        let (gens, secs) = (self.toast_gen.clone(), self.app.settings.popup_seconds);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs_f64(secs));
-            if gens.load(Relaxed) == generation {
-                toast.fade_out(Duration::from_millis(320));
-            }
-        });
     }
 
     /// Keep the cursor in view when the keyboard moves it.
@@ -285,9 +245,17 @@ impl Ui {
         if seen == self.seen {
             return;
         }
+        if seen.0 != self.seen.0 {
+            self.scrolled.set(0.0); // a new page starts at its top
+        }
         self.seen = seen;
         if let Some(i) = sel {
-            tx.scroll_into_view(if side { format!("side-{i}") } else { format!("row-{i}") });
+            tx.scroll_into_view(match () {
+                _ if side => format!("side-{i}"),
+                // the discography's rows are lines of cards
+                _ if a.view.is_grid() => format!("line-{}", i / a.grid_cols.get().max(1)),
+                _ => format!("row-{i}"),
+            });
         }
     }
 
@@ -306,21 +274,15 @@ impl Ui {
 
     /// A row's small cover: fetched the first time it's asked for, None until it's here.
     pub fn thumb(&self, url: &str) -> Option<Image> {
-        self.thumb_and_tint(url).map(|(i, _)| i)
-    }
-
-    /// A small cover and its color.
-    pub fn thumb_and_tint(&self, url: &str) -> Option<(Image, [f32; 3])> {
         let mut t = self.thumbs.borrow_mut();
         if let Some(i) = t.map.get(url) {
             return i.clone();
         }
         if art::headless() {
             let got = art::fetch_blocking(self.app.rt.handle(), url).zip(self.images.as_ref()).map(|(bytes, images)| {
-                let tint = image::load_from_memory(&bytes).map_or([0.5; 3], |i| art::tint(&i));
                 let image = images.load(bytes);
                 let _ = image.wait();
-                (image, tint)
+                image
             });
             t.map.insert(url.to_string(), got.clone());
             return got;
@@ -336,12 +298,11 @@ impl Ui {
         self.app.rt.spawn(async move {
             let bytes = art::fetch_bytes(&url).await;
             if let (Some(me), Some(bytes)) = (me, bytes) {
-                let tint = image::load_from_memory(&bytes).map_or([0.5; 3], |i| art::tint(&i));
                 me.update(move |ui, _| {
                     let Some(images) = &ui.images else { return };
                     let image = images.load(bytes);
                     if let Some(slot) = ui.thumbs.get_mut().map.get_mut(&url) {
-                        *slot = Some((image, tint));
+                        *slot = Some(image);
                     }
                 });
             }
@@ -349,30 +310,65 @@ impl Ui {
         None
     }
 
+    /// Whether the top field finds in the open list (⌘F) rather than searching Spotify.
+    pub fn finding(&self) -> bool {
+        self.app.find.is_some() && (self.find.focused || !self.find.text.is_empty())
+    }
+
     pub fn focus_search(&mut self) {
+        if self.app.find.is_some() {
+            self.find.clear();
+            self.app.close_find();
+        }
+        self.find.focused = false;
         self.search.focused = true;
         self.app.help = false;
     }
 
     pub fn open_find(&mut self) {
+        // the overview has nothing to find in: find in every song the artist has
+        if self.app.view.info.is_some() {
+            self.app.open_artist_mode(ArtistMode::Songs, true);
+        }
         self.app.focus = Focus::Tracks;
         if self.app.find.is_none() {
             self.find.clear();
             self.app.set_find("");
         }
+        self.search.focused = false;
         self.find.focused = true;
     }
 
     /// ⌥Space: the quick search panel, on the screen the pointer's on; again, it goes away.
     pub fn toggle_panel(&mut self) {
+        let started = Instant::now();
         let Some(p) = &self.panel else { return };
-        if p.is_visible() {
+        let closing = p.is_visible();
+        if *TIMING {
+            *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) = (!closing).then_some(started);
+            let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+            eprintln!("timing: hotkey {} at {wall:.3}", if closing { "hide" } else { "show" });
+        }
+        if closing {
             p.hide();
             return;
         }
         let now = self.now_info();
-        p.update(move |p, _| p.opened(now));
-        p.place(DisplayTarget::UnderPointer, OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 180.0, align: Align::Center, inset: 0.0 });
+        let now_shown = now.is_some();
+        p.update(move |p, _| {
+            p.opened(now);
+            if *TIMING {
+                eprintln!("timing: panel state reset {:.1} ms after show hotkey", started.elapsed().as_secs_f64() * 1e3);
+            }
+        });
+        // where it was last dragged to, else near the top of the screen the pointer's on
+        match launcher::home() {
+            Some((x, y)) => {
+                let height = panel::opened_height(now_shown);
+                p.place(DisplayTarget::Primary, OverlayPlacement::Rect { x, y, width: panel::WIDTH, height });
+            }
+            None => p.place(DisplayTarget::UnderPointer, OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 180.0, align: Align::Center, inset: 0.0 }),
+        }
         p.show();
     }
 }
@@ -382,15 +378,24 @@ fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ui.prefs.open {
         // the page takes the keys, but for esc and the window's own (⌘Q, ⌘W)
         match &ev.key {
-            rune::Key::Escape => ui.prefs.open = false,
+            rune::Key::Escape => {
+                ui.prefs.open = false;
+                return true;
+            }
             rune::Key::Command('q' | 'w') => {}
-            _ => return !matches!(ev.key, rune::Key::Command(_)),
-        }
-        if matches!(ev.key, rune::Key::Escape) {
-            return true;
+            k => return !matches!(k, rune::Key::Command(_)),
         }
     }
     let took = match &ev.key {
+        // ⌘?: the keys (⇧/ on a US layout; the physical key elsewhere)
+        rune::Key::Command('?') => {
+            ui.app.help = !ui.app.help;
+            true
+        }
+        rune::Key::Command('/') if ev.mods.shift => {
+            ui.app.help = !ui.app.help;
+            true
+        }
         rune::Key::Command(',') => {
             ui.app.help = false;
             ui.prefs.show();
@@ -506,7 +511,7 @@ fn drive(rx: mpsc::Receiver<Msg>, ui: AppHandle<Ui>, wake: Arc<Mutex<Wake>>) {
     }
 }
 
-/// Run spot: the window (open now if `show`), the panel, the popup. Returns only to quit.
+/// Run spot: the window (open now if `show`) and the panel. Returns only to quit.
 pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>) {
     let hotkey = app.settings.hotkey.clone();
     let tx = app.tx.clone();
@@ -519,13 +524,18 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
         ..AppSpec::new("spot", (1120.0, 740.0), || unreachable!("built by init"), view::view)
     };
     let w = wake.clone();
-    let mut main = rune::App::new(spec)
+    let mut main = menus::items().into_iter().fold(rune::App::new(spec), rune::App::menu_item)
         .init(move || Ui::new(app, w))
         .keep_running()
         .accessory()
         .standard_menus()
         .chrome(Chrome { full_size_content: true, traffic_lights: Some((20.0, 22.0)), drag_regions: true })
-        .on_focus(|ui, focused, _| ui.focused = focused)
+        .on_focus(|ui, focused, _| {
+            ui.focused = focused;
+            if focused {
+                menus::tidy();
+            }
+        })
         .on_close(|ui, _| {
             if let Some(me) = &ui.me {
                 me.set_dock_icon(false);
@@ -546,8 +556,22 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
     let me = main.handle();
 
     let panel_spec = AppSpec { on_key: Some(panel::on_key), setup: Some(panel::setup), ..AppSpec::new("spot search", (640.0, 460.0), || unreachable!("given its state"), panel::view) };
-    let panel_app = rune::App::new(panel_spec).windowless().on_focus(|p, focused, tx| {
-        if !focused {
+    let panel_app = rune::App::new(panel_spec).windowless().on_frame_encoded(|f| {
+        if *TIMING && let Some(t) = *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) {
+            eprintln!("timing: panel frame #{} {:?} {:.1} ms after show hotkey; update_ms={:?} encode_ms={:?} (not display latency)",
+                f.seq(), f.outcome(), t.elapsed().as_secs_f64() * 1e3, f.update_ms(), f.encode_ms());
+        }
+    }).on_focus(|p, focused, tx| {
+        if *TIMING && let Some(t) = *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) {
+            eprintln!("timing: panel focus={focused} {:.1} ms after show hotkey", t.elapsed().as_secs_f64() * 1e3);
+        }
+        if focused {
+            launcher::focused();
+        } else {
+            launcher::closing();
+            if *TIMING {
+                *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
             p.closed();
             tx.close_window();
         }
@@ -555,20 +579,17 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
     let (panel, _) = main.window(
         WindowSpec::from_app("panel", panel_app)
             .state(Panel::new(tx.clone(), rt.clone()))
-            .configured_options(WindowOptions::launcher_panel().macos(|n| n.corner_radius(20.0).shadow(false))),
-    );
-    let toast = main.overlay(
-        OverlaySpec { name: "spot now playing", size: (460.0, 76.0), edge: ScreenEdge::Top, margin: 6.0, align: Align::Center, inset: 0.0, interactive: false, view: toast::view },
-        Toast::default(),
+            .configured_options(WindowOptions::launcher_panel().macos(|n| n.corner_radius(20.0).shadow(false).collection_behavior(launcher::BEHAVIOR))),
     );
 
-    let (h, p, t) = (me.clone(), panel.clone(), toast.clone());
+    let (h, p) = (me.clone(), panel.clone());
     me.update(move |ui, tx| {
         ui.me = Some(h.clone());
         ui.panel = Some(p.clone());
-        ui.toast = Some(t);
         if show {
-            h.set_dock_icon(true);
+            // an accessory app's first window opens without activating it (behind the app in
+            // front, its traffic lights grey): open() brings it to the front with the keyboard
+            ui.open_window();
         }
         ui.after(tx);
     });
@@ -577,6 +598,7 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
         p.me = Some(pm);
         p.main = Some(mm);
     });
+    launcher::watch_spaces(panel.clone());
     std::thread::spawn(move || drive(rx, me, wake));
     main.run();
     drop(lock);
@@ -593,7 +615,7 @@ pub fn problem(e: String) {
         col().w_full().h_full().fill(th.bg).padding(36.0).pt(56.0).gap(14.0).window_drag()
             .child(text("spot can't start").font(TextStyle::new(22.0, 650.0)).color(th.text))
             .child(text(why.to_string()).font(TextStyle::new(14.0, 400.0).lh(21.0)).color(th.sub).wrap())
-            .child(text("Open Terminal and run `spot` to set it up.").font(TextStyle::new(14.0, 500.0)).color(th.accent))
+            .child(text("Open Terminal and run `spot` to set it up.").font(TextStyle::new(14.0, 500.0)).color(th.text))
     }
     rune::App::new(AppSpec::new("spot", (520.0, 240.0), || (), view))
         .chrome(Chrome { full_size_content: true, traffic_lights: None, drag_regions: true })

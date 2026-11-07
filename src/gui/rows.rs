@@ -1,30 +1,65 @@
 // The open list's rows. Under the pointer a row shows what a click can do: its number turns into
 // a play button, and queue and "more" buttons come up by the time; a right click (or "more")
-// opens the system's menu for it. Artist and album names go to the artist and album.
+// opens the system's menu for it. Artist and album names go to the artist and album. Playlists
+// also list when each song was added, and sort by it from that column's head.
 
 use std::borrow::Cow;
 
 use rune::{Color, Cursor, Cx, El, GrowthSpec, PopupAnchor, PopupItem, PopupMenu, ScrollSpec, Tx, col, el, icon, memo, row, text};
 
-use super::view::{BODY, BODY_MED, LABEL, LINK_ROW, NUM, ROW, SMALL, cover, eq, swatch_tile, theme_now, ts};
+use super::view::{BODY, BODY_MED, LABEL, LINK_ROW, NUM, ROW, SMALL, cover, eq, theme_now, tile, ts};
 use super::{Ui, icons};
 use crate::*;
 
-/// Rows are wide enough for an album column.
-fn wide(cx: &mut Cx<Ui>) -> bool {
-    cx.layout_size("main").is_none_or(|s| s[0] >= 720.0)
+/// Rows are wide enough for an album column, and for a date added column.
+fn widths(cx: &mut Cx<Ui>) -> (bool, bool) {
+    let w = cx.layout_size("main").map_or(f32::MAX, |s| s[0]);
+    (w >= 720.0, w >= 600.0)
 }
 
+const DATE_W: f32 = 104.0;
+
 /// Point the cursor at row `r` of the list, as a click on it does.
-fn pick(ui: &mut Ui, r: usize) {
+pub(super) fn pick(ui: &mut Ui, r: usize) {
     ui.app.focus = Focus::Tracks;
     ui.app.tr_state.select(Some(r));
+}
+
+/// Row `r` of the list: lit while it's the cursor's, and a click puts the cursor there (a double
+/// click plays or opens it).
+fn pickable(e: El, r: usize, selected: bool, focused: bool, th: &Theme) -> El {
+    let fill = match (selected, focused) {
+        (true, true) => th.sel,
+        (true, false) => th.wash,
+        (false, _) => Color::TRANSPARENT,
+    };
+    e.fill(fill)
+        .on_press_tx(move |ui: &mut Ui, tx| {
+            pick(ui, r);
+            ui.after(tx);
+        })
+        .on_double_press_tx(move |ui: &mut Ui, tx| {
+            pick(ui, r);
+            ui.app.enter();
+            ui.after(tx);
+        })
+}
+
+/// Sort the playlist the next way: as listed, newest added, oldest added.
+pub fn next_sort(ui: &mut Ui, tx: &mut Tx) {
+    let next = ui.app.sort.next();
+    ui.app.set_sort(next);
+    ui.after(tx);
 }
 
 fn column_head(ui: &Ui, th: &Theme, cols: &[(&'static str, Option<f32>)]) -> El {
     let mut r = row().key("cols").w_full().h(28.0).px(26.0).gap(14.0).center_y();
     for (i, (label, w)) in cols.iter().enumerate() {
-        let t = text(label.to_uppercase()).font(LABEL).color(th.dim);
+        if *label == "date added" {
+            r = r.child(date_head(ui, th, w.unwrap_or(DATE_W)));
+            continue;
+        }
+        let t = text(label.to_uppercase()).font(LABEL).color(th.dim.alpha(0.8));
         let cell = match w {
             Some(w) => row().key(format!("col-{i}")).w(*w).child(if *label == "time" { row().w_full().justify_end().child(t) } else { t }),
             None => row().key(format!("col-{i}")).grow(1.0).shrink().min_w(0.0).child(t),
@@ -36,7 +71,21 @@ fn column_head(ui: &Ui, th: &Theme, cols: &[(&'static str, Option<f32>)]) -> El 
     col().key("cols-wrap").w_full().child(r).child(rule)
 }
 
-fn scroller(ui: &Ui, key: String, rows: El) -> El {
+/// The date added column's head: click to sort by it, newest first, then oldest, then as listed.
+fn date_head(ui: &Ui, th: &Theme, w: f32) -> El {
+    let s = ui.app.sort;
+    let on = s != Sort::List;
+    let mut r = row().key("col-date").w(w).h(20.0).gap(4.0).center_y().cursor(Cursor::Pointer).hover_group()
+        .help("Sort by date added  d")
+        .on_press_tx(next_sort)
+        .child(text("DATE ADDED").font(LABEL).color(if on { th.sub } else { th.dim.alpha(0.8) }).group_color(th.text));
+    if on {
+        r = r.child(icon(if s == Sort::Newest { &icons::DOWN } else { &icons::UP }, 9.0).color(th.sub));
+    }
+    r
+}
+
+pub(super) fn scroller(ui: &Ui, key: String, rows: El) -> El {
     let scrolled = ui.scrolled.clone();
     col().key(key).w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false })
         .scroll_edge_fade(16.0)
@@ -51,8 +100,9 @@ pub fn track_list(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     let v = &a.view;
     let episodes = is_episodes(&v.key);
     let feed = episodes && !is_show(&v.key);
-    let wide = wide(cx);
-    let mut cols: Vec<(&'static str, Option<f32>)> = vec![("#", Some(28.0)), ("", Some(34.0))];
+    let (wide, roomy) = widths(cx);
+    let dates = a.dated() && roomy;
+    let mut cols: Vec<(&'static str, Option<f32>)> = vec![("", Some(34.0))];
     if episodes {
         cols.push(("episode", None));
         if feed {
@@ -64,19 +114,22 @@ pub fn track_list(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         if wide {
             cols.push(("album", None));
         }
+        if dates {
+            cols.push(("date added", Some(DATE_W)));
+        }
         cols.extend([("", Some(56.0)), ("time", Some(44.0))]);
     }
     let n = a.shown().len();
     let rows = col().key("rows").w_full().px(14.0).pt(4.0).pb(24.0).growth(GrowthSpec::default())
-        .virtual_rows(n, ROW, |_: &Ui, r| Cow::Owned(format!("row-{r}")), move |ui: &Ui, r| track_row(ui, r, &theme_now(), wide))
-        .virtual_rows_version((v.id, a.find.is_some(), a.matches.len(), v.tracks.len()));
+        .virtual_rows(n, ROW, |_: &Ui, r| Cow::Owned(format!("row-{r}")), move |ui: &Ui, r| track_row(ui, r, &theme_now(), wide, dates))
+        .virtual_rows_version((v.id, a.find.is_some(), a.matches.len(), v.tracks.len(), a.sort));
     col().key("list").w_full().grow(1.0).min_h(0.0).child(column_head(ui, th, &cols)).child(scroller(ui, format!("list-{}", v.id), rows))
 }
 
 /// A row's little buttons: quiet, brighter under the pointer, a tooltip each.
 fn row_button(key: &str, i: &'static rune::Icon, th: &Theme, help: &str, f: impl Fn(&mut Ui, &mut Tx) + 'static) -> El {
     row().key(key.to_string()).size(26.0, 26.0).radius(13.0).center().cursor(Cursor::Pointer)
-        .hover(th.text.alpha(0.1)).press_scale(0.88).help(help.to_string()).label(help.to_string())
+        .hover(th.text.alpha(0.08)).press_scale(0.88).help(help.to_string()).label(help.to_string())
         .on_press_tx(move |ui: &mut Ui, tx| {
             f(ui, tx);
             ui.after(tx);
@@ -94,7 +147,7 @@ fn link_text(key: &str, s: String, font: rune::TextStyle, c: Color, hover: Color
         .child(text(s.clone()).font(font).color(c).group_color(hover).truncate().help_when_truncated(s))
 }
 
-fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
+pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) -> El {
     let a = &ui.app;
     let v = &a.view;
     let Some(i) = a.shown().get(r) else { return el().key(format!("row-{r}")).h(ROW) };
@@ -102,7 +155,7 @@ fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
     let episodes = is_episodes(&v.key);
     let feed = episodes && !is_show(&v.key);
     let up_next = v.key == QUEUE_KEY;
-    let playing_uri = a.queue.as_ref().filter(|q| q.key == v.key && a.queued.is_none()).and_then(|q| q.tracks.get(q.idx())).map(|t| t.uri.as_str());
+    let playing_uri = a.queue.as_ref().filter(|q| q.key == v.queue_key() && a.queued.is_none()).and_then(|q| q.tracks.get(q.idx())).map(|t| t.uri.as_str());
     let playing = Some(t.uri.as_str()) == playing_uri || (up_next && a.queued.as_ref().is_some_and(|q| q.uri == t.uri) && r == 0);
     let selected = a.tr_state.selected() == Some(r);
     let focused = a.focus == Focus::Tracks;
@@ -118,31 +171,31 @@ fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
         (true, _, Some(q)) => format!("then {}", q.name),
         (true, _, None) => "then".to_string(),
     });
-    let version = ((v.id, r, i, playing, playing && a.playing, selected, focused), (thumb.as_ref().map(rune::Image::id), progress, wide, th.dark, header.clone(), FAMILY.load(std::sync::atomic::Ordering::Relaxed)));
+    // an album named again in the row above is dimmed: runs of one album read as one
+    let same_album = !episodes && r > 0 && a.shown().get(r - 1).is_some_and(|j| v.tracks[j].album == t.album && v.tracks[j].album_id == t.album_id);
+    let version = ((v.id, r, i, playing, playing && a.playing, selected, focused), (thumb.as_ref().map(rune::Image::id), progress, wide, dates, same_album, th.dark, header.clone(), art_key()));
     memo(format!("row-{r}"), version, || {
-        let fill = if selected {
-            if focused { th.sel } else { th.wash }
-        } else {
-            Color::TRANSPARENT
-        };
-        let name_c = if playing { th.accent } else { th.text };
-        // the number, or the eq while it plays; under the pointer, a play button
-        let mark = if playing { eq(th.accent, a.playing, "row-eq") } else { text(num(i + 1)).font(NUM).color(th.dim) };
-        let num_cell = row().key("n").w(28.0).h(28.0).justify_end().center_y()
-            .child(row().key("n-mark").group_opacity(1.0, 0.0).child(mark))
-            .child(row().key("n-play").pin(Some(4.0), Some(2.0), None, None).size(24.0, 24.0).radius(12.0).center()
-                .group_opacity(0.0, 1.0).cursor(Cursor::Pointer).hover(th.text.alpha(0.1)).press_scale(0.85).help("Play")
-                .on_press_tx(move |ui: &mut Ui, tx| {
-                    pick(ui, r);
-                    ui.app.enter();
-                    ui.after(tx);
-                })
-                .child(icon(&icons::PLAY, 15.0).color(th.text)));
+        // the cover; while it plays, the eq (in the accent) over it, and under the pointer a play button
+        let mut art = row().key("art").size(34.0, 34.0)
+            .child(cover("c".into(), thumb.as_ref(), 34.0, 5.0, th, if episodes { &icons::MIC } else { &icons::NOTE }));
+        if playing {
+            art = art.child(row().key("art-eq").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
+                .fill(Color::BLACK.alpha(0.55)).group_opacity(1.0, 0.0)
+                .child(eq(th.accent, a.playing, "row-eq")));
+        }
+        let art = art.child(row().key("art-play").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
+            .fill(Color::BLACK.alpha(0.5)).group_opacity(0.0, 1.0).cursor(Cursor::Pointer).press_scale(0.9).help("Play")
+            .on_press_tx(move |ui: &mut Ui, tx| {
+                pick(ui, r);
+                ui.app.enter();
+                ui.after(tx);
+            })
+            .child(icon(&icons::PLAY, 15.0).color(Color::WHITE)));
         let mut title_line = row().key("tl").gap(6.0).center_y().min_w(0.0)
-            .child(text(t.name.clone()).key("name").font(BODY_MED).color(name_c).truncate().shrink().help_when_truncated(t.name.clone()));
+            .child(text(t.name.clone()).key("name").font(BODY_MED).color(th.text).truncate().shrink().help_when_truncated(t.name.clone()));
         if t.explicit {
-            title_line = title_line.child(row().key("e").size(15.0, 15.0).radius(3.0).fill(th.dim.alpha(0.4)).center()
-                .child(text("E").font(ts(9.0, 750.0)).color(th.text.alpha(0.8))));
+            title_line = title_line.child(row().key("e").size(14.0, 14.0).radius(3.0).border(1.0, th.dim.alpha(0.55)).center()
+                .child(text("E").font(ts(8.5, 650.0)).color(th.dim)));
         }
         let heard = progress == Some(HEARD);
         let by = if episodes && !feed { t.album.clone() } else { t.artists.clone() };
@@ -156,8 +209,7 @@ fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
         };
         let title = col().key("t").grow(1.0).shrink().min_w(0.0).gap(1.0).child(title_line).child(by_el);
         let mut line = row().key("cells").w_full().h(ROW).px(12.0).gap(14.0).center_y().hover_group()
-            .child(num_cell)
-            .child(cover("c".into(), thumb.as_ref(), 34.0, 5.0, th, if episodes { &icons::MIC } else { &icons::NOTE }))
+            .child(art)
             .child(title.opacity(if heard && !playing { 0.55 } else { 1.0 }));
         let actions = row().key("acts").w(56.0).gap(4.0).justify_end().center_y().group_opacity(0.0, 1.0)
             .child(row_button("queue-add", &icons::PLUS, th, "Add to queue  e", move |ui, _| {
@@ -179,23 +231,18 @@ fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
                 .child(row().key("time").w(72.0).justify_end().child(text(left).font(NUM).color(th.dim)));
         } else {
             if wide {
-                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, th.sub, th.text, move |ui| {
+                let c = if same_album { th.dim.alpha(0.6) } else { th.sub };
+                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, c, th.text, move |ui| {
                     pick(ui, r);
                     ui.app.goto_album();
                 })));
             }
+            if dates {
+                line = line.child(row().key("added").w(DATE_W).child(text(added(t.added, now_secs())).font(NUM).color(th.dim)));
+            }
             line = line.child(actions).child(row().key("time").w(44.0).justify_end().child(text(mmss(t.ms)).font(NUM).color(th.dim)));
         }
-        let line = line.radius(9.0).fill(fill).hover(if selected { fill } else { th.wash })
-            .on_press_tx(move |ui: &mut Ui, tx| {
-                pick(ui, r);
-                ui.after(tx);
-            })
-            .on_double_press_tx(move |ui: &mut Ui, tx| {
-                pick(ui, r);
-                ui.app.enter();
-                ui.after(tx);
-            })
+        let line = pickable(line.radius(8.0), r, selected, focused, th)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);
                 ui.after(tx);
@@ -204,16 +251,24 @@ fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool) -> El {
         let mut cell = col().key(format!("row-{r}")).w_full();
         if let Some(h) = header {
             cell = cell.child(row().key("disc").h(34.0).px(14.0).pt(if r == 0 { 0.0 } else { 10.0 }).items_end()
-                .child(text(h.to_uppercase()).font(LABEL).color(th.accent2)));
+                .child(text(h.to_uppercase()).font(LABEL).color(th.dim)));
         }
         cell.child(line)
     })
 }
 
-/// The song under the cursor, as a link to send someone.
-fn web_link(uri: &str) -> Option<String> {
+/// A Spotify uri as a link to send someone.
+pub fn web_link(uri: &str) -> Option<String> {
     let mut p = uri.strip_prefix("spotify:")?.splitn(2, ':');
     Some(format!("https://open.spotify.com/{}/{}", p.next()?, p.next()?))
+}
+
+/// Copy `uri`'s link, and say so.
+pub fn copy_link(a: &mut App, tx: &mut Tx, uri: Option<String>) {
+    if let Some(url) = uri.as_deref().and_then(web_link) {
+        tx.copy(url);
+        a.flash("link copied");
+    }
 }
 
 /// What can be done with the song under the cursor, as the system's menu.
@@ -243,7 +298,7 @@ fn track_menu(ui: &Ui, at: PopupAnchor, tx: &mut Tx) {
             Some("play") => a.enter(),
             Some("next") => {
                 if let Some(t) = a.selected_track().and_then(|i| a.view.tracks.get(i)).cloned() {
-                    a.note = Some((format!("{} plays next", t.name), Instant::now() + Duration::from_millis(1500)));
+                    a.flash(format!("{} plays next", t.name));
                     a.enqueue_at(0, [t]);
                 }
             }
@@ -252,10 +307,8 @@ fn track_menu(ui: &Ui, at: PopupAnchor, tx: &mut Tx) {
             Some("artist") => a.goto_artist(),
             Some("remove") => a.dequeue_selected(),
             Some("copy") => {
-                if let Some(url) = a.selected_track().and_then(|i| a.view.tracks.get(i)).and_then(|t| web_link(&t.uri)) {
-                    tx.copy(url);
-                    a.note = Some(("link copied".into(), Instant::now() + Duration::from_millis(1500)));
-                }
+                let uri = a.selected_track().and_then(|i| a.view.tracks.get(i)).map(|t| t.uri.clone());
+                copy_link(a, tx, uri);
             }
             _ => {}
         }
@@ -271,7 +324,7 @@ pub fn link_list(ui: &Ui, th: &Theme) -> El {
         .virtual_rows(n, LINK_ROW, |_: &Ui, r| Cow::Owned(format!("row-{r}")), move |ui: &Ui, r| link_row(ui, r, &theme_now()))
         .virtual_rows_version((v.id, a.find.is_some(), a.matches.len(), v.links.len()));
     col().key("list").w_full().grow(1.0).min_h(0.0)
-        .child(column_head(ui, th, &[("#", Some(28.0)), ("", Some(32.0)), ("name", None), ("details", None)]))
+        .child(column_head(ui, th, &[("", Some(32.0)), ("name", None), ("details", None)]))
         .child(scroller(ui, format!("list-{}", v.id), rows))
 }
 
@@ -282,32 +335,23 @@ fn link_row(ui: &Ui, r: usize, th: &Theme) -> El {
     let selected = a.tr_state.selected() == Some(r);
     let focused = a.focus == Focus::Tracks;
     let kind = a.view.kind;
-    let version = (a.view.id, r, i, selected, focused, th.dark, FAMILY.load(std::sync::atomic::Ordering::Relaxed));
+    let thumb = l.image.as_deref().map(art::small).and_then(|u| ui.thumb(&u));
+    let version = (a.view.id, r, i, selected, focused, th.dark, thumb.as_ref().map(rune::Image::id));
     memo(format!("row-{r}"), version, || {
-        let fill = if selected {
-            if focused { th.sel } else { th.wash }
-        } else {
-            Color::TRANSPARENT
-        };
         let round = kind == Kind::Artists;
         let glyph = match kind {
             Kind::Artists => &icons::PERSON,
             Kind::Shows => &icons::MIC,
             _ => &icons::ALBUM,
         };
-        let tile = swatch_tile("ic".into(), swatch(&l.name, th), 32.0, if round { 16.0 } else { 7.0 }, Some(glyph));
+        let radius = if round { 16.0 } else { 6.0 };
+        let tile = match &thumb {
+            Some(img) => cover("ic".into(), Some(img), 32.0, radius, th, glyph),
+            None => tile("ic".into(), 32.0, radius, Some(glyph), th),
+        };
         let uri = l.uri.clone();
-        row().key(format!("row-{r}")).w_full().h(LINK_ROW).px(12.0).gap(14.0).center_y().radius(9.0)
-            .fill(fill).hover(if selected { fill } else { th.wash }).cursor(Cursor::Pointer)
-            .on_press_tx(move |ui: &mut Ui, tx| {
-                pick(ui, r);
-                ui.after(tx);
-            })
-            .on_double_press_tx(move |ui: &mut Ui, tx| {
-                pick(ui, r);
-                ui.app.enter();
-                ui.after(tx);
-            })
+        pickable(row().key(format!("row-{r}")).w_full().h(LINK_ROW).px(12.0).gap(14.0).center_y().radius(8.0), r, selected, focused, th)
+            .cursor(Cursor::Pointer)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);
                 ui.after(tx);
@@ -319,18 +363,12 @@ fn link_row(ui: &Ui, r: usize, th: &Theme) -> El {
                 tx.popup_menu(m, at, move |ui: &mut Ui, picked, tx| {
                     match picked {
                         Some("open") => ui.app.enter(),
-                        Some("copy") => {
-                            if let Some(url) = web_link(&uri) {
-                                tx.copy(url);
-                                ui.app.note = Some(("link copied".into(), Instant::now() + Duration::from_millis(1500)));
-                            }
-                        }
+                        Some("copy") => copy_link(&mut ui.app, tx, Some(uri.clone())),
                         _ => {}
                     }
                     ui.after(tx);
                 });
             })
-            .child(row().key("n").w(28.0).justify_end().child(text(num(i + 1)).font(NUM).color(th.dim)))
             .child(tile)
             .child(row().key("name").grow(1.0).shrink().min_w(0.0).child(text(l.name.clone()).font(BODY_MED).color(th.text).truncate().help_when_truncated(l.name.clone())))
             .child(row().key("sub").grow(1.0).shrink().min_w(0.0).child(text(l.sub.clone()).font(BODY).color(th.sub).truncate()))

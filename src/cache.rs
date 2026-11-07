@@ -4,20 +4,21 @@
 
 use crate::*;
 
-pub fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+/// spot's directory under $`var`, else under ~/`home`.
+fn xdg_dir(var: &str, home: &str) -> PathBuf {
+    let base = std::env::var_os(var)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(home));
     base.join("spot")
 }
 
+pub fn cache_dir() -> PathBuf {
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+}
+
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
-    base.join("spot")
+    xdg_dir("XDG_CONFIG_HOME", ".config")
 }
 
 pub fn tracks_path(key: &str) -> PathBuf {
@@ -29,9 +30,63 @@ pub fn uri_key(uri: &str) -> String {
     uri.trim_start_matches("spotify:").replace(':', "_")
 }
 
-/// An artist's releases (the albums & singles page), one `uri, single, name, sub` per line.
+/// An artist's releases (the albums & singles page), one `uri, single, name, sub, image` per line.
 pub fn releases_path(uri: &str) -> PathBuf {
     cache_dir().join("releases").join(uri_key(uri))
+}
+
+/// An artist's overview: the portrait, the bio, then one tagged line per song or card.
+pub fn artist_path(uri: &str) -> PathBuf {
+    cache_dir().join("artists").join(uri_key(uri))
+}
+
+fn link_line(l: &Link) -> String {
+    format!("{}\t{}\t{}\t{}\t{}", l.uri, l.single as u8, clean(&l.name), clean(&l.sub), l.image.as_deref().unwrap_or(""))
+}
+
+fn parse_link_line(l: &str) -> Option<Link> {
+    let mut f = l.split('\t');
+    let (uri, single, name, sub) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    let image = f.next().filter(|s| !s.is_empty()).map(String::from); // missing from older caches
+    Some(Link { uri: uri.into(), single: single == "1", name: name.into(), sub: sub.into(), image })
+}
+
+pub fn read_artist(uri: &str) -> Option<ArtistInfo> {
+    let s = fs::read_to_string(artist_path(uri)).ok()?;
+    let mut lines = s.lines();
+    let portrait = lines.next()?;
+    let mut a = ArtistInfo {
+        portrait: (!portrait.is_empty()).then(|| portrait.into()),
+        bio: lines.next()?.replace("\\n", "\n"),
+        ..Default::default()
+    };
+    for l in lines {
+        let Some((tag, rest)) = l.split_once('\t') else { continue };
+        match tag {
+            "T" => a.top.extend(parse_line(rest)),
+            "R" => a.releases.extend(parse_link_line(rest)),
+            "A" => a.appears.extend(parse_link_line(rest)),
+            "F" => a.related.extend(parse_link_line(rest)),
+            _ => {}
+        }
+    }
+    Some(a)
+}
+
+pub fn save_artist(uri: &str, a: &ArtistInfo) {
+    use std::fmt::Write;
+    let mut s = format!("{}\n{}\n", a.portrait.as_deref().unwrap_or(""), clean(&a.bio.replace('\n', "\\n")));
+    let mut top = String::new();
+    push_tracks(&mut top, &a.top);
+    for l in top.lines() {
+        let _ = writeln!(s, "T\t{l}");
+    }
+    for (tag, links) in [("R", &a.releases), ("A", &a.appears), ("F", &a.related)] {
+        for l in links {
+            let _ = writeln!(s, "{tag}\t{}", link_line(l));
+        }
+    }
+    write_atomic(&artist_path(uri), &s);
 }
 
 /// The podcasts the user follows, kept like an artist's releases.
@@ -68,20 +123,14 @@ pub fn same_uris<'a>(a: impl ExactSizeIterator<Item = &'a String>, b: impl Exact
 
 pub fn read_links(path: &std::path::Path) -> Vec<Link> {
     let s = fs::read_to_string(path).unwrap_or_default();
-    s.lines()
-        .filter_map(|l| {
-            let mut f = l.split('\t');
-            let (uri, single, name, sub) = (f.next()?, f.next()?, f.next()?, f.next()?);
-            Some(Link { uri: uri.into(), single: single == "1", name: name.into(), sub: sub.into() })
-        })
-        .collect()
+    s.lines().filter_map(parse_link_line).collect()
 }
 
 pub fn save_links(path: &std::path::Path, links: &[Link]) {
     use std::fmt::Write;
     let mut s = String::new();
     for l in links {
-        let _ = writeln!(s, "{}\t{}\t{}\t{}", l.uri, l.single as u8, clean(&l.name), clean(&l.sub));
+        let _ = writeln!(s, "{}", link_line(l));
     }
     write_atomic(path, &s);
 }
@@ -113,7 +162,7 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
     for t in tracks {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}\t{}",
             t.uri,
             clean(&t.name),
             clean(&t.artists),
@@ -124,7 +173,8 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
             t.album_id,
             t.artist_id,
             t.disc,
-            t.explicit as u8
+            t.explicit as u8,
+            t.added
         );
     }
 }
@@ -147,12 +197,14 @@ pub fn parse_line(l: &str) -> Option<Track> {
         artist_id: id(),
         disc: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
         explicit: f.next() == Some("1"),
+        added: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
     })
 }
 
 pub fn read_tracks(path: &std::path::Path) -> Vec<Track> {
     let s = fs::read_to_string(path).unwrap_or_default();
-    // lists cached before the explicit flag was kept load fresh, or they'd never get it
+    // lists cached before the explicit flag was kept load fresh, or they'd never get it (the
+    // date added, kept since, is filled in by the next refresh: see liked_tracks, playlist_tracks)
     if s.lines().next().is_some_and(|l| l.split('\t').count() < 11) {
         return vec![];
     }
@@ -225,7 +277,7 @@ pub fn read_last() -> Option<Last> {
     let (pos, pos_ms, shuffle, repeat) = (nums.next()??, nums.next()??, nums.next()??, nums.next()??);
     let order: Vec<usize> = lines.next()?.split(',').filter_map(|n| n.parse().ok()).collect();
     let tracks: Vec<Track> = lines.filter_map(parse_line).collect();
-    let mut queue = Queue { key, name, tracks: Arc::new(tracks), order, pos: pos as usize };
+    let mut queue = Queue { key, name, tracks: Arc::new(tracks), order, pos: pos as usize, sorted: vec![] };
     let n = queue.tracks.len();
     if n == 0 {
         return None;
@@ -260,7 +312,11 @@ pub fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
 
 /// `spot clean`: drop everything that's only a cache. Login, settings, the resume point and
 /// unsent scrobbles stay.
-pub fn clean_cache() {
+/// What the cache keeps that can go (songs and lists; never the login or the resume point).
+const CLEARABLE: [&str; 6] = ["audio", "lists", "releases", "artists", "playlists", "shows"];
+
+/// Bytes the clearable cache takes on disk.
+pub fn cache_size() -> u64 {
     fn size(p: &std::path::Path) -> u64 {
         match fs::symlink_metadata(p) {
             Ok(m) if m.is_dir() => fs::read_dir(p).into_iter().flatten().flatten().map(|e| size(&e.path())).sum(),
@@ -268,19 +324,20 @@ pub fn clean_cache() {
             Err(_) => 0,
         }
     }
-    let dir = cache_dir();
-    let mut freed = 0;
-    for name in ["audio", "lists", "releases", "playlists", "shows"] {
-        let p = dir.join(name);
-        let n = size(&p);
+    CLEARABLE.iter().map(|n| size(&cache_dir().join(n))).sum()
+}
+
+/// Settings' "Clear": the player restarts right after, so nothing holds on to what's gone.
+pub fn clean_cache() {
+    for name in CLEARABLE {
+        let p = cache_dir().join(name);
         let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
-        match r {
-            Ok(()) => freed += n,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("spot: couldn't remove {}: {e}", p.display()),
+        if let Err(e) = r
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("couldn't remove {}: {e}", p.display());
         }
     }
-    println!("Cleared {:.1} MB of cache from {}.", freed as f64 / 1e6, dir.display());
 }
 
 /// The running player's control socket (ctl.rs).

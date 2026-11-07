@@ -5,14 +5,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use rune::{AppHandle, Color, Cursor, Cx, El, Image, ImageCache, KeyEvent, SurfaceFit, SystemMaterial, TextEdit, TextStyle, Tx, Waker, col, el, icon, row, text, text_input};
+use rune::{AppHandle, Color, Cursor, Cx, El, Image, ImageCache, KeyEvent, SurfaceFit, SystemMaterial, TextEdit, Tx, Waker, col, el, icon, row, text, text_input};
 
+use super::view::ts;
 use super::{Now, Ui, icons};
 use crate::*;
 
 const KINDS: [(&str, Option<&str>); 4] = [("songs", None), ("albums", Some("--albums")), ("artists", Some("--artists")), ("podcasts", Some("--podcasts"))];
 const MAX: usize = 8;
-const WIDTH: f32 = 640.0;
+pub const WIDTH: f32 = 640.0;
 const MARGIN: f32 = 24.0; // around the card, for its shadow
 const BAR: f32 = 60.0;
 const HIT: f32 = 50.0;
@@ -61,9 +62,9 @@ pub struct Panel {
     pub main: Option<AppHandle<Ui>>,
 }
 
-/// spotify:track:id as https://open.spotify.com/track/id
-fn share_link(uri: &str) -> String {
-    format!("https://open.spotify.com/{}", uri.trim_start_matches("spotify:").replace(':', "/"))
+/// The window's height as it opens: the bar, and what's playing under it if anything is.
+pub fn opened_height(now: bool) -> f32 {
+    2.0 * MARGIN + BAR + if now { FOOT } else { 0.0 }
 }
 
 /// Ask the player, as a `spot` command would; waits for the answer.
@@ -114,6 +115,9 @@ impl Panel {
     }
 
     fn height(&self) -> f32 {
+        if self.results.is_empty() && self.note.is_none() {
+            return opened_height(self.now.is_some());
+        }
         let list = if self.results.is_empty() { 0.0 } else { 12.0 + self.results.len() as f32 * HIT };
         let note = if self.note.is_some() { 44.0 } else { 0.0 };
         let foot = if self.now.is_some() { FOOT } else { 0.0 };
@@ -240,8 +244,8 @@ impl Panel {
     /// ⌘C: the link to the picked result, or with no results what's playing.
     fn copy_link(&mut self, tx: &mut Tx) {
         let uri = self.results.get(self.picked).map(|h| h.uri.clone()).or_else(|| self.now.as_ref().map(|n| n.uri.clone()));
-        let Some(uri) = uri.filter(|u: &String| !u.is_empty()) else { return };
-        tx.copy(share_link(&uri));
+        let Some(url) = uri.as_deref().and_then(super::rows::web_link) else { return };
+        tx.copy(url);
         self.copied = true;
         if let Some(me) = self.me.clone() {
             std::thread::spawn(move || {
@@ -299,13 +303,7 @@ fn field_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
         rune::Key::Command('c') if p.query.selected().is_empty() => p.copy_link(tx),
         rune::Key::Command('o') => p.open_main(tx),
         _ if ctrl("s", "\u{13}") => p.control(&["shuffle"], |n| n.shuffle = !n.shuffle),
-        _ if ctrl("r", "\u{12}") => p.control(&["repeat"], |n| {
-            n.repeat = match n.repeat {
-                Repeat::Off => Repeat::All,
-                Repeat::All => Repeat::One,
-                Repeat::One => Repeat::Off,
-            }
-        }),
+        _ if ctrl("r", "\u{12}") => p.control(&["repeat"], |n| n.repeat = n.repeat.next()),
         _ => return false,
     }
     true
@@ -320,14 +318,11 @@ pub fn on_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
     false
 }
 
-const fn ts(size: f32, weight: f32) -> TextStyle {
-    TextStyle::new(size, weight)
-}
-
 pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
     let th = theme(cx.system_dark());
-    // enough of the window's own background over the glass that text reads on any desktop
-    let tint = th.bg.alpha(if th.dark { 0.78 } else { 0.72 });
+    // most of the window's own background over the glass: one even surface, whatever desktop or
+    // window is behind it, so text and the picked row read the same everywhere
+    let tint = th.bg.alpha(if th.dark { 0.9 } else { 0.85 });
     let field = text_input(&p.query, ts(21.0, 450.0).lh(28.0)).key("query").single_line().grow(1.0)
         .color(th.text).placeholder(format!("Search {}", KINDS[p.kind].0), th.sub)
         .on_edit(|p: &mut Panel| &mut p.query)
@@ -339,19 +334,20 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
     let kinds = row().key("kinds").gap(4.0).center_y().children(KINDS.iter().enumerate().map(|(i, (k, _))| {
         let on = i == p.kind;
         row().key(format!("k-{k}")).h(24.0).px(9.0).center().radius(12.0)
-            .fill(if on { th.accent.alpha(0.9) } else { Color::TRANSPARENT })
+            .fill(if on { th.text.alpha(0.12) } else { Color::TRANSPARENT })
             .cursor(Cursor::Pointer)
             .on_press(move |p: &mut Panel| {
                 p.kind = i;
                 p.search();
             })
-            .child(text(*k).font(ts(11.5, 600.0)).color(if on { th.on_accent } else { th.text.alpha(0.72) }))
+            .child(text(*k).font(ts(11.5, 600.0)).color(if on { th.text } else { th.text.alpha(0.55) }))
     }));
     let bar = row().key("bar").w_full().h(BAR).px(20.0).gap(14.0).center_y()
-        .child(icon(&icons::SEARCH, 20.0).color(if p.busy { th.accent } else { th.text.alpha(0.6) }))
+        .child(icon(&icons::SEARCH, 20.0).color(if p.busy { th.text } else { th.text.alpha(0.6) }))
         .child(field)
         .child(kinds);
-    let mut card = col().key("card").w_full().radius(20.0).continuous_corners().clip_rounded(20.0)
+    // dragging the card anywhere but a field or button moves it; it opens there next time
+    let mut card = col().key("card").w_full().on_drag(|_: &mut Panel, d: &mut rune::Drag, _: &mut Tx| super::launcher::drag(d.phase)).radius(20.0).continuous_corners().clip_rounded(20.0)
         .system_material(SystemMaterial::Glass)
         .fill(tint)
         .border(1.0, th.text.alpha(if th.dark { 0.12 } else { 0.1 }))
@@ -367,25 +363,29 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
                 None => thumb.center().child(icon(&icons::NOTE, 15.0).color(th.text.alpha(0.5))),
             };
             let mut name = row().key("nm").gap(6.0).center_y().min_w(0.0)
-                .child(text(h.name.clone()).font(ts(14.0, 560.0)).color(if on { th.on_accent } else { th.text }).truncate().shrink());
+                .child(text(h.name.clone()).font(ts(14.0, 560.0)).color(th.text).truncate().shrink());
             if h.explicit {
-                name = name.child(row().key("e").size(14.0, 14.0).radius(3.0).fill(if on { th.on_accent.alpha(0.6) } else { th.dim.alpha(0.6) }).center()
-                    .child(text("E").font(ts(9.0, 750.0)).color(if on { th.accent } else { th.bg })));
+                name = name.child(row().key("e").size(14.0, 14.0).radius(3.0).border(1.0, th.dim.alpha(0.6)).center()
+                    .child(text("E").font(ts(8.5, 650.0)).color(th.dim)));
             }
+            // the picked row: lit, with a bar of the accent at its left edge, and its words brighter
+            let bar = el().key("pick-bar").pin(Some(0.0), Some(13.0), None, Some(13.0)).w(3.0).radius(1.5)
+                .fill(if on { th.accent } else { Color::TRANSPARENT });
             let mut r = row().key(format!("hit-{i}")).w_full().h(HIT).px(12.0).gap(12.0).center_y().radius(12.0)
-                .fill(if on { th.accent.alpha(0.88) } else { Color::TRANSPARENT })
-                .hover(if on { th.accent.alpha(0.88) } else { th.text.alpha(0.06) })
+                .fill(if on { th.text.alpha(0.13) } else { Color::TRANSPARENT })
+                .hover(if on { th.text.alpha(0.13) } else { th.text.alpha(0.05) })
                 .cursor(Cursor::Pointer)
                 .on_press_tx(move |p: &mut Panel, tx| {
                     p.picked = i;
                     p.choose(false, tx);
                 })
+                .child(bar)
                 .child(thumb)
                 .child(col().key("words").grow(1.0).shrink().min_w(0.0).gap(1.0)
                     .child(name)
-                    .child(text(h.sub.clone()).font(ts(12.0, 450.0)).color(if on { th.on_accent.alpha(0.85) } else { th.text.alpha(0.7) }).truncate()));
+                    .child(text(h.sub.clone()).font(ts(12.0, 450.0)).color(th.text.alpha(if on { 0.8 } else { 0.62 })).truncate()));
             if h.ms > 0 {
-                r = r.child(text(mmss(h.ms)).font(ts(12.0, 450.0).features("'tnum' 1")).color(if on { th.on_accent.alpha(0.85) } else { th.text.alpha(0.55) }));
+                r = r.child(text(mmss(h.ms)).font(super::view::NUM).color(th.text.alpha(0.5)));
             }
             list = list.child(r);
         }
@@ -395,7 +395,7 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
         card = card.child(row().key("note").w_full().h(44.0).px(24.0).center_y().child(text(n.clone()).font(ts(13.0, 500.0)).color(th.text.alpha(0.75)).truncate()));
     }
     if let Some(n) = &p.now {
-        let mode = |on: bool| if on { th.gold } else { th.text.alpha(0.6) };
+        let mode = |on: bool| if on { th.text } else { th.text.alpha(0.4) };
         let small_btn = |key: &'static str, i: &'static rune::Icon, c: Color, f: fn(&mut Panel)| {
             row().key(key).size(30.0, 30.0).center().radius(15.0).hover(th.text.alpha(0.08)).cursor(Cursor::Pointer)
                 .on_press(move |p: &mut Panel| f(p))
@@ -406,25 +406,18 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
             Some(img) => art.pixels_fit(img.pixels(), SurfaceFit::Fill),
             None => art,
         };
-        let hint = if p.copied { "link copied" } else { "⏎ play  ·  ⌘⏎ queue  ·  ⌘C link" };
-        let foot = row().key("foot").w_full().h(FOOT).px(20.0).gap(12.0).center_y().fill(th.text.alpha(0.035))
+        let mut foot = row().key("foot").w_full().h(FOOT).px(20.0).gap(12.0).center_y().fill(th.text.alpha(0.035))
             .child(art)
             .child(col().key("now").grow(1.0).shrink().min_w(0.0).gap(1.0)
                 .child(text(n.name.clone()).font(ts(13.0, 600.0)).color(th.text).truncate())
-                .child(text(n.artists.clone()).font(ts(11.5, 450.0)).color(th.text.alpha(0.7)).truncate()))
-            .child(text(hint).font(ts(11.0, 500.0)).color(if p.copied { th.accent } else { th.text.alpha(0.55) }))
-            .child(el().key("gap").w(4.0))
+                .child(text(n.artists.clone()).font(ts(11.5, 450.0)).color(th.text.alpha(0.7)).truncate()));
+        if p.copied {
+            foot = foot.child(text("link copied").font(ts(11.0, 500.0)).color(th.text));
+        }
+        let foot = foot.child(el().key("gap").w(4.0))
             .child(small_btn("p-shuffle", &icons::SHUFFLE, mode(n.shuffle), |p| p.control(&["shuffle"], |n| n.shuffle = !n.shuffle)))
             .child(small_btn("p-play", if n.playing { &icons::PAUSE } else { &icons::PLAY }, th.text, |p| p.control(&["toggle"], |n| n.playing = !n.playing)))
-            .child(small_btn("p-repeat", &icons::REPEAT, mode(n.repeat != Repeat::Off), |p| {
-                p.control(&["repeat"], |n| {
-                    n.repeat = match n.repeat {
-                        Repeat::Off => Repeat::All,
-                        Repeat::All => Repeat::One,
-                        Repeat::One => Repeat::Off,
-                    }
-                })
-            }));
+            .child(small_btn("p-repeat", &icons::REPEAT, mode(n.repeat != Repeat::Off), |p| p.control(&["repeat"], |n| n.repeat = n.repeat.next())));
         card = card.child(el().key("sep2").h(1.0).w_full().fill(th.text.alpha(0.07))).child(foot);
     }
     col().key("panel").w_full().h_full().padding(MARGIN).child(card)

@@ -8,6 +8,13 @@ pub enum Focus {
     Tracks,
 }
 
+/// Whose an album is: the names to show, and the (first) artist to go to, when that's known.
+#[derive(Clone)]
+pub struct By {
+    pub names: String,
+    pub artist: Option<(String, String)>, // uri, name
+}
+
 pub struct View {
     pub id: u64,
     pub key: String,
@@ -20,11 +27,15 @@ pub struct View {
     pub releases: Vec<Link>,    // artist page: every release, of which `links` is the `filter`ed part
     pub filter: Releases,
     pub want: Option<String>,   // track uri to select once it loads (goto album)
+    pub order: Vec<usize>,      // the rows, sorted by date added; empty = as listed (see refilter)
+    pub info: Option<Arc<ArtistInfo>>, // an artist's overview: `tracks` is its popular songs shown
+    pub portrait: Option<String>, // artist pages: theirs, as last seen
+    pub by: Option<By>,         // an album: whose it is
 }
 
 impl View {
     pub fn new(id: u64, key: String, title: String, kind: Kind) -> Self {
-        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None }
+        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None }
     }
     pub fn len(&self) -> usize {
         if self.kind == Kind::Tracks { self.tracks.len() } else { self.links.len() }
@@ -98,7 +109,7 @@ pub struct App {
     pub view: View,
     pub view_seq: u64,                  // last view id handed out
     pub history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row
-    pub artist_songs: bool,             // artist pages list every song (else albums & singles)
+    pub grid_cols: std::cell::Cell<usize>, // cards to a line on artist pages, as the window last laid them out
     pub releases: Releases,             // which releases new artist pages list (remembered)
     pub tr_state: Sel,
     pub focus: Focus,
@@ -108,6 +119,7 @@ pub struct App {
     pub search_task: Option<tokio::task::AbortHandle>, // the last search, while its pages come in
     pub find: Option<String>, // ctrl+f filter over the open track list
     pub matches: Vec<usize>,  // view indices matching `find`, kept current by refilter()
+    pub sort: Sort,           // playlists' order: as listed, or by date added (remembered)
     pub search_kind: Kind,
     pub shuffle: bool,
     pub repeat: Repeat,
@@ -141,14 +153,7 @@ pub struct App {
     pub quit: bool,
     pub art: art::Art,
     pub show: bool,          // `spot show`: bring the window up
-    pub moved: Moved,        // what the last tick saw happen, for the window's popup
-}
-
-/// What changed since the last tick that the window cares about.
-#[derive(Default, Clone, Copy)]
-pub struct Moved {
-    pub track: bool,   // a new song started
-    pub skipped: bool, // a media key skipped or seeked
+    pub shuffle_on_load: Option<u64>, // a view to shuffle and play once it's all loaded
 }
 
 impl App {
@@ -180,6 +185,7 @@ impl App {
                 self.refilter();
                 let sel = keep
                     .and_then(|u| self.view.tracks.iter().position(|t| t.uri == u))
+                    .and_then(|i| self.row_of(i))
                     .or(self.tr_state.selected())
                     .map(|s| s.min(self.shown().len().saturating_sub(1)));
                 self.tr_state.select(sel);
@@ -205,6 +211,10 @@ impl App {
                 if view != self.view.id {
                     return;
                 }
+                if done && self.shuffle_on_load == Some(view) {
+                    self.shuffle_on_load = None;
+                    self.play_from_view(None);
+                }
                 self.refilter();
                 if self.tr_state.selected().is_none() && !self.view.tracks.is_empty() {
                     self.tr_state.select(Some(0));
@@ -214,7 +224,7 @@ impl App {
                     && let Some(w) = &self.view.want
                     && let Some(i) = self.view.tracks.iter().position(|t| &t.uri == w)
                 {
-                    self.tr_state.select(Some(i));
+                    self.tr_state.select(self.row_of(i));
                     self.view.want = None;
                 }
             }
@@ -254,6 +264,18 @@ impl App {
                     .or(self.tr_state.selected())
                     .map(|s| s.min(self.shown().len().saturating_sub(1)));
                 self.tr_state.select(sel);
+            }
+            Msg::Artist { view, info } => {
+                let Some(v) = self.view_mut(view) else { return };
+                if v.info.is_none() {
+                    return;
+                }
+                v.info = Some(info);
+                v.set_top();
+                if view == self.view.id {
+                    let n = self.overview_len();
+                    self.tr_state.select(Some(self.tr_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
+                }
             }
             Msg::Error(e) => {
                 log::error!("{e}");

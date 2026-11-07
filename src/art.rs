@@ -18,14 +18,15 @@ pub struct Art {
     pub cover: Option<Cover>,   // the one on show; the last song's until the new one arrives
 }
 
-/// Spotify's 64 px copy of a 640 px album cover (they differ only in a size code), for rows.
+/// Spotify's 64 px copy of a 640 px album cover (they differ only in a size code), for rows; an
+/// artist's portrait comes no smaller than 160 px.
 pub fn small(url: &str) -> String {
-    url.replacen("ab67616d0000b273", "ab67616d00004851", 1)
+    url.replacen("ab67616d0000b273", "ab67616d00004851", 1).replacen("ab6761610000e5eb", "ab6761610000f178", 1)
 }
 
-/// The 300 px copy, for the header over a list.
+/// The 300 px copy, for the header over a list (320 px for a portrait).
 pub fn medium(url: &str) -> String {
-    url.replacen("ab67616d0000b273", "ab67616d00001e02", 1)
+    url.replacen("ab67616d0000b273", "ab67616d00001e02", 1).replacen("ab6761610000e5eb", "ab67616100005174", 1)
 }
 
 pub async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
@@ -104,11 +105,8 @@ impl App {
             return;
         };
         if headless() {
-            let bytes = fetch_blocking(self.rt.handle(), &url);
-            self.art.cover = bytes.and_then(|b| {
-                let tint = tint(&image::load_from_memory(&b).ok()?);
-                Some(Cover { url, bytes: Arc::new(b), tint })
-            });
+            let rt = self.rt.handle().clone();
+            self.art.cover = std::thread::spawn(move || rt.block_on(fetch(&url))).join().ok().flatten();
             return;
         }
         let tx = self.tx.clone();
@@ -156,5 +154,6 @@ mod tests {
     fn small_covers_swap_the_size_code() {
         assert_eq!(small("https://i.scdn.co/image/ab67616d0000b273abc"), "https://i.scdn.co/image/ab67616d00004851abc");
         assert_eq!(small("https://i.scdn.co/image/ab6765630000ba8aabc"), "https://i.scdn.co/image/ab6765630000ba8aabc");
+        assert_eq!(small("https://i.scdn.co/image/ab6761610000e5ebabc"), "https://i.scdn.co/image/ab6761610000f178abc");
     }
 }

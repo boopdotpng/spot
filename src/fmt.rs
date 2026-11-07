@@ -48,6 +48,60 @@ pub fn short(ms: u64) -> String {
     if m < 60 { format!("{m}m") } else { format!("{}h {:02}m", m / 60, m % 60) }
 }
 
+/// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// The date of a day since 1970-01-01, as (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+}
+
+/// "2024-03-04T05:06:07Z" (the web API's added_at) as unix seconds; 0 if it isn't one.
+pub fn iso_secs(s: &str) -> u64 {
+    let n = |r: std::ops::Range<usize>| s.get(r).and_then(|x| x.parse::<i64>().ok());
+    let (Some(y), Some(mo), Some(d)) = (n(0..4), n(5..7), n(8..10)) else { return 0 };
+    let (h, mi, se) = (n(11..13).unwrap_or(0), n(14..16).unwrap_or(0), n(17..19).unwrap_or(0));
+    let t = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + se;
+    t.max(0) as u64
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// When a song was added, as a list shows it: "today", "3 days ago", then "Mar 4, 2024".
+pub fn added(secs: u64, now: u64) -> String {
+    if secs == 0 {
+        return String::new();
+    }
+    let days = (now / 86400) as i64 - (secs / 86400) as i64;
+    match days {
+        ..=0 => "today".into(),
+        1 => "yesterday".into(),
+        2..=6 => format!("{days} days ago"),
+        _ => {
+            const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            let (y, m, d) = civil_from_days((secs / 86400) as i64);
+            format!("{} {d}, {y}", MONTHS[m as usize - 1])
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +121,19 @@ mod tests {
         assert_eq!(plural(1, "song"), "1 song");
         assert_eq!(hours(185 * 60_000), "3 h 5 min");
         assert_eq!(mmss(61_000), "1:01");
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), 0);
+        assert_eq!(iso_secs("2024-03-04T05:06:07Z"), 1709528767);
+        assert_eq!(iso_secs("nope"), 0);
+        let t = iso_secs("2024-03-04T05:06:07Z");
+        assert_eq!(added(t, t + 3600), "today");
+        assert_eq!(added(t, t + 86400), "yesterday");
+        assert_eq!(added(t, t + 3 * 86400), "3 days ago");
+        assert_eq!(added(t, t + 30 * 86400), "Mar 4, 2024");
+        assert_eq!(added(iso_secs("2000-02-29T00:00:00Z"), 2_000_000_000), "Feb 29, 2000");
+        assert_eq!(added(0, 5), "");
     }
 }
