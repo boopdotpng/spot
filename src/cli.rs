@@ -9,26 +9,29 @@ use std::{
 use crate::*;
 
 pub const COMMANDS: &[&str] = &[
-    "start", "quit", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
-    "search", "playlists", "watch", "wait",
+    "start", "quit", "show", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
+    "search", "playlists", "podcasts", "watch", "wait",
 ];
 
 pub const USAGE: &str = "\
 spot: tiny Spotify player, and a command line for the one that's running
 
-  spot                       open the TUI, starting the player in the background if needed (and
-                             taking the TUI from any other terminal); d closes it, music playing
+  spot                       open spot's window, starting spot if needed (the first time, it
+                             logs you in here); closing the window keeps the music playing
   spot start                 start it in the background, without a window, and return once
-                             it's ready (what scripts and agents should use)
-  spot --headless            the same in the foreground, for a launchd / systemd service
-  spot quit                  stop the player, either kind (it resumes where it was next start)
+                             it's ready (what scripts and agents should use); ⌥Space or the
+                             menu bar item opens it
+  spot show                  open the window of the spot that's running
+  spot --headless            start it in the foreground without a window, for a launchd service
+  spot quit                  stop the player (it resumes where it was next start)
   spot clean                 clear cached songs and lists (keeps login)
   spot -v, --version         which spot this is
 
 Control the running player, from any terminal, script or agent:
   spot status                what's playing, position, queue, modes, volume, what's next
-  spot search <words>        search songs (the default), or with --albums, --artists or
-                             --playlists one of those instead; -n 20 for more than 10.
+  spot search <words>        search songs (the default), or with --albums, --artists,
+                             --playlists, --podcasts or --episodes one of those instead;
+                             -n 20 for more than 10.
                              Spotify's field filters narrow it down:
                              spot search 'track:one more time artist:daft punk'
                              spot search 'artist:radiohead year:1997' --albums
@@ -39,7 +42,8 @@ Control the running player, from any terminal, script or agent:
                              takes these too)
   spot play liked            Liked Songs
   spot play <words>          one of your playlists by name, else the top song on Spotify
-  spot play album <words>    the top album (or artist, song, playlist: yours first, then Spotify's)
+  spot play album <words>    the top album (or artist, song, playlist: yours first, then Spotify's;
+                             podcast, episode)
   spot play | pause | toggle
   spot next | prev
   spot seek 1:30 | +10 | -10
@@ -57,6 +61,7 @@ Control the running player, from any terminal, script or agent:
                              where the first goes (`spot queue mv 3-5 1`); they stay in order
   spot queue clear           empty the queue
   spot playlists             your playlists, numbered, with uris
+  spot podcasts              the podcasts you follow, numbered, with uris
   spot watch [--before 30]   a line per event as it happens: track (new song), playing,
                              paused, modes, skip (a media key skipped or seeked), end (nothing left to
                              play), ending (the song ends in 30s; says what's next, so there's
@@ -131,10 +136,39 @@ pub fn client(args: Vec<String>) -> i32 {
     code
 }
 
-/// `spot start`: run `spot --headless` detached from this terminal (its own process group, no
-/// stdio, so whatever started it can exit or close), and wait until it answers. `say` prints how
-/// that went; the TUI doesn't, or the line would be waiting in the terminal when it closes.
+/// Plain `spot` in a terminal: bring up the running spot's window, or log in if this is the first
+/// run and then start spot with its window open.
+pub fn open() -> i32 {
+    if send(&["show"]).is_ok() {
+        return 0;
+    }
+    if let Err(e) = crate::start(true) {
+        eprintln!("spot: {e}");
+        return 1;
+    }
+    launch(true, false)
+}
+
+/// One request to the running spot, its reply's text; Err if it isn't running or said no.
+pub fn send(args: &[&str]) -> Result<String, String> {
+    let conn = UnixStream::connect(sock_path()).map_err(|e| e.to_string())?;
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+    (&conn).write_all(format!("{}\n", args.join("\t")).as_bytes()).map_err(|e| e.to_string())?;
+    let mut lines = BufReader::new(&conn).lines().map_while(Result::ok);
+    let code = lines.next().and_then(|l| l.parse::<i32>().ok()).ok_or("no reply")?;
+    let text = lines.collect::<Vec<_>>().join("\n");
+    if code == 0 { Ok(text) } else { Err(text) }
+}
+
+/// `spot start`: start spot in the background without its window, and return once it answers.
 pub fn start(say: bool) -> i32 {
+    launch(false, say)
+}
+
+/// Run `spot --app` detached from this terminal (its own process group, no stdio, so whatever
+/// started it can exit or close), with its window if `show`, and wait until it answers. `say`
+/// prints how that went.
+fn launch(show: bool, say: bool) -> i32 {
     if UnixStream::connect(sock_path()).is_ok() {
         if say {
             println!("spot is already running");
@@ -151,9 +185,11 @@ pub fn start(say: bool) -> i32 {
         return 1;
     }
     use std::{os::unix::process::CommandExt, process::Stdio};
-    let exe = std::env::current_exe().unwrap_or_else(|_| "spot".into());
+    // the real file, so a `spot` linked from inside Spot.app runs as that app (its icon and name)
+    let exe = std::env::current_exe().and_then(fs::canonicalize).unwrap_or_else(|_| "spot".into());
     let mut child = match std::process::Command::new(exe)
-        .arg("--headless")
+        .arg("--app")
+        .args(show.then_some("--show"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -219,7 +255,7 @@ fn connect() -> Result<UnixStream, i32> {
     UnixStream::connect(sock_path()).map_err(|e| {
         use std::io::ErrorKind::*;
         if matches!(e.kind(), NotFound | ConnectionRefused) {
-            eprintln!("spot isn't running: `spot start` starts it in the background (or run `spot` in a terminal)");
+            eprintln!("spot isn't running: `spot start` starts it in the background (or `spot` opens its window)");
             3
         } else {
             eprintln!("spot: {}: {e}", sock_path().display());

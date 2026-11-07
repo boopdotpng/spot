@@ -1,88 +1,32 @@
-// Colors: the theme families, light / dark, and the terminal's own background.
+// Colors: the theme families, each light and dark, and what the window paints with them.
 
 use crate::*;
+use rune::Color;
 
-/// One palette per theme family and light/dark; ANSI fallback without truecolor.
+/// One family's palette for light or dark, plus the surfaces the window derives from it.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Theme {
     pub accent: Color,  // focus, playing
-    pub accent2: Color, // context name
-    pub deep: Color,    // unfocused selection, progress track
-    pub hl: Color,      // focused selection background
+    pub accent2: Color, // where it's playing from
+    pub deep: Color,    // progress track, quiet fills
+    pub hl: Color,      // the selected row
     pub text: Color,
     pub sub: Color,
-    pub dim: Color, // borders, durations
-    pub gold: Color, // shuffle / repeat / prompt labels
+    pub dim: Color, // durations, rules
+    pub gold: Color, // shuffle / repeat
     pub pink: Color, // Liked Songs
     pub err: Color,
+    pub bg: Color,      // the window: a near-neutral, only a breath of the family's hue
+    pub side: Color,    // the sidebar and the player: a hair off the window
+    pub raised: Color,  // fields, cards, menus
+    pub line: Color,    // hairlines between regions
+    pub wash: Color,    // quiet fills: hover, empty covers, tracks of bars
+    pub sel: Color,     // the selected row
+    pub on_accent: Color, // text on an accent fill
+    pub dark: bool,
 }
 
-/// Ask the terminal for its background (OSC 11): sets BG, and LIGHT unless `SPOT_THEME=light|dark`
-/// forces it. Must run before the input thread starts reading stdin, or it eats the reply.
-pub fn probe_terminal() {
-    use std::sync::atomic::Ordering::Relaxed;
-    use terminal_colorsaurus::{QueryOptions, ThemeMode, color_palette};
-    let p = color_palette(QueryOptions::default()).ok();
-    if let Some(p) = &p {
-        let (r, g, b) = p.background.scale_to_8bit();
-        BG.store(u32::from_be_bytes([0, r, g, b]), Relaxed);
-    }
-    let light = match std::env::var("SPOT_THEME").as_deref() {
-        Ok("light") => true,
-        Ok("dark") => false,
-        _ => p.is_some_and(|p| p.theme_mode() == ThemeMode::Light),
-    };
-    LIGHT.store(light, Relaxed);
-}
-
-/// Terminal background as 0xRRGGBB; NO_BG until the terminal tells us.
-pub static BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(NO_BG);
-pub const NO_BG: u32 = u32::MAX;
-
-/// `a` moved `t` of the way toward `b` (0xRRGGBB).
-pub fn mix(a: u32, b: u32, t: f32) -> u32 {
-    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
-    [16, 8, 0].iter().fold(0, |acc, &sh| acc | (((ch(a, sh) + (ch(b, sh) - ch(a, sh)) * t).round() as u32) << sh))
-}
-
-pub fn rgb_hex(c: Color) -> Option<u32> {
-    match c {
-        Color::Rgb(r, g, b) => Some(u32::from_be_bytes([0, r, g, b])),
-        _ => None,
-    }
-}
-
-pub fn bg_hex() -> Option<u32> {
-    Some(BG.load(std::sync::atomic::Ordering::Relaxed)).filter(|&b| b != NO_BG)
-}
-
-pub fn hex_rgb(h: u32) -> Color {
-    Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
-}
-
-/// Background for the sidebar and player bar: the terminal's own background nudged a few percent
-/// toward the theme's text color. None without truecolor or a known background (no tint then).
-pub fn panel(th: &Theme) -> Option<u32> {
-    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
-    Some(mix(bg_hex()?, rgb_hex(th.text)?, if light { 0.045 } else { 0.06 }))
-}
-
-/// OSC 11 reply body, `11;rgb:RRRR/GGGG/BBBB` (1-4 hex digits per channel), as 0xRRGGBB.
-pub fn parse_bg_reply(body: &[u8]) -> Option<u32> {
-    let rest = std::str::from_utf8(body).ok()?.strip_prefix("11;rgb:")?;
-    let mut out = 0;
-    for part in rest.split('/') {
-        if !(1..=4).contains(&part.len()) {
-            return None;
-        }
-        let max = (1u32 << (4 * part.len())) - 1;
-        out = (out << 8) | (u32::from_str_radix(part, 16).ok()? * 255 / max);
-    }
-    Some(out)
-}
-
-/// Current light/dark mode; flipped live when the terminal reports a color scheme change.
-pub static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Index into families(), cycled with ctrl+t and remembered in the cache dir.
+/// Index into families(), cycled with ⌘T and remembered in the cache dir.
 pub static FAMILY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Theme families as (name, dark, light). Each palette is
@@ -147,55 +91,57 @@ pub fn families() -> &'static [Family] {
     LIVE.get_or_init(|| merged(vec![]))
 }
 
-pub fn theme() -> &'static Theme {
-    use std::sync::atomic::Ordering::Relaxed;
-    static T: std::sync::OnceLock<Vec<Theme>> = std::sync::OnceLock::new();
-    let t = T.get_or_init(|| {
-        let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
-        families().iter().flat_map(|(_, dark, light)| [palette(truecolor.then_some(dark), false), palette(truecolor.then_some(light), true)]).collect()
-    });
-    &t[FAMILY.load(Relaxed) * 2 + LIGHT.load(Relaxed) as usize]
+/// 0xRRGGBB (sRGB) as a color.
+pub fn rgb(h: u32) -> Color {
+    let ch = |sh: u32| rune::color::srgb_decode(((h >> sh) & 0xff) as f32 / 255.0);
+    Color { r: ch(16), g: ch(8), b: ch(0), a: 1.0 }
 }
 
-pub fn palette(hex: Option<&[u32; 10]>, light: bool) -> Theme {
-    let rgb = |h: u32| Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8);
-    match (hex, light) {
-        (Some(h), _) => Theme {
-            accent: rgb(h[0]),
-            accent2: rgb(h[1]),
-            deep: rgb(h[2]),
-            hl: rgb(h[3]),
-            text: rgb(h[4]),
-            sub: rgb(h[5]),
-            dim: rgb(h[6]),
-            gold: rgb(h[7]),
-            pink: rgb(h[8]),
-            err: rgb(h[9]),
-        },
-        (None, false) => Theme {
-            accent: Color::Yellow,
-            accent2: Color::Yellow,
-            deep: Color::DarkGray,
-            hl: Color::DarkGray,
-            text: Color::White,
-            sub: Color::Gray,
-            dim: Color::DarkGray,
-            gold: Color::LightYellow,
-            pink: Color::Magenta,
-            err: Color::Red,
-        },
-        (None, true) => Theme {
-            accent: Color::Yellow,
-            accent2: Color::Yellow,
-            deep: Color::Gray,
-            hl: Color::Gray,
-            text: Color::Black,
-            sub: Color::DarkGray,
-            dim: Color::Gray,
-            gold: Color::Red,
-            pink: Color::Magenta,
-            err: Color::Red,
-        },
+/// The current family, light or dark.
+pub fn theme(dark: bool) -> Theme {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all = families();
+    let f = &all[FAMILY.load(Relaxed).min(all.len() - 1)];
+    palette(if dark { &f.1 } else { &f.2 }, dark)
+}
+
+pub fn palette(h: &[u32; 10], dark: bool) -> Theme {
+    let c = h.map(rgb);
+    let deep = c[2];
+    // The surfaces are near-neutral greys that keep only a trace of the family's hue, so the
+    // color in the window comes from the music (covers, the glow) and the accents, not from
+    // one tint over everything.
+    let [_, da, db, _] = deep.to_oklab();
+    let hue = db.atan2(da).to_degrees();
+    let grey = |l: f32, c: f32| rune::color::oklch(l, c, hue);
+    let (bg, side, raised) = if dark {
+        (grey(0.175, 0.007), grey(0.155, 0.007), grey(0.235, 0.009))
+    } else {
+        (grey(0.985, 0.003), grey(0.965, 0.005), Color::WHITE)
+    };
+    let text = c[4];
+    let (line, wash) = if dark { (text.alpha(0.08), text.alpha(0.06)) } else { (text.alpha(0.1), text.alpha(0.055)) };
+    let sel = c[0].alpha(if dark { 0.16 } else { 0.13 });
+    let on_accent = if c[0].luminance() > 0.35 { bg.mix(Color::BLACK, 0.4) } else { Color::WHITE };
+    Theme {
+        accent: c[0],
+        accent2: c[1],
+        deep,
+        hl: c[3],
+        text: c[4],
+        sub: c[5],
+        dim: c[6],
+        gold: c[7],
+        pink: c[8],
+        err: c[9],
+        bg,
+        side,
+        raised,
+        line,
+        wash,
+        sel,
+        on_accent,
+        dark,
     }
 }
 
@@ -207,4 +153,69 @@ pub fn cycle_family() -> &'static str {
     FAMILY.store(i, Relaxed);
     let _ = fs::write(cache_dir().join("theme"), &all[i].0);
     &all[i].0
+}
+
+/// Switch to family `i` (a dot under the sidebar) and remember it.
+pub fn set_family(i: usize) {
+    let all = families();
+    let i = i.min(all.len() - 1);
+    FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
+    let _ = fs::write(cache_dir().join("theme"), &all[i].0);
+}
+
+/// A family's accent, light or dark, for its dot.
+pub fn family_accent(i: usize, dark: bool) -> Color {
+    let f = &families()[i];
+    rgb(if dark { f.1[0] } else { f.2[0] })
+}
+
+/// Two colors for a thing with no art of its own (a playlist, an artist), picked from its name
+/// so it keeps them: a hue, and its neighbor a third of the way round, at the theme's lightness.
+pub fn swatch(name: &str, th: &Theme) -> (Color, Color) {
+    let h = name.bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x01000193));
+    let hue = (h % 360) as f32;
+    let step = 28.0 + (h >> 9) as f32 % 50.0;
+    let (l, c) = if th.dark { (0.68, 0.13) } else { (0.72, 0.12) };
+    (rune::color::oklch(l, c, hue), rune::color::oklch(l - 0.1, c, hue + step))
+}
+
+/// A cover's color (sRGB 0..1) as a Color, vivid enough to read as the cover's.
+pub fn cover_color(tint: [f32; 3], th: &Theme) -> Color {
+    let c = Color { r: rune::color::srgb_decode(tint[0]), g: rune::color::srgb_decode(tint[1]), b: rune::color::srgb_decode(tint[2]), a: 1.0 };
+    let [l, a, b, _] = c.to_oklab();
+    let chroma = (a * a + b * b).sqrt();
+    let hue = b.atan2(a);
+    let (lo, hi) = if th.dark { (0.5, 0.75) } else { (0.55, 0.78) };
+    let ch = chroma.clamp(0.0, 0.16);
+    Color::from_oklab([l.clamp(lo, hi), ch * hue.cos(), ch * hue.sin(), 1.0])
+}
+
+/// The remembered family, at startup.
+pub fn load_family() {
+    let name = fs::read_to_string(cache_dir().join("theme")).unwrap_or_default();
+    if let Some(i) = families().iter().position(|(n, ..)| n == name.trim()) {
+        FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_family_reads_on_its_own_background() {
+        for (_, dark, light) in families() {
+            for (p, is_dark) in [(dark, true), (light, false)] {
+                let th = palette(p, is_dark);
+                let (t, b) = (th.text.luminance() + 0.05, th.bg.luminance() + 0.05);
+                assert!(t.max(b) / t.min(b) > 7.0, "contrast {}", t.max(b) / t.min(b));
+            }
+        }
+    }
+
+    #[test]
+    fn hex_is_srgb() {
+        assert_eq!(rgb(0xffffff), Color::WHITE);
+        assert!((rgb(0x808080).r - 0.2158).abs() < 0.001);
+    }
 }

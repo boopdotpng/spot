@@ -3,6 +3,16 @@
 
 use crate::*;
 
+/// What to remember of an episode of `ms` left at `pos`: nothing just after its start, HEARD
+/// in its last minute (outros and credits, which nobody needs to come back for).
+fn progress_after(pos: u64, ms: u64) -> Option<u64> {
+    match pos {
+        0..5000 => None,
+        p if p + 60_000 >= ms => Some(HEARD),
+        p => Some(p),
+    }
+}
+
 impl App {
     pub fn toggle_shuffle(&mut self) {
         self.shuffle = !self.shuffle;
@@ -63,7 +73,9 @@ impl App {
     pub fn set_cur(&mut self, t: &Track, pos_ms: u64) {
         let Ok(uri) = SpotifyUri::from_uri(&t.uri) else { return };
         self.end_listen();
-        if self.lastfm.is_some() {
+        self.episode = t.is_episode().then(|| t.clone());
+        // podcasts don't scrobble
+        if self.lastfm.is_some() && !t.is_episode() {
             self.listen = Some(Listen { track: t.clone(), started: 0, listened: Duration::ZERO, since: None, announced: false });
         }
         if let Some(m) = &mut self.media {
@@ -81,6 +93,21 @@ impl App {
         self.pos_at = None;
         self.plays += 1;
         self.finished = false;
+    }
+
+    /// Remember where the playing episode has got to.
+    pub fn save_progress(&mut self) {
+        let Some(t) = self.episode.clone() else { return };
+        let Some(at) = progress_after(self.position(), t.ms) else { return };
+        if self.progress.insert(t.uri.clone(), at) == Some(at) {
+            return;
+        }
+        save_progress(&self.progress);
+        self.continuing.retain(|c| c.uri != t.uri);
+        if at != HEARD {
+            self.continuing.insert(0, t);
+        }
+        save_tracks(&continuing_path(), &self.continuing);
     }
 
     /// Scrobble the play that just ended, if it counts.
@@ -113,7 +140,10 @@ impl App {
         log::info!("play {} ({} - {})", t.uri, t.name, t.artists);
         self.ensure_session();
         self.reset_fade();
-        self.set_cur(&t, 0);
+        self.save_progress();
+        // an episode picks up where it was left; one heard to the end starts over
+        let at = self.progress.get(&t.uri).copied().filter(|_| t.is_episode()).filter(|&ms| ms != HEARD).unwrap_or(0);
+        self.set_cur(&t, at);
         self.load_cur();
         self.queue_changed();
     }
@@ -128,7 +158,8 @@ impl App {
         self.sync_media();
     }
 
-    pub fn save_last(&self) {
+    pub fn save_last(&mut self) {
+        self.save_progress();
         match &self.queue {
             Some(q) => save_last(q, self.position(), self.shuffle, self.repeat),
             None => {
@@ -432,7 +463,7 @@ impl App {
         v.tracks = tracks;
         v.loading = false;
         self.show(v, true);
-        self.tr_state = TableState::default().with_selected(idx);
+        self.tr_state = Sel::with(idx);
         self.focus = Focus::Tracks;
     }
 
@@ -546,6 +577,7 @@ impl App {
                 self.pos_ms = position_ms as u64;
                 self.pos_at = None;
                 self.pause_listen();
+                self.save_progress();
             }
             PlayerEvent::Seeked { track_id, position_ms, .. }
             | PlayerEvent::PositionCorrection { track_id, position_ms, .. }
@@ -562,6 +594,7 @@ impl App {
                 }
             }
             PlayerEvent::EndOfTrack { track_id, .. } if is_cur(&track_id, &self.cur) => {
+                self.save_progress();
                 if self.repeat == Repeat::One {
                     self.play_current();
                 } else {
@@ -611,5 +644,32 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn episode_progress_skips_the_start_and_finishes_in_the_last_minute() {
+        const HOUR: u64 = 3_600_000;
+        assert_eq!(progress_after(4_999, HOUR), None);
+        assert_eq!(progress_after(5_000, HOUR), Some(5_000));
+        assert_eq!(progress_after(HOUR - 60_001, HOUR), Some(HOUR - 60_001));
+        assert_eq!(progress_after(HOUR - 60_000, HOUR), Some(HEARD));
+        assert_eq!(progress_after(10_000, 30_000), Some(HEARD)); // shorter than the last minute
+    }
+
+    #[test]
+    fn a_shows_episodes_never_shuffle() {
+        let tracks = Arc::new(parse_tracks(5));
+        let mut q = Queue { key: "spotify:show:x".into(), name: String::new(), tracks: tracks.clone(), order: vec![], pos: 0 };
+        q.reorder(true, Some(2));
+        assert_eq!((q.order.as_slice(), q.pos), (&[0, 1, 2, 3, 4][..], 2));
+    }
+
+    fn parse_tracks(n: usize) -> Vec<Track> {
+        (0..n).filter_map(|i| parse_episode(&serde_json::json!({ "uri": format!("spotify:episode:{i}") }), Some(("show", 0)))).collect()
     }
 }

@@ -26,14 +26,14 @@ impl App {
                 self.history.remove(0);
             }
         }
-        self.tr_state = TableState::default().with_selected(0);
+        self.tr_state = Sel::with(0);
     }
 
     pub fn back(&mut self) {
         let Some((v, sel)) = self.history.pop() else { return };
         self.view = v;
         self.find = None;
-        self.tr_state = TableState::default().with_selected(sel);
+        self.tr_state = Sel::with(sel);
         self.focus = Focus::Tracks;
     }
 
@@ -62,6 +62,59 @@ impl App {
         let cached = v.tracks.clone();
         self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, pl.uri(), cached));
         self.show(v, true);
+    }
+
+    /// A show's episodes, newest first; `want` is an episode to land on.
+    pub fn open_show(&mut self, uri: String, name: String, want: Option<String>) {
+        let mut v = self.new_view(uri.clone(), name, Kind::Tracks);
+        v.want = want;
+        v.tracks = match &self.queue {
+            Some(q) if q.key == uri => q.tracks.clone(),
+            _ => Arc::new(read_tracks(&tracks_path(&list_key(&uri)))),
+        };
+        v.loading = v.tracks.is_empty();
+        let cached = v.tracks.clone();
+        self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
+        self.show(v, true);
+        self.focus = Focus::Tracks;
+    }
+
+    /// Enter on the podcast sidebar: a pinned list, or a followed show.
+    pub fn open_podcast_row(&mut self, l: Link) {
+        match l.uri.as_str() {
+            CONTINUE_KEY => self.open_continuing(l.name),
+            NEW_KEY => self.open_new_episodes(l.name),
+            _ => self.open_show(l.uri, l.name, None),
+        }
+    }
+
+    /// `Continue listening`: episodes part way through, last played first.
+    fn open_continuing(&mut self, title: String) {
+        let mut v = self.new_view(CONTINUE_KEY.into(), title, Kind::Tracks);
+        v.tracks = Arc::new(self.continuing.clone());
+        v.loading = false;
+        self.show(v, true);
+        self.focus = Focus::Tracks;
+    }
+
+    /// `New episodes`: instantly from the cache, less what's been heard since, then refreshed.
+    fn open_new_episodes(&mut self, title: String) {
+        let mut v = self.new_view(NEW_KEY.into(), title, Kind::Tracks);
+        let heard: HashSet<String> = self.progress.iter().filter(|(_, ms)| **ms == HEARD).map(|(u, _)| u.clone()).collect();
+        let mut cached = read_tracks(&tracks_path("new_episodes"));
+        cached.retain(|t| !heard.contains(&t.uri));
+        v.tracks = Arc::new(cached);
+        v.loading = v.tracks.is_empty();
+        let shows: Vec<Link> = self.shows.iter().filter(|s| is_show(&s.uri)).cloned().collect();
+        self.rt.spawn(load_new_episodes(self.api.clone(), shows, heard, self.tx.clone(), v.id, v.tracks.clone()));
+        self.show(v, true);
+        self.focus = Focus::Tracks;
+    }
+
+    /// `m`: the sidebar lists podcasts instead of playlists, or back.
+    pub fn toggle_podcasts(&mut self) {
+        self.podcasts = !self.podcasts;
+        self.focus = Focus::Playlists;
     }
 
     /// Search for what's in the prompt, unless those are already the results on show.
@@ -188,14 +241,16 @@ impl App {
         let sel = keep.and_then(|u| v.links.iter().position(|l| l.uri == u)).unwrap_or(0);
         self.find = None;
         self.matches.clear();
-        self.tr_state = TableState::default().with_selected(sel);
+        self.tr_state = Sel::with(sel);
     }
 
     /// Open an album or artist from a search result or an artist's releases.
     pub fn open_link(&mut self, i: usize) {
         let Some(l) = self.view.links.get(i).cloned() else { return };
-        if self.view.kind == Kind::Artists {
-            return self.open_artist(l.uri, l.name);
+        match self.view.kind {
+            Kind::Artists => return self.open_artist(l.uri, l.name),
+            Kind::Shows => return self.open_show(l.uri, l.name, None),
+            _ => {}
         }
         let by = self.view.artist.as_ref().unwrap_or(&l.sub);
         self.open_album(l.uri.clone(), format!("{} — {by}", l.name), None);
@@ -214,14 +269,25 @@ impl App {
 
     pub fn goto_album(&mut self) {
         let Some(t) = self.target_track() else { return };
+        if t.is_episode() {
+            return self.goto_show(t);
+        }
         let Some(uri) = id_uri("album", t.album_id) else { return };
         self.open_album(uri, format!("{} — {}", t.album, t.artists), Some(t.uri));
     }
 
     pub fn goto_artist(&mut self) {
         let Some(t) = self.target_track() else { return };
+        if t.is_episode() {
+            return self.goto_show(t);
+        }
         let Some(uri) = id_uri("artist", t.artist_id) else { return };
         self.open_artist(uri, t.artists[..t.lead].to_string());
+    }
+
+    fn goto_show(&mut self, t: Track) {
+        let Some(uri) = id_uri("show", t.album_id) else { return };
+        self.open_show(uri, t.artists, Some(t.uri));
     }
 
     /// Enter on a row: play a track (queueing the whole list) or open an album/artist.
@@ -264,11 +330,17 @@ impl App {
 }
 
 impl App {
-    pub fn move_sel(&mut self, d: isize) {
-        let (len, cur) = match self.focus {
+    /// How many rows the focused pane lists, and the cursor's.
+    fn focused_rows(&self) -> (usize, Option<usize>) {
+        match self.focus {
+            Focus::Playlists if self.podcasts => (self.shows.len(), self.sh_state.selected()),
             Focus::Playlists => (self.playlists.len(), self.pl_state.selected()),
             Focus::Tracks => (self.shown().len(), self.tr_state.selected()),
-        };
+        }
+    }
+
+    pub fn move_sel(&mut self, d: isize) {
+        let (len, cur) = self.focused_rows();
         if len == 0 {
             return;
         }
@@ -276,16 +348,14 @@ impl App {
         // single steps wrap around the ends; bigger jumps (page, top/bottom) stop at them
         let n = if d.abs() == 1 { to.rem_euclid(len as isize) } else { to.clamp(0, len as isize - 1) } as usize;
         match self.focus {
+            Focus::Playlists if self.podcasts => self.sh_state.select(Some(n)),
             Focus::Playlists => self.pl_state.select(Some(n)),
             Focus::Tracks => self.tr_state.select(Some(n)),
         }
     }
 
     pub fn move_to_middle(&mut self) {
-        let (len, cur) = match self.focus {
-            Focus::Playlists => (self.playlists.len(), self.pl_state.selected()),
-            Focus::Tracks => (self.shown().len(), self.tr_state.selected()),
-        };
+        let (len, cur) = self.focused_rows();
         self.move_sel((len / 2) as isize - cur.unwrap_or(0) as isize);
     }
 }

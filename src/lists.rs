@@ -1,5 +1,5 @@
-// Track lists: Liked Songs, playlists, albums and artists (every song), fetched fresh and
-// compared with the cached copy; and an artist's releases.
+// Track lists: Liked Songs, playlists, albums, artists (every song) and shows (every episode),
+// fetched fresh and compared with the cached copy; and an artist's releases.
 
 use crate::*;
 
@@ -8,7 +8,7 @@ pub fn list_key(uri: &str) -> String {
     uri.strip_prefix("spotify:playlist:").map_or_else(|| uri_key(uri), String::from)
 }
 
-/// The songs of `uri` (`liked`, or a playlist, album or artist uri) fresh from Spotify, or None
+/// The songs of `uri` (`liked`, or a playlist, album, artist or show uri) fresh from Spotify, or None
 /// when `cached` is still current; saved to the cache when they changed. With nothing cached,
 /// they also stream to `view` as they load.
 pub async fn fetch_list(api: Arc<Api>, sess: Sess, uri: &str, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
@@ -16,6 +16,8 @@ pub async fn fetch_list(api: Arc<Api>, sess: Sess, uri: &str, cached: &[Track], 
         liked_tracks(api, cached, tx, view).await?
     } else if let Some(id) = uri.strip_prefix("spotify:playlist:") {
         playlist_tracks(sess, id, cached, tx, view).await?
+    } else if is_show(uri) {
+        show_episodes(&api, uri, cached, tx, view).await?
     } else {
         let session = ready(sess).await?;
         let artist = uri.starts_with("spotify:artist:");
@@ -140,6 +142,90 @@ pub async fn liked_tracks(api: Arc<Api>, cached: &[Track], tx: &mpsc::Sender<Msg
     Ok(Some(got))
 }
 
+/// New episodes land at the top: if the first pages' last one is in `cached`, what's after it
+/// there is the rest of the show, provided that adds up to `total`.
+fn merge_newest(got: &[Track], cached: &[Track], total: usize) -> Option<Vec<Track>> {
+    let last = &got.last()?.uri;
+    let j = cached.iter().position(|t| &t.uri == last)?;
+    let merged: Vec<Track> = got.iter().chain(&cached[j + 1..]).cloned().collect();
+    (merged.len() == total).then_some(merged)
+}
+
+/// A show's episodes, newest first, or None if `cached` is still current. A web API call, unlike
+/// albums': the internal metadata doesn't list a show's episodes in the same order or with dates.
+pub async fn show_episodes(api: &Api, uri: &str, cached: &[Track], tx: &mpsc::Sender<Msg>, view: u64) -> Result<Option<Vec<Track>>, String> {
+    let id = uri.strip_prefix("spotify:show:").unwrap_or(uri);
+    let show = api.get(&format!("{API}/shows/{id}")).await.map_err(|e| format!("podcast: {e}"))?;
+    let name = show["name"].as_str().unwrap_or("?").to_string();
+    let show_id = librespot_core::SpotifyId::from_base62(id).map_or(0, |i| i.id);
+    let mut page = show["episodes"].clone();
+    let mut got: Vec<Track> = vec![];
+    loop {
+        let eps: Vec<Track> = page["items"].as_array().into_iter().flatten().filter_map(|e| parse_episode(e, Some((&name, show_id)))).collect();
+        if cached.is_empty() {
+            let _ = tx.send(Msg::Tracks { view, tracks: eps.clone(), done: false });
+        }
+        got.extend(eps);
+        if let Some(all) = merge_newest(&got, cached, page["total"].as_u64().unwrap_or(0) as usize) {
+            let same = same_uris(all.iter().map(|t| &t.uri), cached.iter().map(|t| &t.uri));
+            return Ok((!same).then_some(all));
+        }
+        let Some(next) = page["next"].as_str() else { break };
+        page = api.get(next).await.map_err(|e| format!("podcast: {e}"))?;
+    }
+    Ok(Some(got))
+}
+
+/// `New episodes`: the latest few of each followed show that haven't been heard, newest first.
+/// One request per show, so it's fetched when opened, a few at a time.
+pub async fn load_new_episodes(api: Arc<Api>, shows: Vec<Link>, heard: HashSet<String>, tx: mpsc::Sender<Msg>, view: u64, cached: Arc<Vec<Track>>) {
+    const PARALLEL: usize = 8;
+    const EACH: usize = 5;
+    const SHOWN: usize = 50;
+    let latest = |s: Link| {
+        let api = api.clone();
+        tokio::spawn(async move {
+            let id = s.uri.strip_prefix("spotify:show:").unwrap_or(&s.uri).to_string();
+            let v = api.get(&format!("{API}/shows/{id}/episodes?limit={EACH}")).await?;
+            let show_id = librespot_core::SpotifyId::from_base62(&id).map_or(0, |i| i.id);
+            let items = v["items"].as_array().into_iter().flatten();
+            Ok::<_, String>(items.filter_map(|e| parse_episode(e, Some((&s.name, show_id)))).collect::<Vec<_>>())
+        })
+    };
+    let mut shows = shows.into_iter();
+    let mut pending = std::collections::VecDeque::new();
+    let mut found = vec![];
+    loop {
+        while pending.len() < PARALLEL
+            && let Some(s) = shows.next()
+        {
+            pending.push_back(latest(s));
+        }
+        let Some(next) = pending.pop_front() else { break };
+        match next.await.map_err(|e| e.to_string()).and_then(|r| r) {
+            Ok(eps) => found.extend(eps),
+            // one show failing shouldn't cost the rest
+            Err(e) => drop(tx.send(Msg::Error(format!("new episodes: {e}")))),
+        }
+    }
+    let fresh = newest_unheard(found, &heard, SHOWN);
+    save_tracks(&tracks_path("new_episodes"), &fresh);
+    let _ = tx.send(if cached.is_empty() {
+        Msg::Tracks { view, tracks: fresh, done: false }
+    } else {
+        Msg::Replace { view, tracks: Arc::new(fresh) }
+    });
+    let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
+}
+
+/// Release dates are `YYYY-MM-DD`, so they sort as text.
+fn newest_unheard(mut eps: Vec<Track>, heard: &HashSet<String>, n: usize) -> Vec<Track> {
+    eps.retain(|t| !heard.contains(&t.uri));
+    eps.sort_by(|a, b| b.album.cmp(&a.album));
+    eps.truncate(n);
+    eps
+}
+
 /// Resolve track uris to names in batches, streaming them to the view in order (unless it's
 /// showing a cached copy, `stream` false); returns them all.
 /// `dedupe` drops repeats of the same song (single + album versions in a discography).
@@ -217,4 +303,42 @@ pub async fn artist_albums(session: &Session, uri: &str) -> Result<Vec<String>, 
         .filter_map(|g| g.album.first())
         .filter_map(|al| gid_uri("album", al.gid()))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn episodes(ids: &[u8]) -> Vec<Track> {
+        let ep = |i: &u8| parse_episode(&serde_json::json!({ "uri": format!("spotify:episode:{i}") }), Some(("show", 0)));
+        ids.iter().filter_map(ep).collect()
+    }
+
+    fn uris(t: &[Track]) -> Vec<&str> {
+        t.iter().map(|t| t.uri.rsplit(':').next().unwrap_or("")).collect()
+    }
+
+    #[test]
+    fn new_episodes_are_the_newest_unheard_across_shows() {
+        let mut eps = episodes(&[1, 2, 3, 4]);
+        for (t, date) in eps.iter_mut().zip(["2026-01-05", "2026-03-01", "2026-02-10", "2026-04-20"]) {
+            t.album = date.into();
+        }
+        let heard = HashSet::from(["spotify:episode:4".to_string()]);
+        assert_eq!(uris(&newest_unheard(eps, &heard, 2)), ["2", "3"]);
+    }
+
+    #[test]
+    fn new_episodes_go_on_top_of_the_cached_show() {
+        let all = merge_newest(&episodes(&[6, 5, 4]), &episodes(&[4, 3, 2, 1]), 6).unwrap();
+        assert_eq!(uris(&all), ["6", "5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn a_show_that_doesnt_add_up_is_fetched_in_full() {
+        let cached = episodes(&[4, 3, 2, 1]);
+        assert!(merge_newest(&episodes(&[6, 5, 4]), &cached, 5).is_none()); // one was taken down
+        assert!(merge_newest(&episodes(&[9, 8]), &cached, 6).is_none()); // nothing in common yet
+        assert!(merge_newest(&episodes(&[9, 8]), &[], 2).is_none());
+    }
 }

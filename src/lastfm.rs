@@ -136,11 +136,19 @@ pub fn lastfm_token(key: &str, redirect: &str) -> Result<String, String> {
     if open::that(auth.as_str()).is_err() {
         println!("Open {auth}");
     }
-    // Polled through crossterm (not a stdin thread) so nothing is left reading input once the TUI starts.
+    // enter skips: a line on stdin (the thread is left behind, reading, until spot exits; the
+    // terminal is only borrowed for setup, so that's soon)
+    let skip = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = skip.clone();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_ok_and(|n| n > 0) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     let skipped = || {
-        use ratatui::crossterm::event::{Event, poll, read};
-        poll(Duration::from_millis(100)).unwrap_or(false)
-            && matches!(read(), Ok(Event::Key(k)) if matches!(k.code, KeyCode::Enter | KeyCode::Esc))
+        std::thread::sleep(Duration::from_millis(100));
+        skip.load(std::sync::atomic::Ordering::Relaxed)
     };
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {

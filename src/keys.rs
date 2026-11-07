@@ -1,249 +1,170 @@
-// Keyboard: reading keys from the terminal, and what each one does.
+// Keyboard: what each key does. The window turns its key events into `Key`s; typing in the
+// search and find fields arrives as their text (set_search, set_find), the keys that aren't
+// typing (enter, esc, tab, arrows) as `Key`s.
 
 use crate::*;
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Tab,
+    BackTab,
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Backspace,
+}
+
 impl App {
-    pub fn on_find_key(&mut self, k: KeyEvent) {
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        match k.code {
-            KeyCode::Esc => self.close_find(),
-            KeyCode::Enter => {
+    /// The find field's text changed.
+    pub fn set_find(&mut self, text: &str) {
+        self.focus = Focus::Tracks;
+        self.find = Some(text.to_string());
+        self.refilter();
+        self.tr_state.select(Some(0));
+    }
+
+    /// The find field's keys that aren't typing. True when it took the key.
+    pub fn on_find_key(&mut self, k: Key) -> bool {
+        match k {
+            Key::Esc => self.close_find(),
+            Key::Enter => {
                 // play the match, but queue the whole list so playback continues through the playlist
                 if let Some(i) = self.selected_track() {
                     self.close_find();
                     self.activate(i);
                 }
             }
-            KeyCode::Down => self.move_sel(1),
-            KeyCode::Up => self.move_sel(-1),
-            KeyCode::Char('n') if ctrl => self.move_sel(1),
-            KeyCode::Char('p') if ctrl => self.move_sel(-1),
-            KeyCode::Backspace => {
-                if let Some(f) = &mut self.find {
-                    f.pop();
-                }
-                self.refilter();
-                self.tr_state.select(Some(0));
-            }
-            KeyCode::Char(c) if !ctrl => {
-                if let Some(f) = &mut self.find {
-                    f.push(c);
-                }
-                self.refilter();
-                self.tr_state.select(Some(0));
-            }
-            _ => {}
+            Key::Down => self.move_sel(1),
+            Key::Up => self.move_sel(-1),
+            Key::PageDown => self.move_sel(15),
+            Key::PageUp => self.move_sel(-15),
+            _ => return false,
         }
+        true
     }
 
-    /// The `/` prompt. Results come as you type: enter keeps them, esc goes back to what was open.
-    pub fn on_search_key(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Enter => {
+    /// The search field's text changed: results come as you type.
+    pub fn set_search(&mut self, text: &str) {
+        if self.input.as_deref() == Some(text) {
+            return;
+        }
+        self.input = Some(text.to_string());
+        self.search_soon();
+    }
+
+    /// The search field's keys that aren't typing: enter keeps the results, esc goes back to
+    /// what was open. True when it took the key.
+    pub fn on_search_key(&mut self, k: Key) -> bool {
+        match k {
+            Key::Enter => {
                 self.search_at = None;
                 self.run_search();
                 self.input = None;
                 self.live_search = false;
+                self.focus = Focus::Tracks;
             }
-            KeyCode::Esc => {
+            Key::Esc => {
                 self.input = None;
                 self.search_at = None;
                 self.end_live_search();
             }
-            KeyCode::Tab => {
-                self.search_kind = self.search_kind.next();
-                self.search_at = Some(Instant::now()); // nothing being typed to wait for
-            }
-            KeyCode::Up if self.live_search => self.move_sel(-1),
-            KeyCode::Down if self.live_search => self.move_sel(1),
-            KeyCode::Backspace => {
-                self.input.as_mut().map(String::pop);
-                self.search_soon();
-            }
-            KeyCode::Char(c) => {
-                if let Some(buf) = &mut self.input {
-                    buf.push(c);
-                }
-                self.search_soon();
-            }
-            _ => {}
+            Key::Tab => self.cycle_search_kind(false),
+            Key::BackTab => self.cycle_search_kind(true),
+            Key::Up if self.live_search => self.move_sel(-1),
+            Key::Down if self.live_search => self.move_sel(1),
+            _ => return false,
         }
+        true
     }
 
-    pub fn on_key(&mut self, k: KeyEvent) {
-        // wherever you are: like closing the terminal, not like q
-        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-            return self.detach_terminal_saying("detached; `spot` brings it back");
-        }
+    pub fn cycle_search_kind(&mut self, back: bool) {
+        self.search_kind = if back { (0..3).fold(self.search_kind, |k, _| k.next()) } else { self.search_kind.next() };
+        self.search_at = Some(Instant::now()); // nothing being typed to wait for
+    }
+
+    /// A key while no field has the keyboard. `cmd` is ⌘ (or ⌃) held. True when it did something.
+    pub fn on_key(&mut self, k: Key, cmd: bool) -> bool {
         if self.help {
             // any key closes the key help
             self.help = false;
-            return;
+            return true;
         }
-        if self.find.is_some() {
-            return self.on_find_key(k);
-        }
-        if self.input.is_some() {
-            return self.on_search_key(k);
-        }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        match k.code {
-            KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('d') if !ctrl => self.detach_terminal_saying("detached; `spot` brings it back"),
-            KeyCode::Char('/') => self.input = Some(String::new()),
-            KeyCode::Char('?') => self.help = !self.help,
-            KeyCode::Char('t') if ctrl => {
+        self.status.clear();
+        match k {
+            Key::Char('t') if cmd => {
                 self.note = Some((format!("theme: {}", cycle_family()), Instant::now() + Duration::from_millis(1500)))
             }
-            KeyCode::Char('f') if ctrl => {
-                self.focus = Focus::Tracks;
-                self.find = Some(String::new());
-                self.tr_state.select(Some(0));
-            }
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
-                self.focus = match (&self.focus, k.code) {
-                    (_, KeyCode::Left | KeyCode::Char('h')) => Focus::Playlists,
-                    (_, KeyCode::Right | KeyCode::Char('l')) => Focus::Tracks,
+            _ if cmd => return false,
+            Key::Char('?') => self.help = true,
+            Key::Tab | Key::BackTab | Key::Left | Key::Right | Key::Char('h') | Key::Char('l') => {
+                self.focus = match (&self.focus, k) {
+                    (_, Key::Left | Key::Char('h')) => Focus::Playlists,
+                    (_, Key::Right | Key::Char('l')) => Focus::Tracks,
                     (Focus::Playlists, _) => Focus::Tracks,
                     (Focus::Tracks, _) => Focus::Playlists,
                 }
             }
-            KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('s') => self.toggle_shuffle(),
-            KeyCode::Char('r') => self.cycle_repeat(),
-            KeyCode::Char('P') => self.play_from_view(None),
-            KeyCode::Char('a') => self.goto_album(),
-            KeyCode::Char('A') => self.goto_artist(),
-            KeyCode::Char('v') => self.toggle_artist_mode(),
-            KeyCode::Char('f') => self.cycle_releases(),
-            KeyCode::Esc | KeyCode::Backspace => self.back(),
-            KeyCode::Char('n') => self.skip_soon(1),
-            KeyCode::Char('p') => self.prev(),
-            KeyCode::Char('.') => self.seek_by(SeekDirection::Forward, Duration::from_secs(10)),
-            KeyCode::Char(',') => self.seek_by(SeekDirection::Backward, Duration::from_secs(10)),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.set_volume(3277),
-            KeyCode::Char('-') => self.set_volume(-3277),
-            KeyCode::Char('o') => self.show_queue(),
-            KeyCode::Char('e') => self.enqueue_selected(),
-            KeyCode::Char('Q') => self.open_queue(),
-            KeyCode::Char('x') => self.dequeue_selected(),
-            KeyCode::Enter => match self.focus {
-                Focus::Playlists => {
-                    if let Some(i) = self.pl_state.selected() {
-                        self.open_playlist(i);
-                        self.focus = Focus::Tracks;
-                    }
-                }
-                Focus::Tracks => {
-                    if let Some(i) = self.selected_track() {
-                        self.activate(i);
-                    }
-                }
-            },
-            KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
-            KeyCode::PageDown | KeyCode::Char('d') if k.code == KeyCode::PageDown || ctrl => self.move_sel(15),
-            KeyCode::PageUp | KeyCode::Char('u') if k.code == KeyCode::PageUp || ctrl => self.move_sel(-15),
-            KeyCode::Char('g') | KeyCode::Home => self.move_sel(isize::MIN / 2),
-            KeyCode::Char('G') | KeyCode::End => self.move_sel(isize::MAX / 2),
-            KeyCode::Char('M') => self.move_to_middle(),
-            _ => {}
+            Key::Char(' ') => self.toggle(),
+            Key::Char('s') => self.toggle_shuffle(),
+            Key::Char('r') => self.cycle_repeat(),
+            Key::Char('P') => self.play_from_view(None),
+            Key::Char('a') => self.goto_album(),
+            Key::Char('A') => self.goto_artist(),
+            Key::Char('m') => self.toggle_podcasts(),
+            Key::Char('v') => self.toggle_artist_mode(),
+            Key::Char('f') => self.cycle_releases(),
+            Key::Esc | Key::Backspace => self.back(),
+            Key::Char('n') => self.skip_soon(1),
+            Key::Char('p') => self.prev(),
+            Key::Char('.') => self.seek_by(SeekDirection::Forward, Duration::from_secs(10)),
+            Key::Char(',') => self.seek_by(SeekDirection::Backward, Duration::from_secs(10)),
+            Key::Char('+') | Key::Char('=') => self.set_volume(3277),
+            Key::Char('-') => self.set_volume(-3277),
+            Key::Char('o') => self.show_queue(),
+            Key::Char('e') => self.enqueue_selected(),
+            Key::Char('Q') => self.open_queue(),
+            Key::Char('x') => self.dequeue_selected(),
+            Key::Enter => self.enter(),
+            Key::Down | Key::Char('j') => self.move_sel(1),
+            Key::Up | Key::Char('k') => self.move_sel(-1),
+            Key::PageDown => self.move_sel(15),
+            Key::PageUp => self.move_sel(-15),
+            Key::Char('g') | Key::Home => self.move_sel(isize::MIN / 2),
+            Key::Char('G') | Key::End => self.move_sel(isize::MAX / 2),
+            Key::Char('M') => self.move_to_middle(),
+            _ => return false,
         }
+        true
     }
-}
 
-/// Parse raw terminal input. Crossterm's reader can't be used: it treats the terminal's color
-/// scheme report (`CSI ? 997 ; 1|2 n`) as an unfinished sequence and swallows the keys after it.
-pub fn parse_input(b: &[u8]) -> Vec<Msg> {
-    let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
-    let ctrl = |c: u8| Msg::Key(KeyEvent::new(KeyCode::Char(c as char), KeyModifiers::CONTROL));
-    let mut out = vec![];
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            // a lone ESC at the end of a read is the Esc key; otherwise it starts a sequence
-            0x1b if i + 1 == b.len() => {
-                out.push(key(KeyCode::Esc));
-                i += 1;
-            }
-            0x1b => match b[i + 1] {
-                b'[' => {
-                    let start = i + 2;
-                    let Some(len) = b[start..].iter().position(|c| (0x40..=0x7e).contains(c)) else { break };
-                    let (params, fin) = (&b[start..start + len], b[start + len]);
-                    i = start + len + 1;
-                    let first = params.split(|&c| c == b';').next().unwrap_or(b"");
-                    out.extend(match (fin, first) {
-                        (b'A', _) => Some(key(KeyCode::Up)),
-                        (b'B', _) => Some(key(KeyCode::Down)),
-                        (b'C', _) => Some(key(KeyCode::Right)),
-                        (b'D', _) => Some(key(KeyCode::Left)),
-                        (b'H', _) | (b'~', b"1" | b"7") => Some(key(KeyCode::Home)),
-                        (b'F', _) | (b'~', b"4" | b"8") => Some(key(KeyCode::End)),
-                        (b'~', b"5") => Some(key(KeyCode::PageUp)),
-                        (b'~', b"6") => Some(key(KeyCode::PageDown)),
-                        (b'Z', _) => Some(Msg::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))),
-                        (b'n', _) if params == b"?997;1" || params == b"?997;2" => {
-                            Some(Msg::Scheme(params == b"?997;2"))
-                        }
-                        _ => None,
-                    });
+    /// Enter (or a double click): open the sidebar's list, or play / open the row.
+    pub fn enter(&mut self) {
+        match self.focus {
+            Focus::Playlists if self.podcasts => {
+                if let Some(l) = self.sh_state.selected().and_then(|i| self.shows.get(i)).cloned() {
+                    self.open_podcast_row(l);
+                    self.focus = Focus::Tracks;
                 }
-                b'O' if i + 2 < b.len() => {
-                    out.extend(match b[i + 2] {
-                        b'A' => Some(key(KeyCode::Up)),
-                        b'B' => Some(key(KeyCode::Down)),
-                        b'C' => Some(key(KeyCode::Right)),
-                        b'D' => Some(key(KeyCode::Left)),
-                        b'H' => Some(key(KeyCode::Home)),
-                        b'F' => Some(key(KeyCode::End)),
-                        _ => None,
-                    });
-                    i += 3;
+            }
+            Focus::Playlists => {
+                if let Some(i) = self.pl_state.selected() {
+                    self.open_playlist(i);
+                    self.focus = Focus::Tracks;
                 }
-                // OSC: the background color we ask for when the scheme changes; skip anything else
-                b']' => {
-                    i += 2;
-                    let start = i;
-                    while i < b.len() && b[i] != 0x07 && !(b[i] == 0x1b && b.get(i + 1) == Some(&b'\\')) {
-                        i += 1;
-                    }
-                    out.extend(parse_bg_reply(&b[start..i]).map(Msg::Background));
-                    i += if b.get(i) == Some(&0x1b) { 2 } else { 1 };
+            }
+            Focus::Tracks => {
+                if let Some(i) = self.selected_track() {
+                    self.activate(i);
                 }
-                // Alt+key: unused, drop both bytes
-                _ => i += 2,
-            },
-            b'\r' | b'\n' => {
-                out.push(key(KeyCode::Enter));
-                i += 1;
-            }
-            b'\t' => {
-                out.push(key(KeyCode::Tab));
-                i += 1;
-            }
-            0x7f | 0x08 => {
-                out.push(key(KeyCode::Backspace));
-                i += 1;
-            }
-            c @ 0x01..=0x1a => {
-                out.push(ctrl(b'a' + c - 1));
-                i += 1;
-            }
-            c if c < 0x20 => i += 1,
-            c => {
-                let len = match c {
-                    0xf0.. => 4,
-                    0xe0.. => 3,
-                    0xc0.. => 2,
-                    _ => 1,
-                };
-                if let Some(ch) = b.get(i..i + len).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.chars().next()) {
-                    out.push(key(KeyCode::Char(ch)));
-                }
-                i += len;
             }
         }
     }
-    out
 }

@@ -17,8 +17,8 @@ mistake in the file shows on the status line and in the log, and that setting ke
 | `quality` | `320` | `96`, `160`, `320` | Audio quality in kbps. 320 is the most librespot can stream. |
 | `audio_cache_gb` | `1` | `0` or above; decimals work | How much played music to keep on disk, least recently played dropped first. `0` turns the cache off. `SPOT_AUDIO_CACHE_GB` overrides it. |
 | `normalize` | `true` | `true`, `false` | Play every song at about the same loudness, using Spotify's loudness data. |
-| `hotkey` | `"option+space"` | modifiers (`ctrl`, `option`, `cmd`, `shift`) and a key (a letter, digit, `space`, `return`, `tab`, `f1`-`f12`), joined with `+`; f-keys need no modifier | macOS launcher: what opens it. It takes effect once the launcher reaches the restarted player, and it remembers the key for its next launch. |
-| `popup` | `"skip"` | `"skip"`, `"track"`, `"off"` | macOS launcher: when to show what's playing. `skip`: a media key skips or seeks. `track`: that, and every new song. |
+| `hotkey` | `"option+space"` | modifiers (`ctrl`, `option`, `cmd`, `shift`) and a key (a letter, digit, `space`, `return`, `tab`, `f1`-`f12`), joined with `+`; f-keys need no modifier | What opens the `⌥Space` search, from any app. Takes effect when spot restarts. |
+| `popup` | `"skip"` | `"skip"`, `"track"`, `"off"` | When to show what's playing at the top of the screen (not while spot's window is in front). `skip`: a media key skips or seeks. `track`: that, and every new song. |
 | `popup_seconds` | `3` | above `0`; decimals work | How long the popup stays up. |
 
 ```toml
@@ -36,12 +36,11 @@ config.toml keep theirs in `~/.config/spot/client_id`, which still works.
 
 ## Themes
 
-Themes color the TUI. The macOS launcher doesn't use them: it's Liquid Glass with your system
-accent color.
+Themes color spot's window, the `⌥Space` search and its popup.
 
 The built-in themes are `desert`, `lagoon`, `moss`, `iris`, `blossom`, `mint` and `sorbet`. A
 `[themes.<name>.dark]` or `[themes.<name>.light]` section changes one of those, or adds a new one
-to the end of the `ctrl+t` cycle. Light or dark follows your terminal.
+to the end of the `⌘T` cycle. Light or dark follows macOS.
 
 - Changing a built-in: name only the colors to change.
 - A new theme: unnamed colors come from `desert`. With no `.light` section, its dark colors are

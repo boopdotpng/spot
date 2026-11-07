@@ -41,6 +41,22 @@ impl View {
     }
 }
 
+/// A list's cursor: the row it's on, if any.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Sel(Option<usize>);
+
+impl Sel {
+    pub fn with(i: impl Into<Option<usize>>) -> Self {
+        Sel(i.into())
+    }
+    pub fn selected(&self) -> Option<usize> {
+        self.0
+    }
+    pub fn select(&mut self, i: Option<usize>) {
+        self.0 = i;
+    }
+}
+
 /// Rows currently listed: the whole view, or the ctrl+f matches.
 pub enum Shown<'a> {
     All(usize),
@@ -74,13 +90,16 @@ pub struct App {
     pub media: Option<MediaControls>,
 
     pub playlists: Vec<Playlist>,
-    pub pl_state: ListState,
+    pub pl_state: Sel,
+    pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
+    pub sh_state: Sel,
+    pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
     pub view: View,
     pub view_seq: u64,                  // last view id handed out
     pub history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row
     pub artist_songs: bool,             // artist pages list every song (else albums & singles)
     pub releases: Releases,             // which releases new artist pages list (remembered)
-    pub tr_state: TableState,
+    pub tr_state: Sel,
     pub focus: Focus,
     pub input: Option<String>,
     pub live_search: bool, // the open view is this prompt's results, so the next ones replace it
@@ -96,6 +115,9 @@ pub struct App {
     pub upnext: Vec<Track>,   // the queue (`e`, `spot queue add`): plays before the list carries on
     pub queued: Option<Track>, // the queued song playing now, taken off `upnext` (the list waits)
     pub cur: Option<SpotifyUri>,
+    pub episode: Option<Track>,         // `cur` if it's an episode
+    pub continuing: Vec<Track>,         // episodes part way through, last played first
+    pub progress: HashMap<String, u64>, // where episodes were left, by uri (ms, or HEARD)
     pub loaded: bool, // `cur` is loaded into the player (it waits for the session)
     pub load_at: Option<Instant>, // manual skip in progress: hold off loading `cur` until then
     pub playing: bool,
@@ -116,31 +138,32 @@ pub struct App {
     pub finished: bool,         // the queue ran out
     pub ctl: ctl::State,
     pub quit: bool,
-    pub terminal: Option<terminal::Display>,
     pub art: art::Art,
+    pub show: bool,          // `spot show`: bring the window up
+    pub moved: Moved,        // what the last tick saw happen, for the window's popup
+}
+
+/// What changed since the last tick that the window cares about.
+#[derive(Default, Clone, Copy)]
+pub struct Moved {
+    pub track: bool,   // a new song started
+    pub skipped: bool, // a media key skipped or seeked
 }
 
 impl App {
     /// Act on one message from the main loop's channel.
     pub fn on_msg(&mut self, m: Msg) {
         match m {
-            Msg::Key(k) => {
-                self.status.clear();
-                self.on_key(k);
-            }
-            Msg::Attach(a) => self.attach_terminal(a),
-            Msg::Terminal { id, event } => self.terminal_event(id, event),
-            Msg::Scheme(light) => {
-                LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
-                // the background changed with it: ask for the new one (answered as Msg::Background)
-                self.query_background();
-            }
-            Msg::Background(bg) => BG.store(bg, std::sync::atomic::Ordering::Relaxed),
             Msg::Player(ev) => self.on_player(ev),
             Msg::Playlists(p) => {
                 let n = p.len();
                 self.playlists = p;
                 self.pl_state.select(Some(self.pl_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
+            }
+            Msg::Shows(s) => {
+                self.shows = podcast_home().into_iter().chain(s).collect();
+                let n = self.shows.len();
+                self.sh_state.select(Some(self.sh_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
             }
             Msg::Replace { view, tracks } => {
                 // keep the cursor on the same song (unless it's at the top, where new likes land)
@@ -207,7 +230,7 @@ impl App {
                     return;
                 }
                 self.refilter();
-                // ratatui drops the selection while a list renders empty
+                // the cursor lands on the first row once there is one
                 if self.tr_state.selected().is_none() && !self.view.links.is_empty() {
                     self.tr_state.select(Some(0));
                 }
@@ -250,7 +273,9 @@ impl App {
             Msg::Ctl(req, reply) => self.on_ctl(req, reply),
             Msg::Loaded(reply, then, list) => self.on_loaded(reply, then, list),
             Msg::Watch(w) => self.watch(w),
-            Msg::Art(url, image) => self.on_art(url, image),
+            Msg::Art(url, art) => self.on_art(url, art),
+            Msg::Show => self.show = true,
+            Msg::Tick => {}
             Msg::Quit => self.quit = true,
         }
     }

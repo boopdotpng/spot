@@ -17,6 +17,34 @@ pub struct Track {
     pub explicit: bool,
 }
 
+// A podcast episode is a Track too, so the queue, the player and the CLI work on it unchanged:
+// `artists` is the show's name, `album` its release date and `album_id` the show.
+impl Track {
+    pub fn is_episode(&self) -> bool {
+        self.uri.starts_with("spotify:episode:")
+    }
+}
+
+/// A list of a show's episodes (a view's or queue's key is its uri).
+pub fn is_show(key: &str) -> bool {
+    key.starts_with("spotify:show:")
+}
+
+/// The podcast sidebar's lists of episodes from several shows.
+pub const CONTINUE_KEY: &str = "podcasts:continue";
+pub const NEW_KEY: &str = "podcasts:new";
+
+/// Above the followed shows in the podcast sidebar.
+pub fn podcast_home() -> [Link; 2] {
+    let link = |uri: &str, name: &str| Link { uri: uri.into(), name: name.into(), sub: String::new(), single: false };
+    [link(CONTINUE_KEY, "Continue listening"), link(NEW_KEY, "New episodes")]
+}
+
+/// A list of episodes: those are never shuffled, and show dates and progress instead of albums.
+pub fn is_episodes(key: &str) -> bool {
+    is_show(key) || key.starts_with("podcasts:")
+}
+
 /// An album or artist search result.
 #[derive(Clone)]
 pub struct Link {
@@ -63,6 +91,7 @@ pub enum Kind {
     Tracks,
     Albums,
     Artists,
+    Shows,
 }
 
 impl Kind {
@@ -70,7 +99,8 @@ impl Kind {
         match self {
             Kind::Tracks => Kind::Albums,
             Kind::Albums => Kind::Artists,
-            Kind::Artists => Kind::Tracks,
+            Kind::Artists => Kind::Shows,
+            Kind::Shows => Kind::Tracks,
         }
     }
     /// What Spotify's search calls it.
@@ -79,6 +109,7 @@ impl Kind {
             Kind::Tracks => "track",
             Kind::Albums => "album",
             Kind::Artists => "artist",
+            Kind::Shows => "show",
         }
     }
     pub fn label(self) -> &'static str {
@@ -86,6 +117,7 @@ impl Kind {
             Kind::Tracks => "songs",
             Kind::Albums => "albums",
             Kind::Artists => "artists",
+            Kind::Shows => "podcasts",
         }
     }
 }
@@ -115,13 +147,9 @@ impl Playlist {
 }
 
 pub enum Msg {
-    Key(KeyEvent),
-    Attach(terminal::Attachment),
-    Terminal { id: u64, event: terminal::Event },
-    Scheme(bool), // terminal switched color scheme; true = light
-    Background(u32), // terminal's background color (OSC 11 reply)
     Player(PlayerEvent),
     Playlists(Vec<Playlist>),
+    Shows(Vec<Link>), // the podcasts the user follows
     Tracks { view: u64, tracks: Vec<Track>, done: bool },
     Replace { view: u64, tracks: Arc<Vec<Track>> }, // fresh copy of a list that was shown from cache
     Links { view: u64, links: Vec<Link>, done: bool },
@@ -134,7 +162,9 @@ pub enum Msg {
     Ctl(Vec<String>, ctl::Reply), // a `spot <command>` request
     Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `queue add` named, fetched
     Watch(ctl::Watcher),
-    Art(String, Option<ratatui_image::protocol::Protocol>), // a cover's url, and it drawn for the terminal
+    Art(String, Option<art::Cover>), // a cover's url, and the image (None: couldn't get it)
+    Show, // `spot` / `spot show`: open the window
+    Tick, // nothing new; a timer is due (or one was just set)
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }
 
@@ -166,10 +196,11 @@ impl Queue {
 
     /// Uniform Fisher-Yates over every track (OS-seeded ChaCha RNG), no "smart" weighting.
     /// `first` stays at the front so the current/chosen song keeps playing.
+    /// Episodes always play in list order.
     pub fn reorder(&mut self, shuffle: bool, first: Option<usize>) {
         use rand::seq::SliceRandom;
         let n = self.tracks.len();
-        if shuffle {
+        if shuffle && !is_episodes(&self.key) {
             let mut rest: Vec<usize> = (0..n).filter(|&i| Some(i) != first).collect();
             rest.shuffle(&mut rand::rng());
             self.order = first.into_iter().chain(rest).collect();

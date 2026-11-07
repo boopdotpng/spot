@@ -71,6 +71,12 @@ pub struct State {
     pub skipped: bool, // a media key skipped or seeked since the last tick
 }
 
+impl State {
+    pub fn watchers(&self) -> &[Watcher] {
+        &self.watchers
+    }
+}
+
 /// The last search's (or `spot playlists`') uris, one per line, so `spot play 3` can pick one.
 fn results_path() -> PathBuf {
     cache_dir().join("last_search")
@@ -193,7 +199,7 @@ fn move_items<T>(items: &mut Vec<T>, from: &[usize], to: usize) {
     items.splice(to..to, moved);
 }
 
-/// The uri a queue key stands for: Liked Songs, a playlist id, or an album / artist / track uri.
+/// The uri a queue key stands for: Liked Songs, a playlist id, or an album / artist / track / show uri.
 fn key_uri(key: &str) -> Option<String> {
     if key == "liked" || key.starts_with("spotify:") {
         Some(key.into())
@@ -242,10 +248,6 @@ fn handle(mut conn: UnixStream, tx: mpsc::Sender<Msg>) {
     }
     let mut args: Vec<String> = line.trim_end_matches('\n').split('\t').map(String::from).collect();
     log::debug!("cli: {args:?}");
-    if args.first().is_some_and(|a| a == "attach") {
-        crate::terminal::serve(conn, &args, tx);
-        return;
-    }
     if matches!(args[0].as_str(), "watch" | "wait") {
         match watcher(&mut args) {
             Ok((before_ms, until)) => {
@@ -303,10 +305,10 @@ impl App {
                 return Ok(Some(self.now().map(row).unwrap_or_default()));
             }
             "status" => {}
-            // for the launcher: popup (skip, track or empty), popup seconds, hotkey
-            "launcher" => {
-                let s = &self.settings;
-                return Ok(Some(tsv_row(&[s.popup.wire(), &s.popup_seconds.to_string(), &s.hotkey])));
+            // `spot` with spot running: bring the window up
+            "show" => {
+                self.show = true;
+                return Ok(Some(String::new()));
             }
             "play" | "resume" => {
                 let show = flag(&mut args, "--show");
@@ -374,6 +376,12 @@ impl App {
                 save_results(&uris);
                 return Ok(Some(numbered(&rows)));
             }
+            "podcasts" => {
+                let shows: Vec<&Link> = self.shows.iter().filter(|s| is_show(&s.uri)).collect();
+                let rows: Vec<String> = shows.iter().map(|s| format!("{} · {}  {}", s.name, s.sub, s.uri)).collect();
+                save_results(&shows.iter().map(|s| s.uri.clone()).collect::<Vec<_>>());
+                return Ok(Some(if rows.is_empty() { "you don't follow any podcasts".into() } else { numbered(&rows) }));
+            }
             "quit" => {
                 self.quit = true;
                 return Ok(Some(String::new()));
@@ -434,9 +442,9 @@ impl App {
         Ok(Some(self.queue_text(shown)))
     }
 
-    /// `search <words> [--albums | --artists | --playlists] [-n 10]`: numbered, saved for `play N`.
+    /// `search <words> [--albums | --artists | --playlists | --podcasts | --episodes] [-n 10]`: numbered, saved for `play N`.
     fn search_cmd(&mut self, mut args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
-        let kinds = [("--tracks", "track"), ("--songs", "track"), ("--albums", "album"), ("--artists", "artist"), ("--playlists", "playlist")];
+        let kinds = [("--tracks", "track"), ("--songs", "track"), ("--albums", "album"), ("--artists", "artist"), ("--playlists", "playlist"), ("--podcasts", "show"), ("--episodes", "episode")];
         let ty = kinds.iter().filter(|(f, _)| flag(&mut args, f)).map(|(_, k)| *k).last().unwrap_or("track");
         let n = num_opt(&mut args, "-n")?.unwrap_or(10).clamp(1, 50) as usize;
         // for programs (the macOS launcher): uri, name, subtitle, cover url, ms, explicit; tab-separated,
@@ -458,6 +466,11 @@ impl App {
                             } else {
                                 format!("{} · {}  {}  {}", song(&t), t.album, mmss(t.ms), t.uri)
                             });
+                            uris.push(t.uri);
+                        }
+                    } else if ty == "episode" {
+                        if let Some(t) = parse_episode(i, None) {
+                            rows.push(format!("{} · {}  {}  {}", t.name, t.album, hours(t.ms), t.uri));
                             uris.push(t.uri);
                         }
                     } else if let Some(l) = parse_link(ty, i) {
@@ -495,8 +508,8 @@ impl App {
         }
         if let Some(rest) = t.strip_prefix("spotify:") {
             let kind = rest.split(':').next().unwrap_or("");
-            if !matches!(kind, "track" | "album" | "artist" | "playlist") {
-                return Err(fail(format!("can't play a {kind} uri (songs, albums, artists and playlists work)")));
+            if !matches!(kind, "track" | "album" | "artist" | "playlist" | "show" | "episode") {
+                return Err(fail(format!("can't play a {kind} uri (songs, albums, artists, playlists, podcasts and episodes work)")));
             }
             let name = self.playlists.iter().find(|p| p.uri() == t).map(|p| p.name.clone());
             return Ok(Target::Uri(t.into(), name));
@@ -511,6 +524,8 @@ impl App {
             Some(("album", q)) => (Some("album"), q),
             Some(("artist", q)) => (Some("artist"), q),
             Some(("playlist", q)) => (Some("playlist"), q),
+            Some(("podcast" | "show", q)) => (Some("show"), q),
+            Some(("episode", q)) => (Some("episode"), q),
             _ => (None, low.as_str()),
         };
         let q = q.trim();
@@ -573,7 +588,7 @@ impl App {
         let List { uri, name, tracks, found } = list;
         let text = match then {
             Then::Play { from, show } => {
-                if uri.starts_with("spotify:track:") && self.queue.is_some() {
+                if (uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")) && self.queue.is_some() {
                     // a single song plays now, then the queue and the list carry on
                     self.queued = tracks.into_iter().next();
                     self.retried = false;
@@ -706,6 +721,7 @@ impl App {
         let toggled = std::mem::replace(&mut self.ctl.playing, self.want_play) != self.want_play;
         let modes = std::mem::replace(&mut self.ctl.modes, (self.shuffle, self.repeat)) != (self.shuffle, self.repeat);
         let skipped = std::mem::take(&mut self.ctl.skipped);
+        self.moved = Moved { track: new_track, skipped };
         if self.ctl.watchers.is_empty() {
             return;
         }
@@ -772,8 +788,13 @@ async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> 
         let t = pb_track(uri, &t);
         return Ok((song(&t), vec![t]));
     }
+    if let Some(id) = uri.strip_prefix("spotify:episode:") {
+        let v = api.get(&format!("{API}/episodes/{id}")).await?;
+        let t = parse_episode(&v, None).ok_or("episode not found")?;
+        return Ok((song(&t), vec![t]));
+    }
     let cached = read_tracks(&tracks_path(&list_key(uri)));
-    let changes = uri == "liked" || uri.starts_with("spotify:playlist:");
+    let changes = uri == "liked" || uri.starts_with("spotify:playlist:") || is_show(uri);
     let tracks = if changes || cached.is_empty() {
         let (nobody, _) = mpsc::channel(); // the songs would stream to a view; none is showing this
         fetch_list(api, sess.clone(), uri, &cached, &nobody, 0).await?.unwrap_or(cached)
@@ -793,6 +814,7 @@ async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> 
             let by = tracks.iter().find(|t| id_uri("artist", t.artist_id).as_deref() == Some(uri));
             format!("{} · all songs", by.map_or("artist", |t| &t.artists[..t.lead]))
         }
+        None if is_show(uri) => tracks.first().map_or("podcast".into(), |t| t.artists.clone()),
         None => tracks.first().map_or("album".into(), |t| format!("{} — {}", t.album, t.artists)),
     };
     if tracks.is_empty() {

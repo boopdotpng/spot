@@ -34,6 +34,34 @@ pub fn releases_path(uri: &str) -> PathBuf {
     cache_dir().join("releases").join(uri_key(uri))
 }
 
+/// The podcasts the user follows, kept like an artist's releases.
+pub fn shows_path() -> PathBuf {
+    cache_dir().join("shows")
+}
+
+/// Where each episode was left (ms, or HEARD), one `uri, ms` per line. Not a cache: `spot clean` keeps it.
+fn episodes_path() -> PathBuf {
+    cache_dir().join("episodes")
+}
+
+/// An episode played to the end.
+pub const HEARD: u64 = u64::MAX;
+
+pub fn read_progress() -> HashMap<String, u64> {
+    let s = fs::read_to_string(episodes_path()).unwrap_or_default();
+    s.lines().filter_map(|l| l.split_once('\t')).filter_map(|(u, ms)| Some((u.to_string(), ms.parse().ok()?))).collect()
+}
+
+pub fn save_progress(progress: &HashMap<String, u64>) {
+    let s: String = progress.iter().map(|(u, ms)| format!("{u}\t{ms}\n")).collect();
+    write_atomic(&episodes_path(), &s);
+}
+
+/// Episodes part way through, last played first. Not a cache either.
+pub fn continuing_path() -> PathBuf {
+    cache_dir().join("continuing")
+}
+
 pub fn same_uris<'a>(a: impl ExactSizeIterator<Item = &'a String>, b: impl ExactSizeIterator<Item = &'a String>) -> bool {
     a.len() == b.len() && a.zip(b).all(|(x, y)| x == y)
 }
@@ -219,7 +247,7 @@ pub fn clean_cache() {
     }
     let dir = cache_dir();
     let mut freed = 0;
-    for name in ["audio", "lists", "releases", "playlists"] {
+    for name in ["audio", "lists", "releases", "playlists", "shows"] {
         let p = dir.join(name);
         let n = size(&p);
         let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };

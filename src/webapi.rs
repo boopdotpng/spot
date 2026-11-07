@@ -115,6 +115,32 @@ pub fn parse_track(v: &Value) -> Option<Track> {
     })
 }
 
+/// A podcast episode. Episodes listed under a show don't name it, so `show` supplies its name
+/// and id; otherwise they come from the episode.
+pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
+    let uri = v["uri"].as_str()?;
+    if !uri.starts_with("spotify:episode:") {
+        return None;
+    }
+    let (name, show_id) = show.unwrap_or_else(|| {
+        let id = v["show"]["id"].as_str().and_then(|s| librespot_core::SpotifyId::from_base62(s).ok());
+        (v["show"]["name"].as_str().unwrap_or(""), id.map_or(0, |i| i.id))
+    });
+    Some(Track {
+        uri: uri.into(),
+        name: v["name"].as_str().unwrap_or("?").into(),
+        artists: name.into(),
+        lead: name.len(),
+        album: v["release_date"].as_str().unwrap_or("").into(),
+        cover: v["images"].as_array().and_then(|i| i.first()?["url"].as_str()).map(String::from),
+        ms: v["duration_ms"].as_u64().unwrap_or(0),
+        album_id: show_id,
+        artist_id: 0,
+        disc: 0,
+        explicit: v["explicit"].as_bool().unwrap_or(false),
+    })
+}
+
 pub fn liked() -> Playlist {
     Playlist { id: None, name: "♥  Liked Songs".into() } // the heart overhangs its cell in many fonts
 }
@@ -145,7 +171,28 @@ pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
     let _ = tx.send(Msg::Playlists(out));
 }
 
-/// An album, artist or playlist search result.
+/// The podcasts the user follows, for the sidebar.
+pub async fn load_shows(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
+    let mut out = vec![];
+    let mut url = Some(format!("{API}/me/shows?limit=50"));
+    while let Some(u) = url {
+        match api.get(&u).await {
+            Ok(v) => {
+                out.extend(v["items"].as_array().into_iter().flatten().filter_map(|i| parse_link("show", &i["show"])));
+                url = v["next"].as_str().map(String::from);
+            }
+            Err(e) => {
+                // keep showing the cached list
+                let _ = tx.send(Msg::Error(format!("podcasts: {e}")));
+                return;
+            }
+        }
+    }
+    save_links(&shows_path(), &out);
+    let _ = tx.send(Msg::Shows(out));
+}
+
+/// An album, artist, playlist or show search result.
 pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
     let names = |a: &Value| a.as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", "));
     let sub = match ty {
@@ -158,13 +205,14 @@ pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
             let by = v["owner"]["display_name"].as_str().unwrap_or("?");
             format!("by {by} · {}", plural(v["tracks"]["total"].as_u64().unwrap_or(0) as usize, "song"))
         }
+        "show" => plural(v["total_episodes"].as_u64().unwrap_or(0) as usize, "episode"),
         _ => v["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
     };
     let single = v["album_type"] == "single";
     Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single })
 }
 
-/// Search Spotify for `n` results of a type (track, album, artist or playlist), each page handed
+/// Search Spotify for `n` results of a type (track, album, artist, playlist, show or episode), each page handed
 /// to `page` as it comes, with whether it's the last. Dev-mode apps get 10 results per call.
 pub async fn search(api: &Api, q: &str, ty: &str, n: usize, mut page: impl FnMut(&[Value], bool)) -> Result<(), String> {
     for offset in (0..n).step_by(10) {

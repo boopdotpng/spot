@@ -1,10 +1,11 @@
-// spot: a tiny Spotify TUI. librespot for audio, Web API for library/search, ratatui for UI.
-// This file: startup (logins, the player, the threads feeding the main loop) and the main loop.
-// The player stays in the background; terminal.rs handles disposable TUI connections.
+// spot: a tiny Spotify player. librespot for audio, the Web API for library and search, Rune for
+// the window. This file: the command line's way in, startup (logins, the player, the threads
+// feeding it) and shutdown. The player lives on the main thread with the window (gui.rs), which
+// keeps running with the window closed; the command line talks to it over a socket (ctl.rs).
 // The imports here are shared by every module (`use crate::*`).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::IsTerminal,
     path::PathBuf,
@@ -22,19 +23,13 @@ use librespot_playback::{
     mixer::{self, Mixer, MixerConfig},
     player::{Player, PlayerEvent},
 };
-use ratatui::{
-    Frame,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
-    layout::{Constraint, Layout},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState},
-};
 use serde_json::Value;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
 mod app;
 mod art;
+mod fmt;
+mod gui;
 mod auth;
 mod cache;
 mod cli;
@@ -47,21 +42,19 @@ mod model;
 mod playback;
 mod settings;
 mod theme;
-mod terminal;
-mod ui;
 mod views;
 mod webapi;
 
 use app::*;
 use auth::*;
 use cache::*;
+use fmt::*;
 use keys::*;
 use lastfm::*;
 use lists::*;
 use metadata::*;
 use model::*;
 use theme::*;
-use ui::*;
 use webapi::*;
 
 // Each user brings their own Spotify developer app (the shared librespot client id is permanently
@@ -86,12 +79,6 @@ const QUEUE_KEY: &str = "queue:";
 const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal to log in";
 
 #[cfg(target_os = "macos")]
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRunLoopRun();
-}
-
-#[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
@@ -105,8 +92,8 @@ pub fn trim_heap() {
     }
 }
 
-/// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log, since the TUI
-/// owns the terminal. The previous run's log is kept as log.1.
+/// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log: the player
+/// runs without a terminal. The previous run's log is kept as log.1.
 fn init_log() {
     let spec = "info,spot=debug,librespot=debug,symphonia_bundle_mp3=error";
     let path = cache_dir().join("log");
@@ -133,10 +120,14 @@ fn init_log() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => std::process::exit(terminal::launch()),
-        Some("--headless") if args.len() == 1 => {}
-        Some("clean") => return clean_cache(),
-        Some("-v" | "--version") if args.len() == 1 => return println!("spot {}", env!("CARGO_PKG_VERSION")),
+        // from a terminal: open the window (starting spot if needed, after any first-run setup);
+        // from Finder or `open`: this is the app
+        None if std::io::stdin().is_terminal() => std::process::exit(cli::open()),
+        None => player(true),
+        Some("--app") if args.len() <= 2 && args.get(1).is_none_or(|a| a == "--show") => player(args.len() == 2),
+        Some("--headless") if args.len() == 1 => player(false),
+        Some("clean") => clean_cache(),
+        Some("-v" | "--version") if args.len() == 1 => println!("spot {}", env!("CARGO_PKG_VERSION")),
         Some(c) if cli::COMMANDS.contains(&c) => std::process::exit(cli::client(args)),
         Some(a) => {
             let ok = matches!(a, "-h" | "--help" | "help");
@@ -144,56 +135,60 @@ fn main() {
             std::process::exit(if ok { 0 } else { 2 });
         }
     }
+}
+
+/// The player, with its window (shown now if `show`) and its menu bar item. Returns only to quit.
+fn player(show: bool) {
     // One player at a time: a second would fight the first over the audio session and the
     // resume point. The lock goes when the process does, crash or not.
     let _ = fs::create_dir_all(cache_dir());
-    let _lock = match fs::File::create(cache_dir().join("lock")) {
+    let lock = match fs::File::create(cache_dir().join("lock")) {
         Ok(f) => match f.try_lock() {
             Ok(()) => Some(f),
             Err(fs::TryLockError::WouldBlock) => {
-                eprintln!("spot is already running (in another terminal, or headless). Control it from here with `spot status`, `spot play …` (see `spot help`).");
-                std::process::exit(1);
+                // it's running: bring its window up instead
+                if show {
+                    let _ = cli::send(&["show"]);
+                } else {
+                    eprintln!("spot is already running. Control it with `spot status`, `spot play …` (see `spot help`).");
+                }
+                std::process::exit(if show { 0 } else { 1 });
             }
             Err(_) => None,
         },
         Err(_) => None,
     };
     init_log();
-    let ui = std::thread::spawn(move || {
-        if let Err(e) = run(false) {
+    rune::prewarm_gpu();
+    match start(false) {
+        Ok(Some((app, rx))) => gui::run(app, rx, show, lock),
+        Ok(None) => {}
+        Err(e) => {
             log::error!("exiting: {e}");
             eprintln!("spot: {e}");
+            // opened from Finder there's no terminal to say it in
+            if !std::io::stderr().is_terminal() {
+                gui::problem(e);
+            }
             std::process::exit(1);
         }
-    });
-    // macOS delivers media key / Now Playing commands on the main run loop.
-    #[cfg(target_os = "macos")]
-    unsafe {
-        CFRunLoopRun()
-    };
-    let _ = ui.join();
+    }
 }
 
-/// macOS sends Control Center the supported commands from the main thread, once: attaching from
-/// another, it snapshots them part way through and the rest stay greyed out for good.
-#[cfg(target_os = "macos")]
-fn on_main<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    dispatch::Queue::main().exec_sync(f)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn on_main<T>(f: impl FnOnce() -> T) -> T {
-    f()
-}
-
-/// `setup_only` completes interactive first-run approvals before the client starts the player.
-fn run(setup_only: bool) -> Result<(), String> {
+/// Log in and start the player: the app and the channel it runs on. `setup_only` completes the
+/// interactive first-run approvals in a terminal, then stops (None), before `spot` starts the app.
+/// Call it on the main thread: macOS sends Control Center the supported commands from there, once;
+/// attaching media controls from another, it snapshots them part way and the rest stay greyed out.
+pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let _guard = rt.enter();
+    // This thread (the window's, for good) runs inside the runtime from here on, so whatever the
+    // app starts finds it, after this returns too.
+    let handle: &'static tokio::runtime::Handle = Box::leak(Box::new(rt.handle().clone()));
+    std::mem::forget(handle.enter());
 
     settings::write_template();
     let (mut settings, problems) = settings::load();
@@ -258,7 +253,7 @@ fn run(setup_only: bool) -> Result<(), String> {
     });
 
     if setup_only {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(fm) = lastfm.clone() {
         rt.spawn(async move { fm.drain().await }); // whatever didn't get sent last time
@@ -290,11 +285,9 @@ fn run(setup_only: bool) -> Result<(), String> {
         rt.spawn(start_session(session, cache.clone(), tx.clone()));
     }
     rt.spawn(load_playlists(api.clone(), tx.clone()));
+    rt.spawn(load_shows(api.clone(), tx.clone()));
 
-    let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
-    if let Some(i) = families().iter().position(|(name, ..)| name == theme.trim()) {
-        FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
-    }
+    load_family();
 
     let mut events = player.get_player_event_channel();
     let ptx = tx.clone();
@@ -322,13 +315,11 @@ fn run(setup_only: bool) -> Result<(), String> {
         .ok()
         .and_then(|mut m| {
             let mtx = tx.clone();
-            on_main(move || {
-                m.attach(move |ev| {
-                    let _ = mtx.send(Msg::Media(ev));
-                })
-                .ok()?;
-                Some(m)
+            m.attach(move |ev| {
+                let _ = mtx.send(Msg::Media(ev));
             })
+            .ok()?;
+            Some(m)
         });
 
     let mut app = App {
@@ -341,13 +332,16 @@ fn run(setup_only: bool) -> Result<(), String> {
         mixer,
         media,
         playlists: read_playlists(),
-        pl_state: ListState::default().with_selected(Some(0)),
+        pl_state: Sel::with(Some(0)),
+        shows: podcast_home().into_iter().chain(read_links(&shows_path())).collect(),
+        sh_state: Sel::with(Some(0)),
+        podcasts: false,
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },
         view_seq: 0,
         history: vec![],
         artist_songs: true,
         releases: Releases::All,
-        tr_state: TableState::default(),
+        tr_state: Sel::default(),
         focus: Focus::Playlists,
         input: None,
         live_search: false,
@@ -363,6 +357,9 @@ fn run(setup_only: bool) -> Result<(), String> {
         upnext: vec![],
         queued: None,
         cur: None,
+        episode: None,
+        continuing: read_tracks(&continuing_path()),
+        progress: read_progress(),
         loaded: false,
         load_at: None,
         playing: false,
@@ -383,8 +380,9 @@ fn run(setup_only: bool) -> Result<(), String> {
         finished: false,
         ctl: ctl::State::default(),
         quit: false,
-        terminal: None,
         art: Default::default(),
+        show: false,
+        moved: Moved::default(),
     };
 
     if let Some(last) = read_last() {
@@ -392,47 +390,60 @@ fn run(setup_only: bool) -> Result<(), String> {
     }
     app.restore_upnext();
     app.open_playlist(0);
+    Ok(Some((app, rx)))
+}
 
-    while !app.quit {
-        app.draw_terminal();
-        // Only wake up once a second while playing (progress clock); otherwise sleep until input.
-        let mut timeout = if app.playing { Duration::from_secs(1) } else { Duration::from_secs(3600) };
-        // wake up in time to take the popup / volume meter down
-        for until in [app.note.as_ref().map(|n| n.1), app.vol_until, app.load_at, app.search_at].into_iter().flatten() {
-            timeout = timeout.min(until.saturating_duration_since(Instant::now()));
+impl App {
+    /// Run the timers that are due: popups and the volume meter going away, a skip settling,
+    /// typing stopping. True when that changed what the window shows.
+    pub fn tick(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        if self.note.as_ref().is_some_and(|(_, until)| now >= *until) {
+            self.note = None;
+            changed = true;
         }
-        let first = match rx.recv_timeout(timeout) {
-            Ok(m) => Some(m),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(_) => break,
-        };
-        if app.note.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
-            app.note = None;
+        if self.vol_until.is_some_and(|until| now >= until) {
+            self.vol_until = None;
+            changed = true;
         }
-        if app.vol_until.is_some_and(|until| Instant::now() >= until) {
-            app.vol_until = None;
+        if self.load_at.is_some_and(|until| now >= until) {
+            self.load_at = None;
+            self.load_cur();
+            changed = true;
         }
-        if app.load_at.is_some_and(|until| Instant::now() >= until) {
-            app.load_at = None;
-            app.load_cur();
+        if self.search_at.is_some_and(|until| now >= until) {
+            self.search_at = None;
+            self.run_search();
+            changed = true;
         }
-        if app.search_at.is_some_and(|until| Instant::now() >= until) {
-            app.search_at = None;
-            app.run_search();
-        }
-        for m in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
-            app.on_msg(m);
-        }
-        app.tick_watchers();
+        self.tick_watchers();
+        changed
     }
-    ctl::unlink();
-    app.detach_terminal();
-    app.save_last();
-    app.player.stop();
-    app.end_listen();
-    if let Some(fm) = app.lastfm.clone() {
-        // give the last scrobble a moment to go out; otherwise it's sent next start
-        let _ = app.rt.block_on(tokio::time::timeout(Duration::from_secs(3), async move { fm.drain().await }));
+
+    /// When `tick` next needs to run: the earliest timer, and once a second while playing if
+    /// `every_second` (a clock on show, or `spot watch`ers waiting for a song to be ending).
+    pub fn next_wake(&self, every_second: bool) -> Option<Instant> {
+        let mut next = [self.note.as_ref().map(|n| n.1), self.vol_until, self.load_at, self.search_at].into_iter().flatten().min();
+        if self.playing && (every_second || !self.ctl.watchers().is_empty()) {
+            // on the clock's next whole second
+            let into = self.position() % 1000;
+            let tick = Instant::now() + Duration::from_millis(1000 - into + 5);
+            next = Some(next.map_or(tick, |n| n.min(tick)));
+        }
+        next
     }
-    std::process::exit(0);
+
+    /// Stop: save where it was, send the last scrobble, and exit.
+    pub fn shutdown(&mut self) -> ! {
+        ctl::unlink();
+        self.save_last();
+        self.player.stop();
+        self.end_listen();
+        if let Some(fm) = self.lastfm.clone() {
+            // give the last scrobble a moment to go out; otherwise it's sent next start
+            let _ = self.rt.block_on(tokio::time::timeout(Duration::from_secs(3), async move { fm.drain().await }));
+        }
+        std::process::exit(0);
+    }
 }

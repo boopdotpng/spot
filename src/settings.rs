@@ -1,7 +1,6 @@
 // ~/.config/spot/config.toml, all of it optional. Read once, when the player starts. Anything
 // wrong with it is reported and that setting keeps its default: a typo shouldn't stop the music.
 // The first run writes it with every setting commented out, so the defaults stay spot's to change.
-// The launcher gets these from the player (the socket's `launcher` command), so one parser.
 
 use crate::*;
 use toml::{Table, Value};
@@ -14,11 +13,11 @@ const TEMPLATE: &str = "\
 # quality = 320         # 96, 160 or 320 kbps
 # audio_cache_gb = 1    # played songs kept on disk; 0 turns it off
 # normalize = true      # play every song at about the same loudness
-# hotkey = \"option+space\"  # macOS launcher: what opens it
-# popup = \"skip\"        # macOS launcher: show what's playing on media keys (skip), every new song (track), or never (off)
+# hotkey = \"option+space\"  # what opens the quick search, from any app
+# popup = \"skip\"        # show what's playing on media keys (skip), every new song (track), or never (off)
 # popup_seconds = 3     # how long it stays up
 
-# Your own colors for the TUI: change a built-in theme, or add one to ctrl+t.
+# Your own colors: change a built-in theme, or add one to cmd+t.
 # [themes.moss.dark]
 # accent = \"#88cc55\"
 ";
@@ -28,17 +27,6 @@ pub enum Popup {
     Off,
     Skip,  // media keys
     Track, // those, and every new song
-}
-
-impl Popup {
-    /// How the launcher hears it: empty is off.
-    pub fn wire(self) -> &'static str {
-        match self {
-            Popup::Off => "",
-            Popup::Skip => "skip",
-            Popup::Track => "track",
-        }
-    }
 }
 
 pub struct Settings {
@@ -172,7 +160,7 @@ fn colors(name: &str, mode: &str, t: &Table, palette: &mut [u32; 10], bad: &mut 
     }
 }
 
-/// A hotkey the launcher can register, written one way: its modifiers in a fixed order, then the
+/// A hotkey spot can register, written one way: its modifiers in a fixed order, then the
 /// key (a letter, digit, space, return, tab or f1-f12). Only f-keys work without a modifier.
 fn hotkey(s: &str) -> Option<String> {
     let s = s.to_lowercase();
