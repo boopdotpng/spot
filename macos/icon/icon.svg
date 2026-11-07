@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#7b5cf0"/>
-      <stop offset="0.55" stop-color="#b058d8"/>
-      <stop offset="1" stop-color="#f07a9c"/>
+      <stop offset="0" stop-color="#2c1d63"/>
+      <stop offset="0.55" stop-color="#4b2273"/>
+      <stop offset="1" stop-color="#8a2f62"/>
     </linearGradient>
     <radialGradient id="glow" cx="0.32" cy="0.22" r="0.75">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.32"/>
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.14"/>
       <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
     </radialGradient>
     <linearGradient id="disc" x1="0" y1="0" x2="0" y2="1">
@@ -27,7 +27,7 @@
   <g filter="url(#outer)">
     <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
     <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#glow)"/>
-    <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#ffffff" stroke-opacity="0.18" stroke-width="3"/>
+    <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#ffffff" stroke-opacity="0.12" stroke-width="3"/>
   </g>
   <circle cx="512" cy="512" r="250" fill="url(#disc)" filter="url(#shadow)"/>
   <rect x="397" y="472" width="54" height="150" rx="27" fill="url(#bar)"/>
