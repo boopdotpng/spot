@@ -284,6 +284,16 @@ pub async fn show_episodes(api: &Api, uri: &str, cached: &[Track], tx: &mpsc::Se
     Ok(Some(got))
 }
 
+/// A show's newest episodes: the first page only, the one the show itself comes with.
+pub async fn show_newest(api: &Api, uri: &str) -> Result<Vec<Track>, String> {
+    let id = uri.strip_prefix("spotify:show:").unwrap_or(uri);
+    let show = api.get(&format!("{API}/shows/{id}")).await.map_err(|e| format!("podcast: {e}"))?;
+    let name = show["name"].as_str().unwrap_or("?");
+    let show_id = librespot_core::SpotifyId::from_base62(id).map_or(0, |i| i.id);
+    let items = show["episodes"]["items"].as_array().into_iter().flatten();
+    Ok(items.filter_map(|e| parse_episode(e, Some((name, show_id)))).collect())
+}
+
 /// `New episodes`: the latest few of each followed show that haven't been heard, newest first.
 /// One request per show, so it's fetched when opened, a few at a time.
 pub async fn load_new_episodes(api: Arc<Api>, shows: Vec<Link>, heard: HashSet<String>, tx: mpsc::Sender<Msg>, view: u64, cached: Arc<Vec<Track>>) {

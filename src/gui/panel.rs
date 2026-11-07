@@ -1,6 +1,6 @@
 // The quick search panel: ⌥Space from any app opens a Spotlight-style bar that searches Spotify
 // and plays what you pick. ↑↓ move, ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with no results, to
-// what's playing), tab cycles songs / albums / artists / podcasts, ⌃S shuffle, ⌃R repeat, ⌘O
+// what's playing), tab cycles songs / albums / artists, ⌃S shuffle, ⌃R repeat, ⌘O
 // opens spot's window, esc closes. It asks the player the way `spot search` and `spot play` do.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -11,7 +11,7 @@ use super::view::ts;
 use super::{Now, Ui, icons};
 use crate::*;
 
-const KINDS: [(&str, Option<&str>); 4] = [("songs", None), ("albums", Some("--albums")), ("artists", Some("--artists")), ("podcasts", Some("--podcasts"))];
+const KINDS: [(&str, Option<&str>); 3] = [("songs", None), ("albums", Some("--albums")), ("artists", Some("--artists"))];
 const MAX: usize = 8;
 pub const WIDTH: f32 = 640.0;
 const MARGIN: f32 = 24.0; // around the card, for its shadow

@@ -107,7 +107,7 @@ Media keys and the macOS Now Playing widget work too.
 
 Searches and plays from any app: `⌥Space` opens a Liquid Glass bar near the top of the screen
 you're on, with what's playing under the results. Type to search, `tab` cycles songs / albums /
-artists / podcasts, `↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the
+artists, `↑`/`↓` move, `enter` plays (pressed before the results are in, it plays the
 first one), `⌘enter` adds to the queue, `⌘c` copies the selected result's open.spotify.com link
 (with no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or
 click the icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc`

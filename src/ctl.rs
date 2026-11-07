@@ -791,6 +791,13 @@ async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> 
         return Ok((song(&t), vec![t]));
     }
     let cached = read_tracks(&tracks_path(&list_key(uri)));
+    if is_show(uri) && cached.is_empty() {
+        // a show never opened: its newest page is enough to play, where all of a long-running
+        // show's episodes would take a request per 50 of them
+        let tracks = show_newest(&api, uri).await?;
+        let name = name.unwrap_or_else(|| tracks.first().map_or("podcast".into(), |t| t.artists.clone()));
+        return if tracks.is_empty() { Err(format!("{name} has no episodes")) } else { Ok((name, tracks)) };
+    }
     let changes = uri == "liked" || uri.starts_with("spotify:playlist:") || is_show(uri);
     let tracks = if changes || cached.is_empty() {
         let (nobody, _) = mpsc::channel(); // the songs would stream to a view; none is showing this
