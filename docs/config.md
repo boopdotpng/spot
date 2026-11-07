@@ -8,7 +8,8 @@ The first launch writes it with every setting commented out; uncomment one to ch
 them commented means you pick up new defaults.
 
 spot reads it when the player starts, so run `spot quit` and start it again after editing it by
-hand. From Settings, the page offers a restart. A mistake in the file shows on the status line and in the log, and that setting keeps its default.
+hand. From Settings, the page offers a restart. A mistake in the file shows as a message in the window and in the log, and that setting keeps
+its default.
 
 ## Settings
 

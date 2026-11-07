@@ -12,24 +12,22 @@ Silicon Mac (macOS 14+, Liquid Glass on 26+).
 
 ## Install
 
-    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh
-
-It installs `Spot.app` to `~/Applications` (set `SPOT_APP_DIR` to change) and links `spot` in
-`~/.local/bin` (set `SPOT_INSTALL_DIR` to change) to the binary inside it, and has spot start at
-login without its window so `⌥Space` always works (`sh -s -- --no-login` leaves that out; the
-login item is `~/Library/LaunchAgents/com.github.boopdotpng.spot.plist`). Run it again to update.
-It removes the separate `Spot Launcher.app` from older versions: that's part of spot now.
-
-It's signed ad hoc, not by an Apple developer: fine when installed this way (macOS only checks
-downloads from browsers), but a copy downloaded from the releases page needs System Settings →
-Privacy & Security → Open Anyway the first time.
-
-To build from a clone instead (needs a Rust toolchain, https://rustup.rs):
+Build it from source. You need a Rust toolchain (https://rustup.rs) and the Xcode command line
+tools (`xcode-select --install`):
 
     git clone https://github.com/boopdotpng/spot && spot/macos/bundle.sh
 
-which builds the same `Spot.app` and links `spot` the same way. Builds use `--locked`: vergen is
-pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to build with vergen 9.1.
+That installs `Spot.app` to `~/Applications` (set `SPOT_APP_DIR` to change) and links `spot` in
+`~/.local/bin` (set `SPOT_INSTALL_DIR` to change) to the binary inside it. It also has spot start
+at login without its window, so `⌥Space` always works (`macos/bundle.sh --no-login` leaves that
+out; the login item is `~/Library/LaunchAgents/com.github.boopdotpng.spot.plist`), and removes
+the separate `Spot Launcher.app` from versions before 2.0. The first build takes a few minutes.
+To update, `git pull` and run `macos/bundle.sh` again, then `spot quit` and `spot`.
+Builds use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to
+build with vergen 9.1.
+
+Using Claude Code or Codex? Point it at this repo and ask it to build and install spot:
+[AGENTS.md](AGENTS.md) tells it how.
 
 ## First run
 
@@ -161,12 +159,9 @@ for agents. `spot wait ending` blocks until the next one and exits.
 ### Claude Code
 
 The repo ships a skill ([`docs/skills/spot`](docs/skills/spot/SKILL.md)) so Claude Code can play music for you. To use it
-in every project, add `--skill` when installing, which copies it to `~/.claude/skills/spot`
-(replacing any copy there). It's off by default:
+in every project, copy it from your clone:
 
-    curl -fsSL https://raw.githubusercontent.com/boopdotpng/spot/master/install.sh | sh -s -- --skill
-
-Or from a clone: `mkdir -p ~/.claude/skills && cp -r docs/skills/spot ~/.claude/skills/`.
+    mkdir -p ~/.claude/skills && cp -r docs/skills/spot ~/.claude/skills/
 
 ### Without a window
 
@@ -207,7 +202,7 @@ Right-click a playlist in the sidebar to pin it to the top.
 - **Shuffle** is a uniform Fisher–Yates shuffle of the whole list (OS-seeded ChaCha RNG):
   every order is equally likely, no artist/popularity weighting. The playing song stays first.
   With repeat on, each pass through the list gets a fresh shuffle.
-- **Artists** open on an overview: their portrait, popular songs, discography, what they appear on, related artists and their bio. Its play
+- **Artists** open on an overview: their portrait, popular songs, discography, what they appear on and related artists. Its play
   button (or `P`) shuffles every song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate single/album versions
   removed: find, sort and play from here) and to the discography as a grid of covers. `⌘F` on the overview finds in every song.
 - **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
@@ -244,8 +239,10 @@ write the release notes (markdown) and tag with them, and push:
     git tag -a v1.1.0 --cleanup=verbatim -F notes.md && git push origin master v1.1.0
 
 (`--cleanup=verbatim` keeps the `## ` headings, which git would otherwise strip as comments.)
-GitHub Actions builds `Spot.app` for Apple Silicon (with `cargo build --profile dist`: the fully
-optimized build, which `bundle.sh` skips to rebuild in seconds) and publishes the release
-with the tag's message as its notes (a tag without one fails the release); `install.sh` always
-fetches the latest one. Pushes to master also build (no release) to keep the Rust cache warm;
-changes to only `.md` files skip CI.
+
+The release workflow is turned off for now (`gh workflow enable release` turns it back on). When
+it's on, it builds `Spot.app` for Apple Silicon on each tag (with `cargo build --profile dist`:
+the fully optimized build, which `bundle.sh` skips to rebuild in seconds) and publishes it as
+`Spot.zip` on the release, with the tag's message as its notes (a tag without one fails the
+release). Pushes to master also build (no release) to keep the Rust cache warm; changes to only
+`.md` files skip CI.
