@@ -29,8 +29,32 @@ pub fn medium(url: &str) -> String {
     url.replacen("ab67616d0000b273", "ab67616d00001e02", 1).replacen("ab6761610000e5eb", "ab67616100005174", 1)
 }
 
+/// Where an image is kept on disk: its url, flattened to a file name. Spotify's image urls name
+/// the picture and its size, so a cached file never goes stale.
+fn disk_path(url: &str) -> PathBuf {
+    let name: String = url.split_once("://").map_or(url, |(_, rest)| rest).chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' }).collect();
+    cache_dir().join("art").join(name)
+}
+
+/// An image fetched before, from disk: a few KB, quick enough to read while drawing.
+pub fn cached(url: &str) -> Option<Vec<u8>> {
+    fs::read(disk_path(url)).ok().filter(|b| !b.is_empty())
+}
+
+/// From disk if it's been fetched before, else from Spotify, kept on disk for next time.
 pub async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
-    Some(reqwest::get(url).await.ok()?.error_for_status().ok()?.bytes().await.ok()?.to_vec())
+    if let Some(bytes) = cached(url) {
+        return Some(bytes);
+    }
+    let bytes = reqwest::get(url).await.ok()?.error_for_status().ok()?.bytes().await.ok()?.to_vec();
+    let path = disk_path(url);
+    let _ = fs::create_dir_all(path.parent().expect("in the art directory"));
+    // through a temp file, so a crash or a second fetch can't leave half an image
+    let tmp = path.with_extension(format!("tmp{:08x}", rand::random::<u32>()));
+    if fs::write(&tmp, &bytes).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    Some(bytes)
 }
 
 /// Whether this is a headless render (`SPOT_RUNE="--snap …"`): it runs on a virtual clock that

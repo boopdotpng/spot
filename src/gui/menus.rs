@@ -86,6 +86,13 @@ pub fn tidy() {
     // SAFETY: main thread; every menu and item is retained while used.
     unsafe {
         let Some(root) = app.mainMenu() else { return };
+        // the app menu's own title: winit's default menu bar leaves it "NSMenuItem", which
+        // AppKit shows as soon as anything sets it (lowercasing it would)
+        if let Some(first) = root.itemAtIndex(0)
+            && first.title().to_string() != "spot"
+        {
+            first.setTitle(&objc2_foundation::NSString::from_str("spot"));
+        }
         lowercase(&root, app.servicesMenu().as_deref());
         let Some(menu) = root.itemAtIndex(0).and_then(|i| i.submenu()) else { return };
         let items = |m: &NSMenu| (0..m.numberOfItems()).filter_map(|i| m.itemAtIndex(i)).collect::<Vec<_>>();

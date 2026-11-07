@@ -110,8 +110,17 @@ impl Panel {
         self.generation.fetch_add(1, Relaxed);
     }
 
-    pub fn closed(&mut self) {
+    /// Closing: back to an empty bar now, while it's hidden, so it opens on one. Cleared only as
+    /// it opened, it showed the last search for a frame and then shrank to the bar.
+    pub fn closed(&mut self, tx: &mut Tx) {
         self.generation.fetch_add(1, Relaxed); // answers on their way are moot
+        self.query.clear();
+        self.results.clear();
+        self.note = None;
+        self.busy = false;
+        self.picked = 0;
+        self.copied = false;
+        self.fit(tx);
     }
 
     fn height(&self) -> f32 {
@@ -211,7 +220,7 @@ impl Panel {
                 return;
             }
             let flag = KINDS[self.kind].1;
-            self.closed();
+            self.closed(tx);
             tx.close_window();
             std::thread::spawn(move || {
                 let mut args = vec!["search", "--tsv", "-n", "1"];
@@ -230,7 +239,7 @@ impl Panel {
             if let Some(me) = me {
                 me.update(move |p, tx| {
                     if code == 0 {
-                        p.closed();
+                        p.closed(tx);
                         tx.close_window();
                     } else {
                         p.note = Some(text);
@@ -278,7 +287,7 @@ impl Panel {
                 ui.after(tx);
             });
         }
-        self.closed();
+        self.closed(tx);
         tx.close_window();
     }
 }
@@ -297,7 +306,7 @@ fn field_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
         rune::Key::Enter => p.choose(ev.mods.cmd, tx),
         rune::Key::Tab => p.cycle_kind(ev.mods.shift),
         rune::Key::Escape => {
-            p.closed();
+            p.closed(tx);
             tx.close_window();
         }
         rune::Key::Command('c') if p.query.selected().is_empty() => p.copy_link(tx),
@@ -311,7 +320,7 @@ fn field_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
 
 pub fn on_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if matches!(ev.key, rune::Key::Escape) {
-        p.closed();
+        p.closed(tx);
         tx.close_window();
         return true;
     }

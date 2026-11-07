@@ -36,10 +36,12 @@ pub fn icon_button(key: &str, i: &'static rune::Icon, size: f32, color: Color, t
 
 /// A cover, or its stand-in while there's none.
 pub fn cover(key: String, image: Option<&rune::Image>, size: f32, radius: f32, th: &Theme, fallback: &'static rune::Icon) -> El {
-    let base = el().key(key).size(size, size).radius(radius).clip_rounded(radius).fill(th.wash);
+    // the picture is a child of its own, so one that arrives after the list shows fades in over
+    // the placeholder (an element mounted after the first frame does) instead of snapping in
+    let base = el().key(key).size(size, size).radius(radius).clip_rounded(radius).fill(th.wash).center();
     match image {
-        Some(i) => base.pixels_fit(i.pixels(), SurfaceFit::Fill),
-        None => base.center().child(icon(fallback, size * 0.4).color(th.dim)),
+        Some(i) => base.child(el().key("pic").size(size, size).pixels_fit(i.pixels(), SurfaceFit::Fill)),
+        None => base.child(icon(fallback, size * 0.4).key("glyph").color(th.dim)),
     }
 }
 

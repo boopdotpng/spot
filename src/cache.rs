@@ -312,8 +312,8 @@ pub fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
 
 /// `spot clean`: drop everything that's only a cache. Login, settings, the resume point and
 /// unsent scrobbles stay.
-/// What the cache keeps that can go (songs and lists; never the login or the resume point).
-const CLEARABLE: [&str; 6] = ["audio", "lists", "releases", "artists", "playlists", "shows"];
+/// What the cache keeps that can go (songs, lists and covers; never the login or the resume point).
+const CLEARABLE: [&str; 7] = ["audio", "lists", "releases", "artists", "playlists", "shows", "art"];
 
 /// Bytes the clearable cache takes on disk.
 pub fn cache_size() -> u64 {

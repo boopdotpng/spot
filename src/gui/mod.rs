@@ -287,12 +287,17 @@ impl Ui {
             t.map.insert(url.to_string(), got.clone());
             return got;
         }
-        t.map.insert(url.to_string(), None);
+        // fetched before: from disk now, so it's there in the first frame rather than popping in
+        let on_disk = art::cached(url).zip(self.images.as_ref()).map(|(bytes, images)| images.load(bytes));
+        t.map.insert(url.to_string(), on_disk.clone());
         t.order.push_back(url.to_string());
         while t.order.len() > THUMBS {
             if let Some(old) = t.order.pop_front() {
                 t.map.remove(&old);
             }
+        }
+        if on_disk.is_some() {
+            return on_disk;
         }
         let (url, me) = (url.to_string(), self.me.clone());
         self.app.rt.spawn(async move {
@@ -527,7 +532,6 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
     let mut main = menus::items().into_iter().fold(rune::App::new(spec), rune::App::menu_item)
         .init(move || Ui::new(app, w))
         .keep_running()
-        .accessory()
         .standard_menus()
         .chrome(Chrome { full_size_content: true, traffic_lights: Some((20.0, 22.0)), drag_regions: true })
         .on_focus(|ui, focused, _| {
@@ -546,8 +550,12 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
             true
         })
         .global_shortcut(&hotkey, |ui, _| ui.toggle_panel());
+    // Without its window (the login item) it starts as an accessory app, with no Dock icon. With
+    // it, it stays a regular app from the start: Launch Services has already activated it, and
+    // turning accessory there would hand the focus back to the app behind, then take it again
+    // when the window opens, a visible flicker between the two.
     if !show {
-        main = main.windowless();
+        main = main.windowless().accessory();
     }
     // Rune's own flags (`--snap out.png`, `--tree`, `--script`: rendering without a window, for
     // checking the UI) come from SPOT_RUNE, never from spot's command line
@@ -572,7 +580,7 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
             if *TIMING {
                 *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
-            p.closed();
+            p.closed(tx);
             tx.close_window();
         }
     });
@@ -587,8 +595,8 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
         ui.me = Some(h.clone());
         ui.panel = Some(p.clone());
         if show {
-            // an accessory app's first window opens without activating it (behind the app in
-            // front, its traffic lights grey): open() brings it to the front with the keyboard
+            // the first window can open behind the app in front (its traffic lights grey):
+            // open() brings it to the front with the keyboard
             ui.open_window();
         }
         ui.after(tx);
