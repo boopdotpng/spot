@@ -21,12 +21,22 @@ pub async fn fetch_list(api: Arc<Api>, sess: Sess, uri: &str, cached: &[Track], 
     } else {
         let session = ready(sess).await?;
         let artist = uri.starts_with("spotify:artist:");
-        let albums = if artist { artist_albums(&session, uri).await? } else { vec![uri.to_string()] };
-        let uris = album_track_uris(&session, &albums).await?;
+        let uris = if artist {
+            album_track_uris(&session, &artist_albums(&session, uri).await?).await?
+        } else {
+            let found = batch_meta::<PbAlbum>(&session, &[uri.to_string()], ExtensionKind::ALBUM_V4).await?;
+            let a = found.get(uri).ok_or("album not found")?;
+            let about = about(a);
+            if about != read_about(uri) {
+                save_about(uri, &about);
+            }
+            let _ = tx.send(Msg::About { view, about });
+            a.disc.iter().flat_map(|d| d.track.iter()).filter_map(|t| gid_uri("track", t.gid())).collect()
+        };
         let tracks = send_tracks(&session, &uris, artist, cached.is_empty(), tx, view).await?;
-        // disc numbers too: caches from before they were kept have none
+        // disc and track numbers too: caches from before they were kept have none
         let same = same_uris(tracks.iter().map(|t| &t.uri), cached.iter().map(|t| &t.uri))
-            && tracks.iter().zip(cached).all(|(a, b)| a.disc == b.disc);
+            && tracks.iter().zip(cached).all(|(a, b)| (a.disc, a.number) == (b.disc, b.number));
         (!same).then_some(tracks)
     };
     if let Some(t) = &fresh {
@@ -389,6 +399,37 @@ pub async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::
             .map(dated)
             .collect(),
     ))
+}
+
+/// An album's footer: when it came out and on what label, then its copyrights ("© 2021 …").
+fn about(a: &PbAlbum) -> Vec<String> {
+    use librespot_protocol::metadata::copyright::Type;
+    const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    let d = &a.date;
+    let date = match (d.year(), d.month(), d.day()) {
+        (y, m @ 1..=12, day) if day > 0 => format!("{} {day}, {y}", MONTHS[m as usize - 1]),
+        (y, m @ 1..=12, _) => format!("{} {y}", MONTHS[m as usize - 1]),
+        (y, ..) if y > 0 => y.to_string(),
+        _ => String::new(),
+    };
+    let first: Vec<&str> = [date.as_str(), a.label().trim()].into_iter().filter(|s| !s.is_empty()).collect();
+    // the copyrights, each text once: the © and ℗ ones are often the same, and then share a line
+    let mut rights: Vec<(String, String)> = vec![];
+    for c in &a.copyright {
+        // the text sometimes carries its own mark: one is enough
+        let text = c.text().trim();
+        let text = ["(C)", "(c)", "(P)", "(p)", "©", "℗"].iter().find_map(|m| text.strip_prefix(m)).unwrap_or(text).trim();
+        let mark = if c.type_() == Type::P { "℗" } else { "©" };
+        if text.is_empty() {
+            continue;
+        }
+        match rights.iter_mut().find(|(_, t)| t == text) {
+            Some((marks, _)) if marks != mark => *marks = "© ℗".to_string(),
+            Some(_) => {}
+            None => rights.push((mark.to_string(), text.to_string())),
+        }
+    }
+    std::iter::once(first.join(" · ")).chain(rights.into_iter().map(|(m, t)| format!("{m} {t}"))).filter(|l| !l.is_empty()).collect()
 }
 
 pub async fn album_track_uris(session: &Session, albums: &[String]) -> Result<Vec<String>, String> {

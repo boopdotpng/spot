@@ -38,11 +38,12 @@ pub struct View {
     pub info: Option<Arc<ArtistInfo>>, // an artist's overview: `tracks` is its popular songs shown
     pub portrait: Option<String>, // artist pages: theirs, as last seen
     pub by: Option<By>,         // an album: whose it is
+    pub about: Vec<String>,     // an album: its footer (see Msg::About)
 }
 
 impl View {
     pub fn new(id: u64, key: String, title: String, kind: Kind) -> Self {
-        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None }
+        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None, about: vec![] }
     }
     pub fn len(&self) -> usize {
         if self.kind == Kind::Tracks { self.tracks.len() } else { self.links.len() }
@@ -233,6 +234,11 @@ impl App {
                 {
                     self.tr_state.select(self.row_of(i));
                     self.view.want = None;
+                }
+            }
+            Msg::About { view, about } => {
+                if let Some(v) = self.view_mut(view) {
+                    v.about = about;
                 }
             }
             Msg::Links { view, links, done } => {

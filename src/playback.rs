@@ -474,6 +474,7 @@ impl App {
         // an album opened from the player says whose it is, as one opened any other way does
         if album {
             self.view.by = self.view.tracks.first().map(By::of);
+            self.view.about = read_about(&self.view.key);
         }
         self.tr_state = Sel::with(self.row_of(idx).unwrap_or(0));
     }

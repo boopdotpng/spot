@@ -836,6 +836,7 @@ mod tests {
             album_id: 0,
             artist_id: 0,
             disc: 0,
+            number: 0,
             explicit: false,
             added: 0,
         };

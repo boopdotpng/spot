@@ -14,6 +14,7 @@ pub struct Track {
     pub album_id: u128, // SpotifyIds for goto album / artist (first artist); 0 = unknown
     pub artist_id: u128,
     pub disc: u32, // disc number on its album; 0 = unknown
+    pub number: u32, // track number on its disc; 0 = unknown
     pub explicit: bool,
     pub added: u64, // when it went into the playlist (or Liked Songs), unix seconds; 0 = unknown
 }
@@ -206,7 +207,8 @@ pub enum Msg {
     Replace { view: u64, tracks: Arc<Vec<Track>> }, // fresh copy of a list that was shown from cache
     Links { view: u64, links: Vec<Link>, done: bool },
     ReplaceLinks { view: u64, links: Vec<Link> }, // fresh copy of an artist's releases shown from cache
-    Artist { view: u64, info: Arc<ArtistInfo> },  // an artist's overview, fresh (or None came: see lists)
+    Artist { view: u64, info: Arc<ArtistInfo> },
+    About { view: u64, about: Vec<String> }, // an album's release date and label, then its copyrights  // an artist's overview, fresh (or None came: see lists)
     Error(String),
     Media(MediaControlEvent),
     Relogin(bool), // true: waiting on browser login; false: it finished

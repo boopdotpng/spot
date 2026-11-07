@@ -162,7 +162,7 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
     for t in tracks {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}\t{}\t{}",
             t.uri,
             clean(&t.name),
             clean(&t.artists),
@@ -174,7 +174,8 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
             t.artist_id,
             t.disc,
             t.explicit as u8,
-            t.added
+            t.added,
+            t.number
         );
     }
 }
@@ -198,6 +199,7 @@ pub fn parse_line(l: &str) -> Option<Track> {
         disc: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
         explicit: f.next() == Some("1"),
         added: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+        number: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
     })
 }
 
@@ -209,6 +211,19 @@ pub fn read_tracks(path: &std::path::Path) -> Vec<Track> {
         return vec![];
     }
     s.lines().filter_map(parse_line).collect()
+}
+
+/// An album's footer (see `Msg::About`), kept next to its songs.
+fn about_path(uri: &str) -> PathBuf {
+    tracks_path(&format!("{}.about", uri_key(uri)))
+}
+
+pub fn read_about(uri: &str) -> Vec<String> {
+    fs::read_to_string(about_path(uri)).unwrap_or_default().lines().map(String::from).collect()
+}
+
+pub fn save_about(uri: &str, about: &[String]) {
+    write_atomic(&about_path(uri), &about.iter().map(|l| format!("{}\n", clean(l))).collect::<String>());
 }
 
 pub fn save_tracks(path: &std::path::Path, tracks: &[Track]) {

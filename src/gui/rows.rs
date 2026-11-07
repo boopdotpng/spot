@@ -61,7 +61,11 @@ fn column_head(ui: &Ui, th: &Theme, cols: &[(&'static str, Option<f32>)]) -> El 
         }
         let t = text(label.to_uppercase()).font(LABEL).color(th.dim.alpha(0.8));
         let cell = match w {
-            Some(w) => row().key(format!("col-{i}")).w(*w).child(if *label == "time" { row().w_full().justify_end().child(t) } else { t }),
+            Some(w) => row().key(format!("col-{i}")).w(*w).child(match *label {
+                "time" => row().w_full().justify_end().child(t),
+                "#" => row().w_full().justify_center().child(t),
+                _ => t,
+            }),
             None => row().key(format!("col-{i}")).grow(1.0).shrink().min_w(0.0).child(t),
         };
         r = r.child(cell);
@@ -101,8 +105,11 @@ pub fn track_list(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     let episodes = is_episodes(&v.key);
     let feed = episodes && !is_show(&v.key);
     let (wide, roomy) = widths(cx);
+    // an album's own songs are all on it: no album column, but track numbers
+    let album = v.key.starts_with("spotify:album:");
+    let wide = wide && !album;
     let dates = a.dated() && roomy;
-    let mut cols: Vec<(&'static str, Option<f32>)> = vec![("", Some(34.0))];
+    let mut cols: Vec<(&'static str, Option<f32>)> = vec![(if album { "#" } else { "" }, Some(34.0))];
     if episodes {
         cols.push(("episode", None));
         if feed {
@@ -120,10 +127,24 @@ pub fn track_list(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         cols.extend([("", Some(56.0)), ("time", Some(44.0))]);
     }
     let n = a.shown().len();
+    // an album ends on when it came out, its label and its copyrights (not while finding in it)
+    let foot = album && !v.about.is_empty() && a.find.is_none() && !v.loading;
     let rows = col().key("rows").w_full().px(14.0).pt(4.0).pb(24.0).growth(GrowthSpec::default())
-        .virtual_rows(n, ROW, |_: &Ui, r| Cow::Owned(format!("row-{r}")), move |ui: &Ui, r| track_row(ui, r, &theme_now(), wide, dates))
-        .virtual_rows_version((v.id, a.find.is_some(), a.matches.len(), v.tracks.len(), a.sort));
+        .virtual_rows(n + usize::from(foot), ROW, move |_: &Ui, r| Cow::Owned(if r == n { "foot".to_string() } else { format!("row-{r}") }), move |ui: &Ui, r| if r == n { album_foot(ui, &theme_now()) } else { track_row(ui, r, &theme_now(), wide, dates) })
+        .virtual_rows_version((v.id, a.find.is_some(), a.matches.len(), v.tracks.len(), a.sort, foot));
     col().key("list").w_full().grow(1.0).min_h(0.0).child(column_head(ui, th, &cols)).child(scroller(ui, format!("list-{}", v.id), rows))
+}
+
+/// Under an album's songs: "April 23, 2021 · Mom+Pop", then its copyrights, small and quiet,
+/// lined up with the titles.
+fn album_foot(ui: &Ui, th: &Theme) -> El {
+    let about = &ui.app.view.about;
+    let mut c = col().key("foot").w_full().pt(26.0).pb(4.0).pl(12.0 + 34.0 + 14.0).pr(12.0).gap(3.0);
+    for (i, l) in about.iter().enumerate() {
+        let (font, color) = if i == 0 { (SMALL, th.sub) } else { (ts(11.0, 450.0).lh(15.0), th.dim) };
+        c = c.child(text(l.clone()).key(format!("l{i}")).font(font).color(color).truncate().help_when_truncated(l.clone()));
+    }
+    c
 }
 
 /// A row's little buttons: quiet, brighter under the pointer, a tooltip each.
@@ -147,6 +168,44 @@ fn link_text(key: &str, s: String, font: rune::TextStyle, c: Color, hover: Color
         .child(text(s.clone()).font(font).color(c).group_color(hover).truncate().help_when_truncated(s))
 }
 
+/// A row's play button, under the pointer over its cover or number: `dark` over a cover.
+fn play_button(r: usize, dark: bool, th: &Theme) -> El {
+    row().key("art-play").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
+        .fill(if dark { Color::BLACK.alpha(0.5) } else { Color::TRANSPARENT }).group_opacity(0.0, 1.0)
+        .cursor(Cursor::Pointer).press_scale(0.9).help("Play")
+        .on_press_tx(move |ui: &mut Ui, tx| {
+            pick(ui, r);
+            ui.app.enter();
+            ui.after(tx);
+        })
+        .child(icon(&icons::PLAY, 15.0).color(if dark { Color::WHITE } else { th.text }))
+}
+
+/// A row's cover, with the eq over it while it plays.
+fn cover_art(thumb: Option<&rune::Image>, playing: bool, on: bool, episodes: bool, r: usize, th: &Theme) -> El {
+    let mut art = row().key("art").size(34.0, 34.0)
+        .child(cover("c".into(), thumb, 34.0, 5.0, th, if episodes { &icons::MIC } else { &icons::NOTE }));
+    if playing {
+        art = art.child(row().key("art-eq").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
+            .fill(Color::BLACK.alpha(0.55)).group_opacity(1.0, 0.0)
+            .child(eq(th.accent, on, "row-eq")));
+    }
+    art.child(play_button(r, true, th))
+}
+
+/// An album's song: its track number in place of the cover (they'd all be the same), the eq
+/// instead while it plays.
+fn numbered(n: u32, playing: bool, on: bool, r: usize, th: &Theme) -> El {
+    let shown = if playing {
+        eq(th.accent, on, "row-eq")
+    } else {
+        text(if n == 0 { String::new() } else { n.to_string() }).font(NUM).color(th.dim)
+    };
+    row().key("art").size(34.0, 34.0)
+        .child(row().key("num").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).center().group_opacity(1.0, 0.0).child(shown))
+        .child(play_button(r, false, th))
+}
+
 pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) -> El {
     let a = &ui.app;
     let v = &a.view;
@@ -155,6 +214,7 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
     let episodes = is_episodes(&v.key);
     let feed = episodes && !is_show(&v.key);
     let up_next = v.key == QUEUE_KEY;
+    let album = v.key.starts_with("spotify:album:");
     let playing_uri = a.queue.as_ref().filter(|q| q.key == v.queue_key() && a.queued.is_none()).and_then(|q| q.tracks.get(q.idx())).map(|t| t.uri.as_str());
     let playing = Some(t.uri.as_str()) == playing_uri || (up_next && a.queued.as_ref().is_some_and(|q| q.uri == t.uri) && r == 0);
     let selected = a.tr_state.selected() == Some(r);
@@ -171,26 +231,11 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
         (true, _, Some(q)) => format!("then {}", q.name),
         (true, _, None) => "then".to_string(),
     });
-    // an album named again in the row above is dimmed: runs of one album read as one
-    let same_album = !episodes && r > 0 && a.shown().get(r - 1).is_some_and(|j| v.tracks[j].album == t.album && v.tracks[j].album_id == t.album_id);
-    let version = ((v.id, r, i, playing, playing && a.playing, selected, focused), (thumb.as_ref().map(rune::Image::id), progress, wide, dates, same_album, th.dark, header.clone(), art_key()));
+    let version = ((v.id, r, i, playing, playing && a.playing, selected, focused), (thumb.as_ref().map(rune::Image::id), progress, wide, dates, t.number, th.dark, header.clone(), art_key()));
     memo(format!("row-{r}"), version, || {
-        // the cover; while it plays, the eq (in the accent) over it, and under the pointer a play button
-        let mut art = row().key("art").size(34.0, 34.0)
-            .child(cover("c".into(), thumb.as_ref(), 34.0, 5.0, th, if episodes { &icons::MIC } else { &icons::NOTE }));
-        if playing {
-            art = art.child(row().key("art-eq").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
-                .fill(Color::BLACK.alpha(0.55)).group_opacity(1.0, 0.0)
-                .child(eq(th.accent, a.playing, "row-eq")));
-        }
-        let art = art.child(row().key("art-play").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).radius(5.0).center()
-            .fill(Color::BLACK.alpha(0.5)).group_opacity(0.0, 1.0).cursor(Cursor::Pointer).press_scale(0.9).help("Play")
-            .on_press_tx(move |ui: &mut Ui, tx| {
-                pick(ui, r);
-                ui.app.enter();
-                ui.after(tx);
-            })
-            .child(icon(&icons::PLAY, 15.0).color(Color::WHITE)));
+        // the cover (an album's songs: their number); while it plays, the eq (in the accent) over
+        // it, and under the pointer a play button
+        let art = if album { numbered(t.number, playing, a.playing, r, th) } else { cover_art(thumb.as_ref(), playing, a.playing, episodes, r, th) };
         let mut title_line = row().key("tl").gap(6.0).center_y().min_w(0.0)
             .child(text(t.name.clone()).key("name").font(BODY_MED).color(th.text).truncate().shrink().help_when_truncated(t.name.clone()));
         if t.explicit {
@@ -231,8 +276,7 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
                 .child(row().key("time").w(72.0).justify_end().child(text(left).font(NUM).color(th.dim)));
         } else {
             if wide {
-                let c = if same_album { th.dim.alpha(0.6) } else { th.sub };
-                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, c, th.text, move |ui| {
+                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, th.sub, th.text, move |ui| {
                     pick(ui, r);
                     ui.app.goto_album();
                 })));

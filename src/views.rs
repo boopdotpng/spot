@@ -63,6 +63,9 @@ impl App {
     fn show_list(&mut self, mut v: View, uri: String, cached: Arc<Vec<Track>>) {
         v.tracks = cached.clone();
         v.loading = cached.is_empty();
+        if uri.starts_with("spotify:album:") {
+            v.about = read_about(&uri);
+        }
         self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
         self.show(v, true);
     }

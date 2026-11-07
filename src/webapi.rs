@@ -107,6 +107,7 @@ pub fn parse_track(v: &Value) -> Option<Track> {
         album_id: id(&v["album"]),
         artist_id: id(&v["artists"][0]),
         disc: v["disc_number"].as_u64().unwrap_or(0) as u32,
+        number: v["track_number"].as_u64().unwrap_or(0) as u32,
         explicit: v["explicit"].as_bool().unwrap_or(false),
         added: 0,
     })
@@ -134,6 +135,7 @@ pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
         album_id: show_id,
         artist_id: 0,
         disc: 0,
+        number: 0,
         explicit: v["explicit"].as_bool().unwrap_or(false),
         added: 0,
     })
