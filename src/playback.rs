@@ -469,7 +469,12 @@ impl App {
     pub fn show_queue(&mut self) {
         let Some(q) = &self.queue else { return };
         let (idx, key, name, tracks) = (q.idx(), q.key.clone(), q.name.clone(), q.tracks.clone());
+        let album = key.starts_with("spotify:album:");
         self.show_ready(key, name, tracks, true);
+        // an album opened from the player says whose it is, as one opened any other way does
+        if album {
+            self.view.by = self.view.tracks.first().map(By::of);
+        }
         self.tr_state = Sel::with(self.row_of(idx).unwrap_or(0));
     }
 

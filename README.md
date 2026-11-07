@@ -6,7 +6,7 @@ is needed. A native window drawn with [Rune](https://github.com/anomalyco/rune),
 from any app, and a command line for scripts and agents. Needs Spotify Premium and an Apple
 Silicon Mac (macOS 14+, Liquid Glass on 26+).
 
-![spot playing Liked Songs](assets/screenshot.png)
+![spot playing an album](assets/screenshot.png)
 
 ![the ⌥Space launcher searching songs](assets/launcher.png)
 

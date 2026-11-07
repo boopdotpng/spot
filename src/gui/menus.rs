@@ -1,13 +1,14 @@
 // The menu bar, while the window shows (spot has none as a menu-bar-only app). Rune's standard
-// menus give Edit and Window; these add the app's own: Settings and Quit in the spot menu, a
-// Playback menu, and Help. Each item does what its key does in the window.
+// menus give edit and window; these add the app's own: settings and quit in the spot menu, a
+// playback menu, and help. Each item does what its key does in the window. Every title is
+// lowercase, as the rest of spot is.
 
 use rune::{MenuItem, Shortcut};
 
 use super::Ui;
 
-const SETTINGS: &str = "Settings…";
-const QUIT: &str = "Quit spot";
+const SETTINGS: &str = "settings…";
+const QUIT: &str = "quit spot";
 
 fn key(s: &str) -> Shortcut {
     s.parse().expect("a valid shortcut")
@@ -22,7 +23,7 @@ macro_rules! playback {
             $f;
             $ui.after(tx);
         })
-        .menu("Playback")
+        .menu("playback")
     };
 }
 
@@ -45,28 +46,28 @@ pub fn items() -> Vec<MenuItem<Ui>> {
         })
         .key_equivalent(key("cmd+q"))
         .keys_first(),
-        playback!("Play/Pause", |ui| ui.app.toggle()),
-        playback!("Next", |ui| ui.app.skip_soon(1)),
-        playback!("Previous", |ui| ui.app.prev()),
-        MenuItem::separator().menu("Playback"),
-        playback!("Shuffle", |ui| ui.app.toggle_shuffle()),
-        playback!("Repeat", |ui| ui.app.cycle_repeat()),
-        MenuItem::separator().menu("Playback"),
-        playback!("Volume Up", |ui| ui.app.set_volume(3277)),
-        playback!("Volume Down", |ui| ui.app.set_volume(-3277)),
-        MenuItem::separator().menu("Playback"),
-        playback!("Show Queue", |ui| ui.app.show_queue()),
-        MenuItem::new("Quick Search", |ui: &mut Ui, _| ui.toggle_panel())
-            .menu("Playback")
+        playback!("play/pause", |ui| ui.app.toggle()),
+        playback!("next", |ui| ui.app.skip_soon(1)),
+        playback!("previous", |ui| ui.app.prev()),
+        MenuItem::separator().menu("playback"),
+        playback!("shuffle", |ui| ui.app.toggle_shuffle()),
+        playback!("repeat", |ui| ui.app.cycle_repeat()),
+        MenuItem::separator().menu("playback"),
+        playback!("volume up", |ui| ui.app.set_volume(3277)),
+        playback!("volume down", |ui| ui.app.set_volume(-3277)),
+        MenuItem::separator().menu("playback"),
+        playback!("show queue", |ui| ui.app.show_queue()),
+        MenuItem::new("quick search", |ui: &mut Ui, _| ui.toggle_panel())
+            .menu("playback")
             .key_equivalent(key("cmd+o"))
             .keys_first(),
-        MenuItem::new("Keyboard Shortcuts", |ui: &mut Ui, tx| {
+        MenuItem::new("keyboard shortcuts", |ui: &mut Ui, tx| {
             ui.prefs.open = false;
             ui.app.help = true;
             ui.open_window();
             ui.after(tx);
         })
-        .menu("Help"),
+        .menu("help"),
     ]
 }
 
@@ -85,14 +86,15 @@ pub fn tidy() {
     // SAFETY: main thread; every menu and item is retained while used.
     unsafe {
         let Some(root) = app.mainMenu() else { return };
+        lowercase(&root, app.servicesMenu().as_deref());
         let Some(menu) = root.itemAtIndex(0).and_then(|i| i.submenu()) else { return };
         let items = |m: &NSMenu| (0..m.numberOfItems()).filter_map(|i| m.itemAtIndex(i)).collect::<Vec<_>>();
         let find = |m: &NSMenu, f: &dyn Fn(&NSMenuItem) -> bool| items(m).iter().position(|i| f(i)).map(|i| i as isize);
-        let titled = |t: &'static str| move |i: &NSMenuItem| i.title().to_string() == t;
+        let titled = |t: &'static str| move |i: &NSMenuItem| i.title().to_string().to_lowercase() == t;
 
-        // the bar: spot, Edit, Playback, Window, Help (Rune adds menus in whatever order they come)
+        // the bar: spot, edit, playback, window, help (Rune adds menus in whatever order they come)
         let mut at = 1;
-        for t in ["Edit", "Playback", "Window", "Help"] {
+        for t in ["edit", "playback", "window", "help"] {
             if let Some(i) = find(&root, &titled(t)) {
                 if i != at {
                     let top = root.itemAtIndex(i).expect("found it");
@@ -103,7 +105,7 @@ pub fn tidy() {
             }
         }
         if app.helpMenu().is_none()
-            && let Some(help) = find(&root, &titled("Help")).and_then(|i| root.itemAtIndex(i)).and_then(|i| i.submenu())
+            && let Some(help) = find(&root, &titled("help")).and_then(|i| root.itemAtIndex(i)).and_then(|i| i.submenu())
         {
             app.setHelpMenu(Some(&help));
         }
@@ -148,3 +150,29 @@ pub fn tidy() {
 
 #[cfg(not(target_os = "macos"))]
 pub fn tidy() {}
+
+/// Every title in the menu bar in lowercase, as the rest of spot is: Rune's Edit and Window
+/// menus and what AppKit adds (About, Hide, Zoom…) as well as spot's own. The Services submenu,
+/// which lists other apps' services, stays as they name them.
+#[cfg(target_os = "macos")]
+unsafe fn lowercase(menu: &objc2_app_kit::NSMenu, services: Option<&objc2_app_kit::NSMenu>) {
+    use objc2_foundation::NSString;
+    // SAFETY (for the caller too): main thread; every menu and item is retained while used.
+    unsafe {
+        let t = menu.title().to_string();
+        if t.to_lowercase() != t {
+            menu.setTitle(&NSString::from_str(&t.to_lowercase()));
+        }
+        for i in (0..menu.numberOfItems()).filter_map(|i| menu.itemAtIndex(i)) {
+            let t = i.title().to_string();
+            if t.to_lowercase() != t {
+                i.setTitle(&NSString::from_str(&t.to_lowercase()));
+            }
+            if let Some(sub) = i.submenu()
+                && services.is_none_or(|s| !std::ptr::eq(s, &*sub))
+            {
+                lowercase(&sub, services);
+            }
+        }
+    }
+}

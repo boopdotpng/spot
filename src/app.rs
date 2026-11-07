@@ -15,6 +15,13 @@ pub struct By {
     pub artist: Option<(String, String)>, // uri, name
 }
 
+impl By {
+    /// Whose `t`'s album is, going by the song: its artists, the first to go to.
+    pub fn of(t: &Track) -> By {
+        By { names: t.artists.clone(), artist: id_uri("artist", t.artist_id).map(|u| (u, t.artists[..t.lead].to_string())) }
+    }
+}
+
 pub struct View {
     pub id: u64,
     pub key: String,

@@ -225,8 +225,7 @@ impl App {
             return self.goto_show(t);
         }
         let Some(uri) = id_uri("album", t.album_id) else { return };
-        let artist = id_uri("artist", t.artist_id).map(|u| (u, t.artists[..t.lead].to_string()));
-        self.open_album(uri, t.album.clone(), By { names: t.artists.clone(), artist }, Some(t.uri));
+        self.open_album(uri, t.album.clone(), By::of(&t), Some(t.uri));
     }
 
     pub fn goto_artist(&mut self) {
