@@ -186,11 +186,12 @@ impl App {
     }
 
     /// An album, titled by its name; `by` shows under it (the artist goes to their page).
-    pub fn open_album(&mut self, uri: String, name: String, by: By, want: Option<String>) {
+    pub fn open_album(&mut self, uri: String, name: String, mut by: By, want: Option<String>) {
         let mut v = self.new_view(uri.clone(), name, Kind::Tracks);
         v.want = want;
-        v.by = Some(by);
         let cached = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
+        by.find_artist(&cached);
+        v.by = Some(by);
         self.show_list(v, uri, cached);
         self.focus = Focus::Tracks;
     }

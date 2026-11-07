@@ -20,6 +20,19 @@ impl By {
     pub fn of(t: &Track) -> By {
         By { names: t.artists.clone(), artist: id_uri("artist", t.artist_id).map(|u| (u, t.artists[..t.lead].to_string())) }
     }
+
+    /// A search result or "appears on" card only knows the names: find the first artist's page
+    /// among the album's songs, by a song led by that name.
+    pub fn find_artist(&mut self, tracks: &[Track]) {
+        if self.artist.is_some() {
+            return;
+        }
+        self.artist = tracks.iter().find_map(|t| {
+            let lead = &t.artists[..t.lead];
+            let named = !lead.is_empty() && self.names.starts_with(lead);
+            named.then(|| id_uri("artist", t.artist_id).map(|u| (u, lead.to_string()))).flatten()
+        });
+    }
 }
 
 pub struct View {
@@ -211,6 +224,9 @@ impl App {
                 let Some(v) = self.view_mut(view) else { return };
                 if !tracks.is_empty() {
                     Arc::make_mut(&mut v.tracks).extend(tracks);
+                    if let Some(by) = &mut v.by {
+                        by.find_artist(&v.tracks);
+                    }
                 }
                 v.loading = !done;
                 if done {
