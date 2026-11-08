@@ -7,13 +7,13 @@ use std::borrow::Cow;
 use rune::{Color, Cursor, Cx, El, GrowthSpec, ScrollSpec, SurfaceFit, col, el, icon, row, spacer, text};
 
 use super::rows::{pick, scroller, track_row};
-use super::view::{BODY, BODY_MED, LABEL, SMALL, cover, theme_now, ts};
+use super::view::{BODY, BODY_MED, LABEL, SMALL, cover, fit, theme_now, ts};
 use super::{Ui, icons, motion};
 use crate::artist::top_cols;
 use crate::*;
 
-const PAD: f32 = 20.0; // the pane's edges
-const GAP: f32 = 10.0; // between cards
+pub(super) const PAD: f32 = 20.0; // the pane's edges
+pub(super) const GAP: f32 = 10.0; // between cards
 const CARD_MIN: f32 = 150.0;
 const CARD_PAD: f32 = 8.0;
 const CARD_TEXT: f32 = 8.0 + 17.0 + 2.0 + 16.0; // under the cover: a gap, the name, the line under it
@@ -23,12 +23,12 @@ pub const TOP_BAR: f32 = 52.0;
 const NAME: rune::TextStyle = ts(46.0, 780.0).lh(54.0).tracking(-1.4);
 const HEADING: rune::TextStyle = ts(19.0, 700.0).lh(24.0).tracking(-0.3);
 
-fn pane_w(cx: &mut Cx<Ui>) -> f32 {
+pub(super) fn pane_w(cx: &mut Cx<Ui>) -> f32 {
     cx.layout_size("main").map_or(900.0, |s| s[0])
 }
 
 /// Cards to a line, and how wide each is, for the pane as it last laid out.
-fn grid_layout(cx: &mut Cx<Ui>) -> (usize, f32) {
+pub(super) fn grid_layout(cx: &mut Cx<Ui>) -> (usize, f32) {
     let w = pane_w(cx);
     let avail = (w - 2.0 * PAD).max(CARD_MIN);
     let cols = ((avail + GAP) / (CARD_MIN + GAP)).floor().clamp(2.0, 10.0) as usize;
@@ -45,7 +45,7 @@ fn card(ui: &Ui, r: usize, l: &Link, w: f32, th: &Theme) -> El {
     let artist = l.uri.starts_with("spotify:artist:");
     let side = w - 2.0 * CARD_PAD;
     let img = l.image.as_deref().and_then(|u| ui.thumb(&art::medium(u)));
-    let glyph = if artist { &icons::PERSON } else { &icons::ALBUM };
+    let glyph = if artist { &icons::PERSON } else if l.uri.starts_with("spotify:show:") { &icons::MIC } else { &icons::ALBUM };
     let fill = match (selected, focused) {
         (true, true) => th.sel,
         (true, false) => th.wash,
@@ -72,7 +72,7 @@ fn card(ui: &Ui, r: usize, l: &Link, w: f32, th: &Theme) -> El {
 }
 
 /// A section's cards, `cols` to a line; the first is stop `start`.
-fn card_lines(ui: &Ui, key: &str, start: usize, cards: &[&Link], cols: usize, w: f32, th: &Theme) -> El {
+pub(super) fn card_lines(ui: &Ui, key: &str, start: usize, cards: &[&Link], cols: usize, w: f32, th: &Theme) -> El {
     let mut lines = col().key(key.to_string()).w_full().gap(GAP);
     for (n, chunk) in cards.chunks(cols).enumerate() {
         let mut line = row().key(format!("{key}-{n}")).w_full().gap(GAP);
@@ -101,13 +101,13 @@ pub fn release_chips(ui: &Ui, th: &Theme) -> El {
     super::view::segmented("chips", &opts, on, 70.0, "Releases  f", th, |ui, f| ui.app.set_releases(f))
 }
 
-fn heading(key: &str, s: &str, th: &Theme) -> El {
+pub(super) fn heading(key: &str, s: &str, th: &Theme) -> El {
     text(s.to_string()).key(format!("{key}-h")).font(HEADING).color(th.text)
 }
 
 /// The portrait, blurred into the header's backdrop (up under the top bar), under the round portrait, the name, and
 /// the things to do: play (every song, shuffled) and every song as a list.
-fn header(ui: &Ui, info: &ArtistInfo, th: &Theme) -> El {
+fn header(ui: &Ui, info: &ArtistInfo, th: &Theme, pane: f32) -> El {
     let a = &ui.app;
     let v = &a.view;
     let img = info.portrait.as_deref().and_then(|u| ui.thumb(&art::medium(u)));
@@ -141,7 +141,7 @@ fn header(ui: &Ui, info: &ArtistInfo, th: &Theme) -> El {
     let actions = row().key("ov-actions").gap(14.0).center_y().pt(14.0).child(play).child(songs);
     let words = col().key("ov-words").grow(1.0).shrink().min_w(0.0).gap(2.0)
         .child(text("ARTIST").key("kicker").font(LABEL).color(th.dim))
-        .child(text(name.clone()).key("name").font(NAME).color(th.text).truncate().help_when_truncated(name))
+        .child(text(name.clone()).key("name").font(fit(&name, NAME, pane - 2.0 * 28.0 - PORTRAIT - 26.0, 30.0)).color(th.text).truncate().help_when_truncated(name))
         .child(text(meta).key("meta").font(SMALL).color(th.sub))
         .child(actions);
     let portrait = cover("ov-portrait".into(), img.as_ref(), PORTRAIT, PORTRAIT / 2.0, th, &icons::PERSON)
@@ -171,7 +171,7 @@ pub fn overview(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     a.grid_cols.set(cols);
     let blocks = a.blocks();
     let start = |s: Section| blocks.iter().find(|b| b.section == Some(s)).map_or(0, |b| b.start);
-    let mut page = col().key("ov").w_full().pb(40.0).gap(30.0).child(header(ui, info, th));
+    let mut page = col().key("ov").w_full().pb(40.0).gap(30.0).child(header(ui, info, th, pane_w(cx)));
 
     if !v.tracks.is_empty() {
         // two columns of songs in rank order, down the left one and then the right

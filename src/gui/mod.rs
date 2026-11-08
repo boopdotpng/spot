@@ -26,6 +26,7 @@ mod motion;
 mod panel;
 mod player;
 mod rows;
+mod search;
 mod swipe;
 mod prefs;
 mod view;
@@ -425,6 +426,10 @@ impl Ui {
     }
 
     pub fn open_find(&mut self) {
+        // a search of everything: search again instead
+        if self.app.view.is_search_all() {
+            return self.focus_search();
+        }
         // the overview has nothing to find in: find in every song the artist has
         if self.app.view.info.is_some() {
             self.app.open_artist_mode(ArtistMode::Songs, true);

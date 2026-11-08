@@ -24,9 +24,11 @@ pub fn small(url: &str) -> String {
     url.replacen("ab67616d0000b273", "ab67616d00004851", 1).replacen("ab6761610000e5eb", "ab6761610000f178", 1)
 }
 
-/// The 300 px copy, for the header over a list (320 px for a portrait).
+/// The 300 px copy, for the header over a list (320 px for a portrait, and a playlist's
+/// four-album mosaic from the sidebar's 60 px one).
 pub fn medium(url: &str) -> String {
     url.replacen("ab67616d0000b273", "ab67616d00001e02", 1).replacen("ab6761610000e5eb", "ab67616100005174", 1)
+        .replacen("mosaic.scdn.co/60/", "mosaic.scdn.co/300/", 1)
 }
 
 /// Where an image is kept on disk: its url, flattened to a file name. Spotify's image urls name
@@ -172,6 +174,11 @@ mod tests {
         let img = image::RgbImage::from_pixel(8, 8, image::Rgb([128, 128, 128]));
         let [r, g, b] = tint(&image::DynamicImage::ImageRgb8(img));
         assert!((r - 0.5).abs() < 0.01 && r == g && g == b);
+    }
+
+    #[test]
+    fn medium_mosaics_are_300() {
+        assert_eq!(medium("https://mosaic.scdn.co/60/ab67616d00001e02aab67616d00001e02b"), "https://mosaic.scdn.co/300/ab67616d00001e02aab67616d00001e02b");
     }
 
     #[test]

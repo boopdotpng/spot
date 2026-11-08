@@ -5,8 +5,25 @@ use crate::*;
 /// How long typing has to stop for before searching; the launcher's wait.
 const SEARCH_SETTLE: Duration = Duration::from_millis(140);
 
-fn search_key(kind: Kind, q: &str) -> String {
-    format!("search:{}:{q}", kind.label())
+fn search_key(kind: Option<Kind>, q: &str) -> String {
+    format!("search:{}:{q}", search_label(kind))
+}
+
+/// The songs, albums and artists a search of everything shows: the top result, five songs, and
+/// a line each of artists and albums (as many as Spotify gives one request).
+fn found(q: &str, v: &Value) -> (Option<Hit>, ArtistInfo) {
+    let m = ctl::mixed(q, v);
+    let hit = m.top.and_then(|(kind, i)| match kind {
+        "track" => parse_track(i).map(|t| Hit { link: song_link(&t), song: Some(t) }),
+        _ => parse_link(kind, i).map(|link| Hit { link, song: None }),
+    });
+    let info = ArtistInfo {
+        top: m.tracks.into_iter().filter_map(parse_track).take(5).collect(),
+        releases: m.albums.into_iter().filter_map(|i| parse_link("album", i)).collect(),
+        related: m.artists.into_iter().filter_map(|i| parse_link("artist", i)).collect(),
+        ..Default::default()
+    };
+    (hit, info)
 }
 
 impl App {
@@ -152,7 +169,15 @@ impl App {
 
     /// Search for what's in the prompt, unless those are already the results on show.
     pub fn run_search(&mut self) {
-        let Some(q) = self.input.as_deref().map(str::trim).map(String::from) else { return };
+        let Some(q) = self.input.as_deref().map(str::trim).map(String::from) else {
+            // a chip on a search's results: the same words, for something else, in its place
+            if let Some(q) = self.view.search_query().map(String::from)
+                && self.view.key != search_key(self.search_kind, &q)
+            {
+                self.open_search(q, false);
+            }
+            return;
+        };
         if q.is_empty() {
             return self.end_live_search();
         }
@@ -183,9 +208,27 @@ impl App {
         if let Some(task) = self.search_task.take() {
             task.abort();
         }
-        let kind = self.search_kind;
+        let Some(kind) = self.search_kind else {
+            let mut v = self.new_view(search_key(None, &q), format!("Search: {q}"), Kind::Tracks);
+            v.info = Some(Arc::default());
+            let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
+            let task = self.rt.spawn(async move {
+                let found = match search_all(&api, &q, 10).await {
+                    Ok(v) => found(&q, &v),
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(e));
+                        (None, ArtistInfo::default())
+                    }
+                };
+                let _ = tx.send(Msg::Found { view, found: Box::new(found) });
+            });
+            self.search_task = Some(task.abort_handle());
+            self.show(v, back);
+            self.focus = Focus::Tracks;
+            return;
+        };
         let title = format!("Search {}: {q}", kind.label());
-        let v = self.new_view(search_key(kind, &q), title, kind);
+        let v = self.new_view(search_key(Some(kind), &q), title, kind);
         let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
         let task = self.rt.spawn(async move {
             let res = search(&api, &q, kind.ty(), 50, |items, done| {

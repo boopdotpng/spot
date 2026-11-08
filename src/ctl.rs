@@ -612,6 +612,13 @@ impl App {
 
     /// Fetch the songs behind each target in the background (searching first for words);
     /// on_loaded acts on them.
+    /// Play an album, artist or playlist from the window without opening it, as `spot play
+    /// <uri>` would. Nobody waits on the answer.
+    pub fn play_uri(&mut self, uri: String) {
+        let (reply, _) = mpsc::channel();
+        self.load(vec![uri], Then::Play { from: None, show: false }, reply);
+    }
+
     fn load(&mut self, targets: Vec<String>, then: Then, reply: Reply) {
         let targets = match targets.iter().map(|t| self.target(t)).collect::<Result<Vec<_>, _>>() {
             Ok(t) => t,
@@ -839,15 +846,25 @@ fn top_pick(q: &str, names: [Option<&str>; 3]) -> Option<usize> {
     }
 }
 
-/// The panel's mixed results from one search's tracks, albums and artists. A song or album
-/// that's on several releases (a deluxe edition, a single and its album) shows once, the first
-/// time; so does the top result. Artists far less known than the best of them are dropped:
-/// searching an album's name finds accounts named after it.
-fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
-    let items = |k: &str| v[k]["items"].as_array().cloned().unwrap_or_default();
-    let (tracks, albums, mut artists) = (items("tracks"), items("albums"), items("artists"));
+/// One search's songs, albums and artists, sorted out: the top result (`"artist"`, `"track"` or
+/// `"album"`, and which) is whichever of the first artist, song and album the words name best.
+/// A song or album that's on several releases (a deluxe edition, a single and its album) is
+/// kept once, the first time; the top result isn't repeated after it. Artists far less known
+/// than the best of them are dropped: searching an album's name finds accounts named after it.
+pub struct Mixed<'a> {
+    pub top: Option<(&'static str, &'a Value)>,
+    pub tracks: Vec<&'a Value>,
+    pub albums: Vec<&'a Value>,
+    pub artists: Vec<&'a Value>,
+}
+
+pub fn mixed<'a>(q: &str, v: &'a Value) -> Mixed<'a> {
+    fn items<'a>(v: &'a Value, k: &str) -> Vec<&'a Value> {
+        v[k]["items"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    }
+    let (tracks, albums, mut artists) = (items(v, "tracks"), items(v, "albums"), items(v, "artists"));
     let fame = |i: &Value| i["popularity"].as_u64();
-    if let Some(best) = artists.iter().filter_map(fame).max() {
+    if let Some(best) = artists.iter().filter_map(|i| fame(i)).max() {
         artists.retain(|i| fame(i).is_none_or(|p| p * 4 >= best));
     }
     // the same song or album: its name and its artists'
@@ -855,8 +872,29 @@ fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
         let by: Vec<String> = i["artists"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).map(str::to_lowercase).collect()).unwrap_or_default();
         format!("{}\t{}", i["name"].as_str().unwrap_or("").trim().to_lowercase(), by.join(", "))
     };
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut fresh = |kind: &str, i: &Value| seen.insert(format!("{kind}\t{}", same(i)));
+    fn name<'a>(l: &[&'a Value]) -> Option<&'a str> {
+        l.first().and_then(|i| i["name"].as_str())
+    }
+    let top = match top_pick(q, [name(&artists), name(&tracks), name(&albums)]) {
+        Some(0) => Some(("artist", artists[0])),
+        Some(1) => Some(("track", tracks[0])),
+        Some(2) => Some(("album", albums[0])),
+        _ => None,
+    };
+    if let Some((kind, i)) = top {
+        fresh(kind, i);
+    }
+    let tracks = tracks.into_iter().filter(|i| fresh("track", i)).collect();
+    let albums = albums.into_iter().filter(|i| fresh("album", i)).collect();
+    let artists = artists.into_iter().filter(|i| fresh("artist", i)).collect();
+    Mixed { top, tracks, albums, artists }
+}
+
+/// The panel's mixed results (see `mixed`): the top result, three songs, an album and an
+/// artist.
+fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
     let track_row = |i: &Value, section: &str, kind: bool| {
         let t = parse_track(i)?;
         let sub = if kind { format!("Song · {}", t.artists) } else { format!("{} · {}", t.artists, t.album) };
@@ -871,20 +909,16 @@ fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
         let l = parse_link("artist", i)?;
         Some(tsv_row(&[&l.uri, &l.name, "Artist", &cover(i), "", "", section]))
     };
-    fn name(l: &[Value]) -> Option<&str> {
-        l.first().and_then(|i| i["name"].as_str())
-    }
-    let top = top_pick(q, [name(&artists), name(&tracks), name(&albums)]);
+    let m = mixed(q, v);
     let mut rows = vec![];
-    rows.extend(match top {
-        Some(0) => fresh("artist", &artists[0]).then(|| artist_row(&artists[0], "Top result")).flatten(),
-        Some(1) => fresh("track", &tracks[0]).then(|| track_row(&tracks[0], "Top result", true)).flatten(),
-        Some(2) => fresh("album", &albums[0]).then(|| album_row(&albums[0], "Top result", true)).flatten(),
-        _ => None,
-    });
-    rows.extend(tracks.iter().filter(|i| fresh("track", i)).take(3).filter_map(|i| track_row(i, "Songs", false)).collect::<Vec<_>>());
-    rows.extend(albums.iter().filter(|i| fresh("album", i)).take(1).filter_map(|i| album_row(i, "Albums", false)).collect::<Vec<_>>());
-    rows.extend(artists.iter().filter(|i| fresh("artist", i)).take(1).filter_map(|i| artist_row(i, "Artists")).collect::<Vec<_>>());
+    rows.extend(m.top.and_then(|(kind, i)| match kind {
+        "artist" => artist_row(i, "Top result"),
+        "track" => track_row(i, "Top result", true),
+        _ => album_row(i, "Top result", true),
+    }));
+    rows.extend(m.tracks.iter().take(3).filter_map(|i| track_row(i, "Songs", false)));
+    rows.extend(m.albums.iter().take(1).filter_map(|i| album_row(i, "Albums", false)));
+    rows.extend(m.artists.iter().take(1).filter_map(|i| artist_row(i, "Artists")));
     rows
 }
 

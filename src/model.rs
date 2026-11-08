@@ -105,6 +105,7 @@ pub struct ArtistInfo {
 /// The overview's sections of cards.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Section {
+    Top, // a search's top result
     Releases,
     Appears,
     Related,
@@ -178,6 +179,11 @@ impl Kind {
     }
 }
 
+/// What a search is for, as its chip says it: everything, or songs, albums, ….
+pub fn search_label(kind: Option<Kind>) -> &'static str {
+    kind.map_or("all", Kind::label)
+}
+
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum Repeat {
     #[default]
@@ -214,6 +220,14 @@ impl Playlist {
     }
 }
 
+/// A search's top result: a song, an album or an artist, as a card; a song keeps its track to
+/// play.
+#[derive(Clone)]
+pub struct Hit {
+    pub link: Link,
+    pub song: Option<Track>,
+}
+
 /// A song (or an episode) as the recently played keep it.
 pub fn song_link(t: &Track) -> Link {
     let kind = if t.uri.starts_with("spotify:episode:") { "Episode" } else { "Song" };
@@ -229,6 +243,7 @@ pub enum Msg {
     Links { view: u64, links: Vec<Link>, done: bool },
     ReplaceLinks { view: u64, links: Vec<Link> }, // fresh copy of an artist's releases shown from cache
     Artist { view: u64, info: Arc<ArtistInfo> },
+    Found { view: u64, found: Box<(Option<Hit>, ArtistInfo)> }, // a search of everything: songs, albums (releases) and artists (related)
     About { view: u64, about: Vec<String> }, // an album's release date and label, then its copyrights  // an artist's overview, fresh (or None came: see lists)
     Error(String),
     Media(MediaControlEvent),

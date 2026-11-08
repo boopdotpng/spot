@@ -34,27 +34,39 @@ impl View {
         })
     }
 
-    /// The artist's discography as a grid of covers.
+    /// A grid of covers: the artist's discography, or a search's albums, artists or podcasts.
     pub fn is_grid(&self) -> bool {
-        self.artist_mode() == Some(ArtistMode::Releases)
+        self.artist_mode() == Some(ArtistMode::Releases) || (self.kind != Kind::Tracks && self.search_query().is_some())
+    }
+
+    /// The words searched for, when this is a search's results.
+    pub fn search_query(&self) -> Option<&str> {
+        self.key.strip_prefix("search:")?.split_once(':').map(|(_, q)| q)
+    }
+
+    /// A search of everything: the top result, songs, artists and albums on one page.
+    pub fn is_search_all(&self) -> bool {
+        self.key.starts_with("search:all:")
     }
 
     /// What the queue's called when playing from here: popular songs aren't the artist's list.
     pub fn queue_key(&self) -> String {
-        if self.info.is_some() { format!("top:{}", self.key) } else { self.key.clone() }
+        if self.artist.is_some() && self.info.is_some() { format!("top:{}", self.key) } else { self.key.clone() }
     }
 
     pub fn queue_name(&self) -> String {
-        if self.info.is_some() { format!("{} · popular", self.title) } else { self.title.clone() }
+        if self.artist.is_some() && self.info.is_some() { format!("{} · popular", self.title) } else { self.title.clone() }
     }
 
     /// The overview's cards in `s`: as many as its lines hold (two for the discography, one
-    /// for the rest), at `cols` to a line.
+    /// for the rest; a search's albums, one), at `cols` to a line.
     pub fn cards(&self, s: Section, cols: usize) -> Vec<&Link> {
         let Some(info) = self.overview() else { return vec![] };
         let cols = cols.max(1);
+        let lines = if self.is_search_all() { 1 } else { 2 };
         match s {
-            Section::Releases => info.releases.iter().filter(|l| self.filter.keeps(l)).take(cols * 2).collect(),
+            Section::Top => self.hit.iter().map(|h| &h.link).collect(),
+            Section::Releases => info.releases.iter().filter(|l| self.filter.keeps(l)).take(cols * lines).collect(),
             Section::Appears => info.appears.iter().take(cols).collect(),
             Section::Related => info.related.iter().take(cols).collect(),
         }
@@ -65,10 +77,21 @@ impl View {
     pub fn blocks(&self, cols: usize, shown: usize) -> Vec<Block> {
         let cols = cols.max(1);
         if self.info.is_some() {
-            let mut out = vec![Block { section: None, start: 0, len: self.tracks.len(), cols: top_cols(cols), down: true }];
-            for s in [Section::Releases, Section::Appears, Section::Related] {
-                let start = out.last().map_or(0, |b| b.start + b.len);
-                out.push(Block { section: Some(s), start, len: self.cards(s, cols).len(), cols, down: false });
+            // a search's songs are one column beside the top result. The songs are the first
+            // stops (a stop under their count is a song to play), so the top result is numbered
+            // after them, though it comes first on the page
+            let all = self.is_search_all();
+            let songs = Block { section: None, start: 0, len: self.tracks.len(), cols: if all { 1 } else { top_cols(cols) }, down: true };
+            let sections: &[Section] = if all { &[Section::Top, Section::Related, Section::Releases] } else { &[Section::Releases, Section::Appears, Section::Related] };
+            let mut out = vec![songs];
+            let mut start = self.tracks.len();
+            for &s in sections {
+                let len = self.cards(s, cols).len();
+                out.push(Block { section: Some(s), start, len, cols: if s == Section::Top { 1 } else { cols }, down: false });
+                start += len;
+            }
+            if all {
+                out.swap(0, 1);
             }
             out.retain(|b| b.len > 0);
             return out;
@@ -232,7 +255,7 @@ impl App {
     }
 
     pub fn overview_len(&self) -> usize {
-        self.blocks().last().map_or(0, |b| b.start + b.len)
+        self.blocks().iter().map(|b| b.start + b.len).max().unwrap_or(0)
     }
 
     pub fn card_at(&self, i: usize) -> Option<(Section, Link)> {
@@ -243,7 +266,13 @@ impl App {
     pub fn open_card(&mut self, i: usize) {
         let Some((s, l)) = self.card_at(i) else { return };
         match s {
+            Section::Top => self.open_hit(),
             Section::Related => self.open_artist(l.uri, l.name),
+            Section::Releases if self.view.artist.is_none() => {
+                // a search's album: its line starts with whose it is
+                let names = l.sub.split(" · ").next().unwrap_or_default().to_string();
+                self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
+            }
             Section::Releases => {
                 let name = self.view.artist.clone().unwrap_or_default();
                 let by = By::one(self.view.key.clone(), name);
@@ -268,6 +297,23 @@ impl App {
             self.tr_state.select(Some(to));
         }
         Some(to.is_some())
+    }
+
+    /// A search's top result: play the song (then the songs beside it), or open the album or
+    /// artist.
+    pub fn open_hit(&mut self) {
+        let Some(hit) = self.view.hit.clone() else { return };
+        let l = hit.link;
+        if let Some(t) = hit.song {
+            let tracks: Vec<Track> = std::iter::once(t).chain(self.view.tracks.iter().cloned()).collect();
+            let q = Queue { key: self.view.queue_key(), name: self.view.queue_name(), tracks: Arc::new(tracks), order: vec![], pos: 0, sorted: vec![] };
+            return self.play_queue(q, Some(0));
+        }
+        if l.uri.starts_with("spotify:artist:") {
+            return self.open_artist(l.uri, l.name);
+        }
+        let names = l.sub.split(" · ").next().unwrap_or_default().to_string();
+        self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
     }
 
     /// The artist page's play: every song they have, shuffled. At once from the cache (and
@@ -372,6 +418,32 @@ mod tests {
         assert_eq!(grid_step(&bs, 1, -1, 0), None); // the sidebar's
         assert_eq!(grid_step(&bs, 2, 0, 1), Some(3)); // the last song, on to the first card
         assert_eq!(grid_step(&bs, 3, 0, -1), Some(2)); // and back
+    }
+
+    /// A search of everything: a top result, 2 songs, 3 artists and 5 albums.
+    fn search() -> View {
+        let artist = |i: usize| Link { uri: format!("spotify:artist:{i}"), ..link(i) };
+        let info = ArtistInfo { top: (0..2).map(track).collect(), releases: (0..5).map(link).collect(), related: (10..13).map(artist).collect(), ..Default::default() };
+        let mut v = View::new(1, "search:all:x".into(), "Search: x".into(), Kind::Tracks);
+        v.info = Some(Arc::new(info));
+        v.hit = Some(Hit { link: artist(9), song: None });
+        v.set_top();
+        v
+    }
+
+    #[test]
+    fn a_search_lays_out_the_top_result_then_songs_artists_and_a_line_of_albums() {
+        let v = search();
+        let bs = v.blocks(3, 0);
+        let b: Vec<(Option<Section>, usize, usize, usize)> = bs.iter().map(|b| (b.section, b.start, b.len, b.cols)).collect();
+        // the songs keep the first stops, so the top result is numbered after them
+        assert_eq!(b, [(Some(Section::Top), 2, 1, 1), (None, 0, 2, 1), (Some(Section::Related), 3, 3, 3), (Some(Section::Releases), 6, 3, 3)]);
+        assert_eq!(v.card_at(3, 2).map(|(s, l)| (s, l.uri.as_str())), Some((Section::Top, "spotify:artist:9")));
+        assert_eq!(grid_step(&bs, 2, 0, 1), Some(0)); // down off the top result onto the first song
+        assert_eq!(grid_step(&bs, 0, 0, -1), Some(2)); // and back
+        assert_eq!(grid_step(&bs, 1, 0, 1), Some(3)); // the last song, on to the first artist
+        assert_eq!(grid_step(&bs, 5, 0, 1), Some(8)); // an artist, down to the album under it
+        assert_eq!(v.queue_key(), "search:all:x");
     }
 
     #[test]

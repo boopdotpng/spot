@@ -5,7 +5,7 @@
 use rune::{Color, Cursor, Cx, El, Phase, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
 
 use super::menu::{self, Menu};
-use super::{Ui, artist, icons, motion, player, rows};
+use super::{Ui, artist, icons, motion, player, rows, search};
 use crate::*;
 
 pub const ROW: f32 = 44.0; // a song's row (with its cover)
@@ -19,6 +19,22 @@ pub const fn ts(size: f32, weight: f32) -> TextStyle {
 pub const TITLE: TextStyle = ts(24.0, 720.0).lh(30.0).tracking(-0.4);
 /// A list's name over it.
 const HERO_TITLE: TextStyle = ts(36.0, 760.0).lh(42.0).tracking(-0.9);
+/// `style`, made smaller (down to `min` points) until `s` fits on one line `width` points wide,
+/// so a long title or name shrinks before it's cut short. The line height stays, so the header
+/// doesn't move as it does; past `min` the text still truncates.
+pub fn fit(s: &str, style: TextStyle, width: f32, min: f32) -> TextStyle {
+    let wide = |st: TextStyle| rune::text::measure(s, &[], st, None).0;
+    if width <= 0.0 || wide(style) <= width {
+        return style;
+    }
+    let at = |size: f32| TextStyle { size, tracking: style.tracking * size / style.size, ..style };
+    // width goes nearly as the size does: guess from that, then step down by half points
+    let mut size = (style.size * width / wide(style)).floor().clamp(min, style.size);
+    while size > min && wide(at(size)) > width {
+        size = (size - 0.5).max(min);
+    }
+    at(size)
+}
 pub const BODY: TextStyle = ts(13.0, 450.0).lh(17.0);
 pub const BODY_MED: TextStyle = ts(13.0, 560.0).lh(17.0);
 pub const SMALL: TextStyle = ts(12.0, 450.0).lh(16.0);
@@ -338,13 +354,23 @@ fn hero_tint(ui: &Ui) -> Option<[f32; 3]> {
     if v.artist.is_some() {
         return v.portrait.as_deref().and_then(|u| ui.tint(&art::medium(u)));
     }
+    if let Some(u) = own_cover(ui) {
+        return ui.tint(&art::medium(u)).or_else(|| ui.tint(u));
+    }
     if v.kind != Kind::Tracks {
         return None;
     }
     v.tracks.iter().find_map(|t| t.cover.as_deref()).and_then(|u| ui.tint(&art::small(u)))
 }
 
-/// The art over a list: its cover, the first four albums in it as a square, or a plain tile.
+/// The cover Spotify gives the open playlist (the sidebar's), when it's one of yours.
+fn own_cover(ui: &Ui) -> Option<&str> {
+    let key = &ui.app.view.key;
+    ui.app.playlists.iter().find(|p| p.id.as_deref() == Some(key.as_str()))?.image.as_deref()
+}
+
+/// The art over a list: the playlist's own cover (as in the sidebar), else the first four albums
+/// in it as a square, or a plain tile.
 fn hero_art(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
     let v = &a.view;
@@ -362,6 +388,10 @@ fn hero_art(ui: &Ui, th: &Theme) -> El {
             Some(i) => cover("hero-art".into(), Some(i), size, r, th, &icons::QUEUE),
             None => tile("hero-art".into(), size, r, Some(&icons::QUEUE), th),
         };
+    }
+    if let Some(u) = own_cover(ui) {
+        let img = ui.thumb(&art::medium(u)).or_else(|| ui.thumb(u));
+        return cover("hero-art".into(), img.as_ref(), size, r, th, &icons::NOTE);
     }
     let mut covers: Vec<&str> = vec![];
     for c in v.tracks.iter().filter_map(|t| t.cover.as_deref()) {
@@ -415,7 +445,15 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     } else {
         icon_button("search-open", &icons::SEARCH, 16.0, th.sub, th, "Search  ⌘K", |ui| ui.focus_search())
     });
-    if v.info.is_some() && !(a.input.is_some() || a.live_search) {
+    if v.search_query().is_some() {
+        // a search's results: no header, only what to search for, then what it found
+        let [back_mark, fwd_mark] = super::swipe::marks(ui, th);
+        return col().key("main").grow(1.0).shrink().h_full().min_w(0.0).on_wheel(super::swipe::wheel)
+            .child(top)
+            .child(search::page(ui, th, cx))
+            .child(back_mark).child(fwd_mark);
+    }
+    if v.info.is_some() {
         // the bar floats over the header's backdrop, and takes the window's color (and a
         // hairline) once the page scrolls under it
         let bar_bg = col().key("top-bg").pin(Some(0.0), Some(0.0), Some(0.0), None).live_opacity(&ui.scrolled)
@@ -456,6 +494,9 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     // a flat header: the art, then what it is, its title, and a line of what's in it with the
     // things to do with it
     let title = v.title.trim_start_matches(['♥', ' ']).to_string();
+    // the words' column: the pane, less its edges, the art and the gap after it
+    let words_w = cx.layout_size("main").map_or(0.0, |s| s[0]) - 2.0 * 28.0 - HERO_ART - 22.0;
+    let title_font = fit(&title, HERO_TITLE, words_w, 24.0);
     let mut line = row().key("hero-line").gap(14.0).center_y().min_w(0.0);
     if let Some(by) = &v.by {
         // an album's artist, as Spotify puts it: first on the line, and a way to their page
@@ -472,16 +513,14 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     }
     let mut words = col().key("hero-words").grow(1.0).shrink().min_w(0.0).gap(2.0)
         .child(text(kicker(&v.key).to_uppercase()).key("kicker").font(LABEL).color(th.dim))
-        .child(text(title.clone()).key("title").font(HERO_TITLE).color(th.text).truncate().help_when_truncated(title))
+        .child(text(title.clone()).key("title").font(title_font).color(th.text).truncate().help_when_truncated(title))
         .child(line);
-    if a.input.is_some() || a.live_search {
-        words = words.child(kinds(ui, th));
-    } else if v.is_grid() {
+    if v.is_grid() {
         words = words.child(row().key("chips-pad").pt(8.0).child(artist::release_chips(ui, th)));
     }
     // a list opening (or coming back) makes an entrance: its art comes into focus and its words
     // rise in just after, while the last list's header slips away. A search stays put as you type
-    let staged = if a.input.is_some() || a.live_search { "search".to_string() } else { v.id.to_string() };
+    let staged = v.id.to_string();
     let hero_row = row().key(format!("hero-row-{staged}")).w_full().px(28.0).pt(2.0).pb(18.0).gap(22.0).items_end()
         .transition(motion::stage())
         .child(hero_art(ui, th).transition(motion::focus()))
@@ -538,7 +577,10 @@ fn field(th: &Theme, key: &str, edit: &rune::TextEdit, w: f32, i: &'static rune:
 }
 
 fn search_field(ui: &Ui, th: &Theme) -> El {
-    let label = format!("Search {}", ui.app.search_kind.label());
+    let label = match ui.app.search_kind {
+        None => "Search".to_string(),
+        Some(k) => format!("Search {}", k.label()),
+    };
     field(th, "search", &ui.search, 260.0, &icons::SEARCH, &label, |f| f.on_edit(|ui: &mut Ui| &mut ui.search)
         .on_input_change(|ui: &mut Ui, tx| {
             let t = ui.search.text.clone();
@@ -589,15 +631,15 @@ fn find_field(ui: &Ui, th: &Theme) -> El {
     row().key("find-row").gap(10.0).center_y().child(count).child(f)
 }
 
-/// While searching: what to search for, as chips (tab cycles them).
-fn kinds(ui: &Ui, th: &Theme) -> El {
-    let opts = [Kind::Tracks, Kind::Albums, Kind::Artists, Kind::Shows].map(|k| (k, k.label()));
+/// On a search's results: what to search for, as chips (tab in the field cycles them).
+pub fn kinds(ui: &Ui, th: &Theme) -> El {
+    let opts = [None, Some(Kind::Tracks), Some(Kind::Albums), Some(Kind::Artists), Some(Kind::Shows)].map(|k| (k, search_label(k)));
     let on = opts.iter().position(|&(k, _)| k == ui.app.search_kind).unwrap_or(0);
-    let pick = |ui: &mut Ui, k: Kind| {
+    let pick = |ui: &mut Ui, k: Option<Kind>| {
         ui.app.search_kind = k;
         ui.app.search_at = Some(Instant::now());
     };
-    row().key("kinds").pt(8.0).child(segmented("kind", &opts, on, 78.0, "", th, pick))
+    row().key("kinds").child(segmented("kind", &opts, on, 78.0, "", th, pick))
 }
 
 /// One choice of a few, as chips all one width: the chosen one sits on a solid pill, and when
@@ -718,4 +760,21 @@ fn help(th: &Theme) -> El {
             ui.after(tx);
         })
         .child(card)
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn shrinks_to_fit() {
+        let t = "Wonder Woman (Original Motion Picture Soundtrack)";
+        let full = rune::text::measure(t, &[], HERO_TITLE, None).0;
+        let f = fit(t, HERO_TITLE, 700.0, 24.0);
+        eprintln!("full {full}, fitted {} at {}", rune::text::measure(t, &[], f, None).0, f.size);
+        assert!(f.size < HERO_TITLE.size && f.size >= 24.0);
+        assert!(rune::text::measure(t, &[], f, None).0 <= 700.0);
+        assert_eq!(fit("Short", HERO_TITLE, 700.0, 24.0).size, HERO_TITLE.size);
+        assert_eq!(fit(t, HERO_TITLE, 200.0, 24.0).size, 24.0);
+    }
 }

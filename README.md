@@ -74,7 +74,7 @@ Closing the window (`⌘W`) keeps the music playing; `⌘Q` quits.
 
 | key | action |
 |---|---|
-| `/`, `⌘K` | search as you type (`tab` in the field cycles songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
+| `/`, `⌘K` | search as you type (`tab` in the field cycles all / songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
 | `enter` | play song (the rest of the list plays after it) · open album / artist |
 | `d` | playlists: sort by date added (newest first, oldest first, as listed); also the DATE ADDED column's head; remembered |
 | `⌘F` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |

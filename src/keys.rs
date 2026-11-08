@@ -78,15 +78,26 @@ impl App {
             }
             Key::Tab => self.cycle_search_kind(false),
             Key::BackTab => self.cycle_search_kind(true),
-            Key::Up if self.live_search => self.move_sel(-1),
-            Key::Down if self.live_search => self.move_sel(1),
+            // the results' cursor: by line on a page of cards, else by row
+            Key::Up if self.live_search => {
+                if self.grid_move(0, -1).is_none() {
+                    self.move_sel(-1);
+                }
+            }
+            Key::Down if self.live_search => {
+                if self.grid_move(0, 1).is_none() {
+                    self.move_sel(1);
+                }
+            }
             _ => return false,
         }
         true
     }
 
     pub fn cycle_search_kind(&mut self, back: bool) {
-        self.search_kind = if back { (0..3).fold(self.search_kind, |k, _| k.next()) } else { self.search_kind.next() };
+        const ORDER: [Option<Kind>; 5] = [None, Some(Kind::Tracks), Some(Kind::Albums), Some(Kind::Artists), Some(Kind::Shows)];
+        let at = ORDER.iter().position(|&k| k == self.search_kind).unwrap_or(0);
+        self.search_kind = ORDER[(at + if back { ORDER.len() - 1 } else { 1 }) % ORDER.len()];
         self.search_at = Some(Instant::now()); // nothing being typed to wait for
     }
 
@@ -106,7 +117,7 @@ impl App {
             Key::Right | Key::Char('l') if self.focus == Focus::Tracks && self.grid_move(1, 0).is_some() => {}
             Key::Down | Key::Char('j') if self.focus == Focus::Tracks && self.grid_move(0, 1).is_some() => {}
             Key::Up | Key::Char('k') if self.focus == Focus::Tracks && self.grid_move(0, -1).is_some() => {}
-            Key::Char('P') if self.view.info.is_some() => self.play_artist(),
+            Key::Char('P') if self.view.artist.is_some() && self.view.info.is_some() => self.play_artist(),
             Key::Tab | Key::BackTab | Key::Left | Key::Right | Key::Char('h') | Key::Char('l') => {
                 self.focus = match (&self.focus, k) {
                     (_, Key::Left | Key::Char('h')) => Focus::Playlists,

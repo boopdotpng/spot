@@ -68,11 +68,12 @@ pub struct View {
     pub portrait: Option<String>, // artist pages: theirs, as last seen
     pub by: Option<By>,         // an album: whose it is
     pub about: Vec<String>,     // an album: its footer (see Msg::About)
+    pub hit: Option<Hit>,       // a search of everything: its top result
 }
 
 impl View {
     pub fn new(id: u64, key: String, title: String, kind: Kind) -> Self {
-        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None, about: vec![] }
+        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None, about: vec![], hit: None }
     }
     pub fn len(&self) -> usize {
         if self.kind == Kind::Tracks { self.tracks.len() } else { self.links.len() }
@@ -159,7 +160,7 @@ pub struct App {
     pub find: Option<String>, // ctrl+f filter over the open track list
     pub matches: Vec<usize>,  // view indices matching `find`, kept current by refilter()
     pub sort: Sort,           // playlists' order: as listed, or by date added (remembered)
-    pub search_kind: Kind,
+    pub search_kind: Option<Kind>, // what to search for; None: everything
     pub shuffle: bool,
     pub repeat: Repeat,
     pub fails: usize, // consecutive unplayable tracks, so repeat-all can't spin forever
@@ -322,6 +323,19 @@ impl App {
                 if view == self.view.id {
                     let n = self.overview_len();
                     self.tr_state.select(Some(self.tr_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
+                }
+            }
+            Msg::Found { view, found } => {
+                let Some(v) = self.view_mut(view) else { return };
+                let (hit, info) = *found;
+                v.hit = hit;
+                v.info = Some(Arc::new(info));
+                v.set_top();
+                v.loading = false;
+                if view == self.view.id {
+                    // the cursor starts on the top result
+                    let first = self.blocks().first().map_or(0, |b| b.start);
+                    self.tr_state.select(Some(first));
                 }
             }
             Msg::Error(e) => {
