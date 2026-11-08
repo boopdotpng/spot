@@ -26,12 +26,12 @@ pub(super) fn pick(ui: &mut Ui, r: usize) {
 }
 
 /// Row `r` of the list: lit while it's the cursor's, and a click puts the cursor there (a double
-/// click plays or opens it).
-fn pickable(e: El, r: usize, selected: bool, focused: bool, th: &Theme) -> El {
+/// click plays or opens it). `under` is its fill otherwise.
+fn pickable(e: El, r: usize, selected: bool, focused: bool, under: Color, th: &Theme) -> El {
     let fill = match (selected, focused) {
         (true, true) => th.sel,
         (true, false) => th.wash,
-        (false, _) => Color::TRANSPARENT,
+        (false, _) => under,
     };
     e.fill(fill)
         .on_press_tx(move |ui: &mut Ui, tx| {
@@ -237,10 +237,9 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
         // it, and under the pointer a play button
         let art = if album { numbered(t.number, playing, a.playing, r, th) } else { cover_art(thumb.as_ref(), playing, a.playing, episodes, r, th) };
         let mut title_line = row().key("tl").gap(6.0).center_y().min_w(0.0)
-            .child(text(t.name.clone()).key("name").font(BODY_MED).color(th.text).truncate().shrink().help_when_truncated(t.name.clone()));
+            .child(text(t.name.clone()).key("name").font(BODY_MED).color(if playing { th.accent } else { th.text }).truncate().shrink().help_when_truncated(t.name.clone()));
         if t.explicit {
-            title_line = title_line.child(row().key("e").size(14.0, 14.0).radius(3.0).border(1.0, th.dim.alpha(0.55)).center()
-                .child(text("E").font(ts(8.5, 650.0)).color(th.dim)));
+            title_line = title_line.child(explicit(th));
         }
         let heard = progress == Some(HEARD);
         let by = if episodes && !feed { t.album.clone() } else { t.artists.clone() };
@@ -276,7 +275,7 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
                 .child(row().key("time").w(72.0).justify_end().child(text(left).font(NUM).color(th.dim)));
         } else {
             if wide {
-                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, th.sub, th.text, move |ui| {
+                line = line.child(row().key("album").grow(1.0).shrink().min_w(0.0).child(link_text("al", t.album.clone(), BODY, th.dim, th.text, move |ui| {
                     pick(ui, r);
                     ui.app.goto_album();
                 })));
@@ -286,7 +285,9 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
             }
             line = line.child(actions).child(row().key("time").w(44.0).justify_end().child(text(mmss(t.ms)).font(NUM).color(th.dim)));
         }
-        let line = pickable(line.radius(8.0), r, selected, focused, th)
+        // the playing row: a faint wash of the accent
+        let under = if playing { th.accent.alpha(if th.dark { 0.09 } else { 0.08 }) } else { Color::TRANSPARENT };
+        let line = pickable(line.radius(8.0), r, selected, focused, under, th)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);
                 ui.after(tx);
@@ -299,6 +300,12 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
         }
         cell.child(line)
     })
+}
+
+/// The explicit mark: a quiet chip, read as metadata rather than a warning.
+pub fn explicit(th: &Theme) -> El {
+    row().key("e").size(14.0, 14.0).radius(3.0).fill(th.wash).center()
+        .child(text("E").font(ts(8.5, 650.0)).color(th.dim))
 }
 
 /// A Spotify uri as a link to send someone.
@@ -394,7 +401,7 @@ fn link_row(ui: &Ui, r: usize, th: &Theme) -> El {
             None => tile("ic".into(), 32.0, radius, Some(glyph), th),
         };
         let uri = l.uri.clone();
-        pickable(row().key(format!("row-{r}")).w_full().h(LINK_ROW).px(12.0).gap(14.0).center_y().radius(8.0), r, selected, focused, th)
+        pickable(row().key(format!("row-{r}")).w_full().h(LINK_ROW).px(12.0).gap(14.0).center_y().radius(8.0), r, selected, focused, Color::TRANSPARENT, th)
             .cursor(Cursor::Pointer)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);

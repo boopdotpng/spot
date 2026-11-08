@@ -39,10 +39,22 @@ pub struct Now {
     pub shuffle: bool,
     pub repeat: Repeat,
     pub cover: Option<Image>,
+    pub pos: u64, // where the song was, in ms, `at`
+    pub ms: u64,
+    pub at: Instant,
 }
 
 impl Now {
-    /// Whether the panel would draw something else.
+    /// How far through the song it is now, 0 to 1.
+    pub fn ratio(&self) -> f32 {
+        if self.ms == 0 {
+            return 0.0;
+        }
+        let pos = if self.playing { self.pos + self.at.elapsed().as_millis() as u64 } else { self.pos };
+        pos.min(self.ms) as f32 / self.ms as f32
+    }
+
+    /// Whether the panel would draw something else (but for where in the song it is).
     fn same(&self, o: &Now) -> bool {
         (&self.uri, self.playing, self.shuffle, self.repeat, self.cover.as_ref().map(Image::id))
             == (&o.uri, o.playing, o.shuffle, o.repeat, o.cover.as_ref().map(Image::id))
@@ -78,6 +90,7 @@ pub struct Ui {
     images: Option<ImageCache>,
     pub cover: Option<(String, Image)>, // the playing song's cover, by url
     pub thumbs: RefCell<Thumbs>,
+    tints: RefCell<HashMap<String, Option<[f32; 3]>>>, // covers' colors, by url: None while on its way
     pub clock: LiveText, // where the song is, "1:23"
     pub bar: Live<[f32; 4]>, // the progress bar's fill: set each second, so the view doesn't run
     pub knob: Live<[f32; 4]>, // and the knob at its end, shown under the pointer
@@ -105,6 +118,7 @@ impl Ui {
             images: None,
             cover: None,
             thumbs: RefCell::default(),
+            tints: RefCell::default(),
             clock: LiveText::new("0:00"),
             bar: Live::new([0.0; 4]),
             knob: Live::new([0.0; 4]),
@@ -138,6 +152,7 @@ impl Ui {
         self.sync_clock();
         self.tell_now();
         self.tell_lists();
+        self.tidy_search();
         self.scroll(tx);
         self.rearm();
     }
@@ -219,6 +234,9 @@ impl Ui {
             shuffle: self.app.shuffle,
             repeat: self.app.repeat,
             cover: self.cover.as_ref().filter(|(u, _)| t.cover.as_ref() == Some(u)).map(|(_, i)| i.clone()),
+            pos: self.app.position().min(t.ms),
+            ms: t.ms,
+            at: Instant::now(),
         })
     }
 
@@ -236,6 +254,14 @@ impl Ui {
         self.told = now.clone();
         if let Some(p) = &self.panel {
             p.update(move |p, _| p.now = now);
+        }
+    }
+
+    /// The search field keeps its words only while their results are what's open: anything
+    /// else opened empties it, so it doesn't sit there holding a search that's gone.
+    fn tidy_search(&mut self) {
+        if !self.search.focused && !self.search.text.is_empty() && self.app.input.is_none() && !self.app.view.key.starts_with("search:") {
+            self.search.clear();
         }
     }
 
@@ -337,6 +363,41 @@ impl Ui {
         None
     }
 
+    /// A cover's color (sRGB), as the playing one's is taken: worked out the first time it's
+    /// asked for, None until then.
+    pub fn tint(&self, url: &str) -> Option<[f32; 3]> {
+        if let Some(t) = self.tints.borrow().get(url) {
+            return *t;
+        }
+        let work = {
+            let url = url.to_string();
+            async move {
+                let bytes = art::fetch_bytes(&url).await?;
+                tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).ok().map(|i| art::tint(&i))).await.ok().flatten()
+            }
+        };
+        let mut tints = self.tints.borrow_mut();
+        if tints.len() > 200 {
+            tints.clear();
+        }
+        if art::headless() {
+            let rt = self.app.rt.handle().clone();
+            let got = std::thread::spawn(move || rt.block_on(work)).join().ok().flatten();
+            tints.insert(url.to_string(), got);
+            return got;
+        }
+        tints.insert(url.to_string(), None);
+        let (url, me) = (url.to_string(), self.me.clone());
+        self.app.rt.spawn(async move {
+            if let (Some(t), Some(me)) = (work.await, me) {
+                me.update(move |ui, _| {
+                    ui.tints.get_mut().insert(url, Some(t));
+                });
+            }
+        });
+        None
+    }
+
     /// Whether the top field finds in the open list (⌘F) rather than searching Spotify.
     pub fn finding(&self) -> bool {
         self.app.find.is_some() && (self.find.focused || !self.find.text.is_empty())
@@ -381,8 +442,6 @@ impl Ui {
             return;
         }
         let now = self.now_info();
-        let now_shown = now.is_some();
-        let recent_n = self.app.recent.len();
         p.update(move |p, tx| {
             p.opened(now);
             p.fit(tx);
@@ -393,8 +452,7 @@ impl Ui {
         // where it was last dragged to, else near the top of the screen the pointer's on
         match launcher::home() {
             Some((x, y)) => {
-                let height = panel::opened_height(now_shown, recent_n);
-                p.place(DisplayTarget::Primary, OverlayPlacement::Rect { x, y, width: panel::WIDTH, height });
+                p.place(DisplayTarget::Primary, OverlayPlacement::Rect { x, y, width: panel::WIDTH, height: panel::HEIGHT });
             }
             None => p.place(DisplayTarget::UnderPointer, OverlayPlacement::Edge { edge: ScreenEdge::Top, margin: 180.0, align: Align::Center, inset: 0.0 }),
         }
@@ -587,7 +645,7 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
     main = main.args(rune_args.split_whitespace().map(String::from).collect::<Vec<_>>());
     let me = main.handle();
 
-    let panel_spec = AppSpec { on_key: Some(panel::on_key), setup: Some(panel::setup), ..AppSpec::new("spot search", (640.0, 460.0), || unreachable!("given its state"), panel::view) };
+    let panel_spec = AppSpec { on_key: Some(panel::on_key), setup: Some(panel::setup), ..AppSpec::new("spot search", (panel::WIDTH, panel::HEIGHT), || unreachable!("given its state"), panel::view) };
     let panel_app = rune::App::new(panel_spec).windowless().on_frame_encoded(|f| {
         if *TIMING && let Some(t) = *OPENED_AT.lock().unwrap_or_else(|e| e.into_inner()) {
             eprintln!("timing: panel frame #{} {:?} {:.1} ms after show hotkey; update_ms={:?} encode_ms={:?} (not display latency)",

@@ -519,7 +519,7 @@ impl App {
     }
 
     /// `songs <uri>`, for the panel's → on an album, playlist or artist: its songs (an artist's
-    /// popular ones) as `--tsv` rows.
+    /// popular ones) as `--tsv` rows, with an eighth field on an album's, the track number.
     fn songs_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
         let Some(uri) = args.first().cloned() else { return Err(usage("songs: of what?")) };
         let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
@@ -538,10 +538,13 @@ impl App {
             let _ = reply.send(match tracks {
                 Err(e) => fail(e),
                 Ok(t) => {
+                    // an album's carry their track numbers, after an empty section
                     let artist = uri.starts_with("spotify:artist:");
+                    let album = uri.starts_with("spotify:album:");
                     let row = |t: &Track| {
                         let sub = if artist { t.album.clone() } else { t.artists.clone() };
-                        tsv_row(&[&t.uri, &t.name, &sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }])
+                        let n = if album && t.number > 0 { t.number.to_string() } else { String::new() };
+                        tsv_row(&[&t.uri, &t.name, &sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }, "", &n])
                     };
                     (0, t.iter().map(row).collect::<Vec<_>>().join("\n"))
                 }
@@ -836,10 +839,24 @@ fn top_pick(q: &str, names: [Option<&str>; 3]) -> Option<usize> {
     }
 }
 
-/// The panel's mixed results from one search's tracks, albums and artists.
+/// The panel's mixed results from one search's tracks, albums and artists. A song or album
+/// that's on several releases (a deluxe edition, a single and its album) shows once, the first
+/// time; so does the top result. Artists far less known than the best of them are dropped:
+/// searching an album's name finds accounts named after it.
 fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
     let items = |k: &str| v[k]["items"].as_array().cloned().unwrap_or_default();
-    let (tracks, albums, artists) = (items("tracks"), items("albums"), items("artists"));
+    let (tracks, albums, mut artists) = (items("tracks"), items("albums"), items("artists"));
+    let fame = |i: &Value| i["popularity"].as_u64();
+    if let Some(best) = artists.iter().filter_map(fame).max() {
+        artists.retain(|i| fame(i).is_none_or(|p| p * 4 >= best));
+    }
+    // the same song or album: its name and its artists'
+    let same = |i: &Value| {
+        let by: Vec<String> = i["artists"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).map(str::to_lowercase).collect()).unwrap_or_default();
+        format!("{}\t{}", i["name"].as_str().unwrap_or("").trim().to_lowercase(), by.join(", "))
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut fresh = |kind: &str, i: &Value| seen.insert(format!("{kind}\t{}", same(i)));
     let track_row = |i: &Value, section: &str, kind: bool| {
         let t = parse_track(i)?;
         let sub = if kind { format!("Song · {}", t.artists) } else { format!("{} · {}", t.artists, t.album) };
@@ -860,15 +877,14 @@ fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
     let top = top_pick(q, [name(&artists), name(&tracks), name(&albums)]);
     let mut rows = vec![];
     rows.extend(match top {
-        Some(0) => artist_row(&artists[0], "Top result"),
-        Some(1) => track_row(&tracks[0], "Top result", true),
-        Some(2) => album_row(&albums[0], "Top result", true),
+        Some(0) => fresh("artist", &artists[0]).then(|| artist_row(&artists[0], "Top result")).flatten(),
+        Some(1) => fresh("track", &tracks[0]).then(|| track_row(&tracks[0], "Top result", true)).flatten(),
+        Some(2) => fresh("album", &albums[0]).then(|| album_row(&albums[0], "Top result", true)).flatten(),
         _ => None,
     });
-    let skip = |k: usize| usize::from(top == Some(k));
-    rows.extend(tracks.iter().skip(skip(1)).take(3).filter_map(|i| track_row(i, "Songs", false)));
-    rows.extend(albums.iter().skip(skip(2)).take(2).filter_map(|i| album_row(i, "Albums", false)));
-    rows.extend(artists.iter().skip(skip(0)).take(2).filter_map(|i| artist_row(i, "Artists")));
+    rows.extend(tracks.iter().filter(|i| fresh("track", i)).take(3).filter_map(|i| track_row(i, "Songs", false)).collect::<Vec<_>>());
+    rows.extend(albums.iter().filter(|i| fresh("album", i)).take(1).filter_map(|i| album_row(i, "Albums", false)).collect::<Vec<_>>());
+    rows.extend(artists.iter().filter(|i| fresh("artist", i)).take(1).filter_map(|i| artist_row(i, "Artists")).collect::<Vec<_>>());
     rows
 }
 
@@ -957,6 +973,26 @@ mod tests {
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mixed_results_show_each_song_album_and_artist_once() {
+        let ari = serde_json::json!([{"name": "Ariana Grande"}]);
+        let track = |id: &str, album: &str| serde_json::json!({"uri": format!("spotify:track:{id}"), "name": "sweetener", "artists": ari, "album": {"name": album}});
+        let album = |id: &str| serde_json::json!({"uri": format!("spotify:album:{id}"), "name": "Sweetener", "artists": ari});
+        let v = serde_json::json!({
+            "tracks": {"items": [track("a", "Sweetener"), track("b", "Sweetener (Deluxe)"), serde_json::json!({"uri": "spotify:track:c", "name": "breathin", "artists": ari})]},
+            "albums": {"items": [album("x"), album("y")]},
+            "artists": {"items": [
+                {"uri": "spotify:artist:fake", "name": "sweetener", "popularity": 3},
+                {"uri": "spotify:artist:ari", "name": "Ariana Grande", "popularity": 88},
+            ]},
+        });
+        let rows = mixed_rows("sweetener", &v);
+        let uris: Vec<&str> = rows.iter().map(|r| r.split('\t').next().unwrap()).collect();
+        // the song is the top result (the fake artist that's named best is gone), and isn't
+        // under Songs again from its deluxe edition; the album shows once
+        assert_eq!(uris, ["spotify:track:a", "spotify:track:c", "spotify:album:x", "spotify:artist:ari"]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // Colors: one near-monochrome palette, light and dark, and a single accent taken from the
-// playing song's cover. The covers are the color in the window; the accent marks only what's
-// playing (its row, its playlist) and how far through it is.
+// playing song's cover. The covers are the color in the window: the surfaces lean a hair toward
+// the playing cover's hue, so the window warms or cools with each song, and the accent marks
+// what's playing (its row, its playlist, the play button) and how far through it is.
 
 use rune::Color;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -45,16 +46,37 @@ pub fn rgb(h: u32) -> Color {
     Color { r: ch(16), g: ch(8), b: ch(0), a: 1.0 }
 }
 
-/// A warm grey: the window's surfaces and its text are all on one hue, barely tinted.
+/// A warm grey: the window's text is all on one hue, barely tinted.
 fn grey(l: f32, c: f32) -> Color {
     rune::color::oklch(l, c, 75.0)
 }
 
+/// A cover's color (0xRRGGBB) as oklab lightness, chroma and hue (radians).
+fn lch(hex: u32) -> (f32, f32, f32) {
+    let [l, a, b, _] = rgb(hex).to_oklab();
+    (l, (a * a + b * b).sqrt(), b.atan2(a))
+}
+
+/// The playing cover's hue in degrees, if it has a real color; else the warm grey's.
+fn surface_hue() -> Option<f32> {
+    match ART.load(Relaxed) {
+        0 => None,
+        v => Some(lch(v & 0xff_ffff)).filter(|&(_, c, _)| c >= 0.02).map(|(_, _, h)| h.to_degrees()),
+    }
+}
+
 pub fn theme(dark: bool) -> Theme {
+    // the surfaces take the playing cover's hue, just enough to feel: the window least, the
+    // sidebar and the player a little more
+    let hue = surface_hue();
+    let surface = |l: f32, quiet: f32, tinted: f32| match hue {
+        Some(h) => rune::color::oklch(l, tinted, h),
+        None => grey(l, quiet),
+    };
     let (bg, side, raised, text, sub, dim, err) = if dark {
-        (grey(0.175, 0.003), grey(0.158, 0.003), grey(0.225, 0.004), grey(0.935, 0.012), grey(0.70, 0.006), grey(0.52, 0.005), rgb(0xe0705e))
+        (surface(0.175, 0.003, 0.006), surface(0.158, 0.003, 0.010), surface(0.225, 0.004, 0.010), grey(0.935, 0.012), grey(0.70, 0.006), grey(0.52, 0.005), rgb(0xe0705e))
     } else {
-        (grey(0.987, 0.002), grey(0.968, 0.003), Color::WHITE, grey(0.24, 0.008), grey(0.47, 0.006), grey(0.64, 0.005), rgb(0xc2402f))
+        (surface(0.987, 0.002, 0.006), surface(0.968, 0.003, 0.010), Color::WHITE, grey(0.24, 0.008), grey(0.47, 0.006), grey(0.64, 0.005), rgb(0xc2402f))
     };
     let (line, wash, sel) = if dark {
         (text.alpha(0.07), text.alpha(0.05), text.alpha(0.08))
@@ -71,16 +93,24 @@ pub fn theme(dark: bool) -> Theme {
 /// A cover's color as the accent: its hue, held to a quiet chroma and a lightness that reads on
 /// the window, so a neon sleeve doesn't shout and a grey one still shows as a color.
 fn quiet(hex: u32, dark: bool) -> Color {
-    let [l, a, b, _] = rgb(hex).to_oklab();
-    let chroma = (a * a + b * b).sqrt();
+    let (l, chroma, hue) = lch(hex);
     if chroma < 0.02 {
         // no real color in it: a plain light grey
         return grey(if dark { 0.80 } else { 0.42 }, 0.0);
     }
-    let hue = b.atan2(a);
     let (lo, hi) = if dark { (0.70, 0.80) } else { (0.45, 0.56) };
-    let c = chroma.clamp(0.05, 0.095);
+    let c = chroma.clamp(0.05, 0.14);
     Color::from_oklab([l.clamp(lo, hi), c * hue.cos(), c * hue.sin(), 1.0])
+}
+
+/// A cover's color (sRGB 0..1) as the wash at the top of a list's header: deep and quiet on
+/// dark, pale on light, fading down into the window.
+pub fn backdrop([r, g, b]: [f32; 3], dark: bool) -> Color {
+    let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let (_, chroma, hue) = lch(c(r) << 16 | c(g) << 8 | c(b));
+    let (l, cap) = if dark { (0.30, 0.07) } else { (0.92, 0.045) };
+    let c = if chroma < 0.02 { 0.0 } else { chroma.min(cap) };
+    Color::from_oklab([l, c * hue.cos(), c * hue.sin(), 1.0])
 }
 
 #[cfg(test)]
@@ -109,6 +139,19 @@ mod tests {
                 assert!(contrast(c, theme(dark).bg) > 3.0, "{hex:06x} dark={dark}");
             }
         }
+    }
+
+    #[test]
+    fn text_reads_on_any_tinted_window() {
+        for hex in [0xff0000, 0x00ff00, 0x0000ff, 0x7a3fd0, 0xffe800] {
+            set_art(Some([((hex >> 16) & 0xff) as f32 / 255.0, ((hex >> 8) & 0xff) as f32 / 255.0, (hex & 0xff) as f32 / 255.0]));
+            for dark in [true, false] {
+                let th = theme(dark);
+                assert!(contrast(th.text, th.bg) > 7.0 && contrast(th.text, th.side) > 7.0, "{hex:06x} dark={dark}");
+                assert!(contrast(th.accent, th.bg) > 3.0, "{hex:06x} dark={dark}");
+            }
+        }
+        set_art(None);
     }
 
     #[test]

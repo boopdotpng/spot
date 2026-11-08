@@ -1,19 +1,23 @@
-// The main window: a quiet, near-monochrome frame (sidebar, list, player) where the covers are
-// the only color, and one accent, taken from the playing cover, marks what's playing.
+// The main window: a quiet frame (sidebar, list, player) where the covers are the only color.
+// The surfaces lean toward the playing cover's hue, one accent taken from it marks what's
+// playing, and a list's header fades down from its own cover's color.
 
 use rune::{Color, Cursor, Cx, El, Phase, PopupItem, PopupMenu, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
 
 use super::{Ui, artist, icons, player, rows};
 use crate::*;
 
-pub const ROW: f32 = 50.0; // a song's row (with its cover)
+pub const ROW: f32 = 44.0; // a song's row (with its cover)
 pub const LINK_ROW: f32 = 46.0;
-const HERO_ART: f32 = 76.0;
+const HERO_ART: f32 = 128.0;
+const HERO_WASH: f32 = 240.0; // how far down the header's color fades into the window
 
 pub const fn ts(size: f32, weight: f32) -> TextStyle {
     TextStyle::new(size, weight)
 }
 pub const TITLE: TextStyle = ts(24.0, 720.0).lh(30.0).tracking(-0.4);
+/// A list's name over it.
+const HERO_TITLE: TextStyle = ts(36.0, 760.0).lh(42.0).tracking(-0.9);
 pub const BODY: TextStyle = ts(13.0, 450.0).lh(17.0);
 pub const BODY_MED: TextStyle = ts(13.0, 560.0).lh(17.0);
 pub const SMALL: TextStyle = ts(12.0, 450.0).lh(16.0);
@@ -176,7 +180,7 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             })
             // drawn as the song list's rows are: the highlight marks the open list, the bars the playing one
             .child(tile)
-            .child(text(name.to_string()).font(BODY).color(th.text).truncate().grow(1.0).shrink()
+            .child(text(name.to_string()).font(BODY).color(if playing { th.accent } else { th.text }).truncate().grow(1.0).shrink()
                 .help_when_truncated(name.to_string()));
         if playing {
             r = r.child(eq(th.accent, a.playing, &format!("side-eq-{i}")));
@@ -197,6 +201,10 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             list = list.child(row_for(i, &s.name, &s.uri, tile, a.sh_state.selected() == Some(i), false));
         }
     } else {
+        // Liked Songs and the pinned are one group, a hairline over the rest
+        let pins = a.playlists.iter().filter(|p| a.is_pinned(p)).count();
+        let split = (pins > 0).then(|| a.playlists.iter().rposition(|p| p.id.is_none() || a.is_pinned(p))).flatten()
+            .filter(|&last| last + 1 < a.playlists.len());
         for (i, p) in a.playlists.iter().enumerate() {
             let liked = p.id.is_none();
             let name = if liked { "Liked Songs" } else if p.name.trim().is_empty() { "Untitled playlist" } else { p.name.as_str() };
@@ -214,6 +222,10 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
                 r = r.on_secondary_press(move |ui: &mut Ui, at, tx| playlist_menu(ui, i, at.into(), tx));
             }
             list = list.child(r);
+            if split == Some(i) {
+                list = list.child(row().key("side-pins-rule").w_full().h(9.0).px(8.0).center_y()
+                    .child(el().w_full().h(1.0).fill(th.line)));
+            }
         }
     }
     let scroller = col().key("side-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0).child(list);
@@ -252,6 +264,25 @@ fn kicker(key: &str) -> &'static str {
         "" => "",
         _ => "playlist",
     }
+}
+
+/// The color the header fades down from: the list's own cover's (sRGB), once it's been looked at.
+fn hero_tint(ui: &Ui) -> Option<[f32; 3]> {
+    let v = &ui.app.view;
+    if v.key == "liked" {
+        let c = crate::theme::rgb(0x450af5);
+        return Some([c.r, c.g, c.b].map(rune::color::srgb_encode));
+    }
+    if v.key == QUEUE_KEY {
+        return ui.app.art.cover.as_ref().map(|c| c.tint);
+    }
+    if v.artist.is_some() {
+        return v.portrait.as_deref().and_then(|u| ui.tint(&art::medium(u)));
+    }
+    if v.kind != Kind::Tracks {
+        return None;
+    }
+    v.tracks.iter().find_map(|t| t.cover.as_deref()).and_then(|u| ui.tint(&art::small(u)))
 }
 
 /// The art over a list: its cover, the first four albums in it as a square, or a plain tile.
@@ -300,7 +331,7 @@ fn hero_art(ui: &Ui, th: &Theme) -> El {
     } else {
         // the first four albums in it, as a square
         let q = size / 2.0;
-        let cell = |i: usize| cover(format!("m{i}"), ui.thumb(&art::small(covers[i])).as_ref(), q, 0.0, th, &icons::NOTE);
+        let cell = |i: usize| cover(format!("m{i}"), ui.thumb(&art::medium(covers[i])).or_else(|| ui.thumb(&art::small(covers[i]))).as_ref(), q, 0.0, th, &icons::NOTE);
         col().key("hero-art").size(size, size).radius(r).clip_rounded(r)
             .child(row().key("m-top").child(cell(0)).child(cell(1)))
             .child(row().key("m-bot").child(cell(2)).child(cell(3)))
@@ -316,8 +347,15 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         top = top.child(icon_button("back", &icons::BACK, 18.0, th.sub, th, "Back  esc", |ui| ui.app.back()));
     }
     top = top.child(spacer());
-    // one field: ⌘F turns it to finding in the open list, until esc or it's left empty
-    top = top.child(if ui.finding() { find_field(ui, th) } else { search_field(ui, th) });
+    // one field: ⌘F turns it to finding in the open list, until esc or it's left empty. Idle,
+    // it's a round button (or ⌘K) that opens into the field, so the bar is empty
+    top = top.child(if ui.finding() {
+        find_field(ui, th)
+    } else if ui.search.focused || !ui.search.text.is_empty() {
+        search_field(ui, th)
+    } else {
+        icon_button("search-open", &icons::SEARCH, 16.0, th.sub, th, "Search  ⌘K", |ui| ui.focus_search())
+    });
     if v.info.is_some() && !(a.input.is_some() || a.live_search) {
         // the bar floats over the header's backdrop, and takes the window's color (and a
         // hairline) once the page scrolls under it
@@ -382,14 +420,14 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     }
     let mut words = col().key("hero-words").grow(1.0).shrink().min_w(0.0).gap(2.0)
         .child(text(kicker(&v.key).to_uppercase()).key("kicker").font(LABEL).color(th.dim))
-        .child(text(title.clone()).key("title").font(TITLE).color(th.text).truncate().help_when_truncated(title))
+        .child(text(title.clone()).key("title").font(HERO_TITLE).color(th.text).truncate().help_when_truncated(title))
         .child(line);
     if a.input.is_some() || a.live_search {
         words = words.child(kinds(ui, th));
     } else if v.is_grid() {
         words = words.child(row().key("chips-pad").pt(8.0).child(artist::release_chips(ui, th)));
     }
-    let hero_row = row().key("hero-row").w_full().px(28.0).pt(2.0).pb(18.0).gap(18.0).items_end()
+    let hero_row = row().key("hero-row").w_full().px(28.0).pt(2.0).pb(18.0).gap(22.0).items_end()
         .child(hero_art(ui, th).transition(Transition::blur_replace()))
         .child(words);
     let hero = col().key("hero").w_full().child(top).child(hero_row);
@@ -405,22 +443,28 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     } else {
         rows::link_list(ui, th)
     };
-    col().key("main").grow(1.0).shrink().h_full().min_w(0.0)
-        .child(hero).child(list)
+    let mut main = col().key("main").grow(1.0).shrink().h_full().min_w(0.0);
+    if let Some(tint) = hero_tint(ui) {
+        // the list's cover's color at the top, fading into the window behind the header
+        main = main.child(el().key(format!("hero-wash-{}", v.id)).pin(Some(0.0), Some(0.0), Some(0.0), None).h(HERO_WASH)
+            .gradient(crate::theme::backdrop(tint, th.dark), th.bg)
+            .transition(Transition::opacity()));
+    }
+    main.child(hero).child(list)
 }
 
-/// Play the list: an outlined button in white and grey, not a filled one, so the accent stays
-/// the playing song's. Sorting is the date column's header; finding, the search field's ⌘F.
+/// Play the list: filled in the accent, the playing cover's color. Sorting is the date column's
+/// header; finding, the search field's ⌘F.
 fn hero_actions(ui: &Ui, th: &Theme) -> El {
     let playing_here = ui.app.queue.as_ref().is_some_and(|q| q.key == ui.app.view.key) && ui.app.want_play;
-    let play = row().key("hero-play").size(30.0, 30.0).radius(15.0).center().cursor(Cursor::Pointer).press_scale(0.9)
-        .border(1.0, th.text.alpha(0.3)).hover(th.text.alpha(0.08))
+    let play = row().key("hero-play").size(36.0, 36.0).radius(18.0).center().cursor(Cursor::Pointer).press_scale(0.9)
+        .fill(th.accent).hover(th.accent.mix(th.text, 0.25))
         .help(if playing_here { "Pause  space" } else { "Play  P" }).label("Play")
         .on_press_tx(move |ui: &mut Ui, tx| {
             if playing_here { ui.app.toggle() } else { ui.app.play_from_view(None) }
             ui.after(tx);
         })
-        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 14.0).color(th.text));
+        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 15.0).color(th.bg));
     row().key("hero-actions").center_y().child(play)
 }
 

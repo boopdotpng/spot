@@ -13,15 +13,21 @@ use super::view::ts;
 use super::{Now, Ui, icons};
 use crate::*;
 
-const VISIBLE: usize = 10; // rows shown at once; more scroll with the selection
-const RECENT: usize = 6;
-const MINE: usize = 3; // of your playlists matching
+const RECENT: usize = 7;
+const MINE: usize = 1; // of your playlists matching
 pub const WIDTH: f32 = 640.0;
 const MARGIN: f32 = 24.0; // around the card, for its shadow
-const BAR: f32 = 60.0;
-const HIT: f32 = 50.0;
-const FOOT: f32 = 58.0;
-const HEAD: f32 = 24.0; // a section's title
+const BAR: f32 = 54.0;
+const HIT: f32 = 38.0;
+const FOOT: f32 = 50.0;
+const HEAD: f32 = 22.0; // a section's title
+const THUMB: f32 = 28.0;
+/// The window's height, always, so it never runs into the bottom of the screen and gets pushed
+/// up. Spotify's results (the top one, three songs, an album, an artist: four sections) fit in
+/// its list; past what fits, the rows scroll with the selection.
+pub const HEIGHT: f32 = 486.0;
+/// What the list has room for, under the bar and over what's playing.
+const ROOM: f32 = HEIGHT - 2.0 * MARGIN - BAR - 12.0 - FOOT;
 
 #[derive(Clone)]
 struct Hit {
@@ -32,11 +38,12 @@ struct Hit {
     ms: u64,
     explicit: bool,
     section: String,
+    number: u32, // inside an album: the song's track number
 }
 
 impl Hit {
     /// A `spot search --tsv` line: uri, name, subtitle, cover url, ms, explicit, and (from
-    /// `search --mixed`) the section.
+    /// `search --mixed`) the section; `songs` of an album adds the track number after it.
     fn parse(line: &str) -> Option<Hit> {
         let f: Vec<&str> = line.split('\t').collect();
         (f.len() >= 6).then(|| Hit {
@@ -47,11 +54,12 @@ impl Hit {
             ms: f[4].parse().unwrap_or(0),
             explicit: f[5] == "1",
             section: f.get(6).unwrap_or(&"").to_string(),
+            number: f.get(7).and_then(|n| n.parse().ok()).unwrap_or(0),
         })
     }
 
     fn of(l: &Link, section: &str) -> Hit {
-        Hit { uri: l.uri.clone(), name: l.name.clone(), sub: l.sub.clone(), cover: l.image.clone(), ms: 0, explicit: false, section: section.into() }
+        Hit { uri: l.uri.clone(), name: l.name.clone(), sub: l.sub.clone(), cover: l.image.clone(), ms: 0, explicit: false, section: section.into(), number: 0 }
     }
 
     /// An album, playlist or artist: → lists its songs.
@@ -66,12 +74,6 @@ struct Inside {
     back: Vec<Hit>,
     picked: usize,
     scroll: usize,
-}
-
-/// The card's height for `rows` results under `heads` section titles.
-fn card_height(rows: usize, heads: usize, note: bool, now: bool) -> f32 {
-    let list = if rows == 0 && heads == 0 { 0.0 } else { 12.0 + rows as f32 * HIT + heads as f32 * HEAD };
-    2.0 * MARGIN + BAR + list + if note { 44.0 } else { 0.0 } + if now { FOOT } else { 0.0 }
 }
 
 pub struct Panel {
@@ -94,13 +96,6 @@ pub struct Panel {
     copied: bool,
     pub me: Option<AppHandle<Panel>>,
     pub main: Option<AppHandle<Ui>>,
-}
-
-/// The window's height as it opens: the bar, the recently played, and what's playing under it
-/// if anything is.
-pub fn opened_height(now: bool, recent: usize) -> f32 {
-    let rows = recent.min(RECENT);
-    card_height(rows, usize::from(rows > 0), false, now)
 }
 
 /// Ask the player, as a `spot` command would; waits for the answer.
@@ -184,22 +179,25 @@ impl Panel {
         self.fit(tx);
     }
 
-    /// The rows on screen: their indices, and whether each starts a section (has a title).
-    fn shown(&self) -> Vec<(usize, bool)> {
-        let end = (self.scroll + VISIBLE).min(self.results.len());
-        (self.scroll..end)
-            .map(|i| {
-                let s = &self.results[i].section;
-                (i, !s.is_empty() && (i == self.scroll || self.results[i - 1].section != *s))
-            })
-            .collect()
+    /// The rows on screen from row `scroll`, as many as the list has room for: their indices,
+    /// and whether each starts a section (has a title).
+    fn shown_from(&self, scroll: usize) -> Vec<(usize, bool)> {
+        let mut used = if self.inside.is_some() { HEAD } else { 0.0 };
+        let mut out = vec![];
+        for i in scroll..self.results.len() {
+            let s = &self.results[i].section;
+            let titled = !s.is_empty() && (i == scroll || self.results[i - 1].section != *s);
+            used += HIT + if titled { HEAD } else { 0.0 };
+            if used > ROOM + 0.5 && !out.is_empty() {
+                break;
+            }
+            out.push((i, titled));
+        }
+        out
     }
 
-    fn height(&self) -> f32 {
-        let shown = self.shown();
-        let heads = shown.iter().filter(|(_, h)| *h).count() + usize::from(self.inside.is_some());
-        let rows = shown.len().max(usize::from(self.inside.is_some() && self.note.is_none()));
-        card_height(rows, heads, self.note.is_some(), self.now.is_some())
+    fn shown(&self) -> Vec<(usize, bool)> {
+        self.shown_from(self.scroll)
     }
 
     /// Move the selection to `i`, scrolling it into view.
@@ -207,8 +205,9 @@ impl Panel {
         self.picked = i;
         if i < self.scroll {
             self.scroll = i;
-        } else if i >= self.scroll + VISIBLE {
-            self.scroll = i + 1 - VISIBLE;
+        }
+        while self.scroll < i && self.shown_from(self.scroll).last().is_none_or(|&(last, _)| last < i) {
+            self.scroll += 1;
         }
         self.want_thumbs();
     }
@@ -228,12 +227,14 @@ impl Panel {
         }
     }
 
+    /// The window at its one size (it's only ever off it before the first open).
     pub fn fit(&self, tx: &mut Tx) {
-        tx.resize_window((WIDTH, self.height()));
+        tx.resize_window((WIDTH, HEIGHT));
     }
 
     /// Search as you type: waits a moment for typing to stop, and drops answers to older queries.
-    /// Your playlists show at once; Spotify's results replace the last ones when they come.
+    /// Your playlists show at once, and the last query's results go; Spotify's come after, with
+    /// stand-ins for them meanwhile.
     fn search(&mut self) {
         let g = self.generation.fetch_add(1, Relaxed) + 1;
         let q = self.query.text.trim().to_string();
@@ -247,7 +248,8 @@ impl Panel {
             self.busy = false;
             return;
         }
-        self.results = self.matching(&q).into_iter().chain(self.remote.iter().cloned()).collect();
+        self.remote.clear();
+        self.results = self.matching(&q);
         self.want_thumbs();
         self.busy = true;
         let (gens, tx, me) = (self.generation.clone(), self.tx.clone(), self.me.clone());
@@ -507,36 +509,47 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
     // most of the window's own background over the glass: one even surface, whatever desktop or
     // window is behind it, so text and the picked row read the same everywhere
     let tint = th.bg.alpha(if th.dark { 0.9 } else { 0.85 });
-    let field = text_input(&p.query, ts(21.0, 450.0).lh(28.0)).key("query").single_line().grow(1.0)
+    let field = text_input(&p.query, ts(20.0, 450.0).lh(26.0)).key("query").single_line().grow(1.0)
         .color(th.text).placeholder("Songs, albums, artists, your playlists", th.sub)
         .on_edit(|p: &mut Panel| &mut p.query)
         .on_input_change(|p: &mut Panel, tx| {
             p.search();
-            p.fit(tx);
+            if !p.busy {
+                p.fit(tx); // emptied: the recently played, at once
+            }
         })
         .on_input_key(field_key);
     let bar = row().key("bar").w_full().h(BAR).px(20.0).gap(14.0).center_y()
         .child(icon(&icons::SEARCH, 20.0).color(if p.busy { th.text } else { th.text.alpha(0.6) }))
         .child(field);
     // dragging the card anywhere but a field or button moves it; it opens there next time
-    let mut card = col().key("card").w_full().on_drag(|_: &mut Panel, d: &mut rune::Drag, _: &mut Tx| super::launcher::drag(d.phase)).radius(20.0).continuous_corners().clip_rounded(20.0)
+    let mut card = col().key("card").w_full().grow(1.0).min_h(0.0).on_drag(|_: &mut Panel, d: &mut rune::Drag, _: &mut Tx| super::launcher::drag(d.phase)).radius(20.0).continuous_corners().clip_rounded(20.0)
         .system_material(SystemMaterial::Glass)
         .fill(tint)
         .border(1.0, th.text.alpha(if th.dark { 0.12 } else { 0.1 }))
         .shadow(18.0, 48.0, Color::BLACK.alpha(if th.dark { 0.5 } else { 0.22 }))
         .child(bar);
-    let head = |key: String, title: String| row().key(key).w_full().h(HEAD).px(12.0).pt(6.0).center_y()
-        .child(text(title).font(ts(11.0, 650.0)).color(th.text.alpha(0.5)).truncate());
-    if !p.results.is_empty() || p.inside.is_some() {
-        let mut list = col().key("results").w_full().px(8.0).pb(8.0).pt(4.0).gap(0.0);
+    let head = |key: String, title: String| row().key(key).w_full().h(HEAD).px(12.0).pt(7.0).center_y()
+        .child(text(title.to_uppercase()).font(ts(10.0, 650.0).tracking(0.6)).color(th.text.alpha(0.5)).truncate());
+    // while a search is on its way the list stays, so the card keeps its shape and its foot stays put
+    let searching = p.busy && p.inside.is_none();
+    let listed = !p.results.is_empty() || p.inside.is_some() || searching;
+    if listed {
+        // it fills the card, which holds its height while a search is on its way: what doesn't
+        // fit until then is cut off rather than pushing the card's foot out of it
+        let mut list = col().key("results").w_full().grow(1.0).min_h(0.0).clip_rounded(0.0).px(8.0).pb(8.0).pt(4.0).gap(0.0);
+        let numbered = p.inside.as_ref().is_some_and(|i| i.parent.uri.starts_with("spotify:album:"));
         if let Some(inside) = &p.inside {
-            // what's open, clicked (or ←) to go back
-            list = list.child(row().key("inside").w_full().h(HEAD).px(12.0).pt(6.0).gap(6.0).center_y().cursor(Cursor::Pointer)
+            // what's open, clicked (or ←) to go back; an album's cover beside it, once
+            let mut crumb = row().key("inside").w_full().h(HEAD).px(12.0).pt(5.0).gap(8.0).center_y().cursor(Cursor::Pointer)
                 .on_press_tx(|p: &mut Panel, tx| {
                     p.go_back(tx);
                 })
-                .child(text("‹").font(ts(13.0, 650.0)).color(th.text.alpha(0.6)))
-                .child(text(inside.parent.name.clone()).font(ts(11.0, 650.0)).color(th.text.alpha(0.6)).truncate()));
+                .child(text("‹").font(ts(13.0, 650.0)).color(th.text.alpha(0.6)));
+            if numbered && let Some(img) = p.thumb(&inside.parent) {
+                crumb = crumb.child(el().key("crumb-art").size(16.0, 16.0).radius(4.0).clip_rounded(4.0).pixels_fit(img.pixels(), SurfaceFit::Fill));
+            }
+            list = list.child(crumb.child(text(inside.parent.name.clone()).font(ts(11.5, 650.0)).color(th.text.alpha(0.7)).truncate()));
             if p.results.is_empty() && p.note.is_none() {
                 list = list.child(row().key("wait").w_full().h(HIT).px(14.0).center_y()
                     .child(text("…").font(ts(14.0, 500.0)).color(th.text.alpha(0.5))));
@@ -549,20 +562,22 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
             }
             let on = i == p.picked;
             let round = h.uri.starts_with("spotify:artist:");
-            let thumb = el().key("thumb").size(34.0, 34.0).radius(if round { 17.0 } else { 6.0 }).clip_rounded(if round { 17.0 } else { 6.0 }).fill(th.text.alpha(0.08));
+            let thumb = el().key("thumb").size(THUMB, THUMB).radius(if round { THUMB / 2.0 } else { 6.0 }).clip_rounded(if round { THUMB / 2.0 } else { 6.0 }).fill(th.text.alpha(0.08));
             let thumb = match p.thumb(h) {
-                _ if h.uri == "liked" => super::view::liked_cover("thumb", 34.0, 6.0),
+                // an album's songs: their number where the cover would be (they'd all be the same)
+                _ if numbered => row().key("thumb").size(THUMB, THUMB).center()
+                    .child(text(if h.number > 0 { h.number.to_string() } else { String::new() }).font(super::view::NUM).color(th.text.alpha(0.5))),
+                _ if h.uri == "liked" => super::view::liked_cover("thumb", THUMB, 6.0),
                 Some(img) => thumb.pixels_fit(img.pixels(), SurfaceFit::Fill),
                 None => thumb.center().child(icon(&icons::NOTE, 15.0).color(th.text.alpha(0.5))),
             };
             let mut name = row().key("nm").gap(6.0).center_y().min_w(0.0)
-                .child(text(h.name.clone()).font(ts(14.0, 560.0)).color(th.text).truncate().shrink());
+                .child(text(h.name.clone()).font(ts(13.5, 560.0).lh(17.0)).color(th.text).truncate().shrink());
             if h.explicit {
-                name = name.child(row().key("e").size(14.0, 14.0).radius(3.0).border(1.0, th.dim.alpha(0.6)).center()
-                    .child(text("E").font(ts(8.5, 650.0)).color(th.dim)));
+                name = name.child(super::rows::explicit(&th));
             }
             // the picked row: lit, with a bar of the accent at its left edge, and its words brighter
-            let bar = el().key("pick-bar").pin(Some(0.0), Some(13.0), None, Some(13.0)).w(3.0).radius(1.5)
+            let bar = el().key("pick-bar").pin(Some(0.0), Some(10.0), None, Some(10.0)).w(3.0).radius(1.5)
                 .fill(if on { th.accent } else { Color::TRANSPARENT });
             let mut r = row().key(format!("hit-{i}")).w_full().h(HIT).px(12.0).gap(12.0).center_y().radius(12.0)
                 .fill(if on { th.text.alpha(0.13) } else { Color::TRANSPARENT })
@@ -574,9 +589,9 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
                 })
                 .child(bar)
                 .child(thumb)
-                .child(col().key("words").grow(1.0).shrink().min_w(0.0).gap(1.0)
+                .child(col().key("words").grow(1.0).shrink().min_w(0.0).gap(0.0)
                     .child(name)
-                    .child(text(h.sub.clone()).font(ts(12.0, 450.0)).color(th.text.alpha(if on { 0.8 } else { 0.62 })).truncate()));
+                    .child(text(h.sub.clone()).font(ts(11.5, 450.0).lh(15.0)).color(th.text.alpha(if on { 0.8 } else { 0.62 })).truncate()));
             if h.ms > 0 {
                 r = r.child(text(mmss(h.ms)).font(super::view::NUM).color(th.text.alpha(0.5)));
             }
@@ -586,10 +601,25 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
             }
             list = list.child(r);
         }
+        if searching {
+            // stand-ins for Spotify's results, filling what the card has room for (the rest is cut off)
+            for i in 0..((ROOM / HIT) as usize).saturating_sub(p.results.len()) {
+                let bar = |key: &'static str, w: f32, h: f32| el().key(key).w(w).h(h).radius(h / 2.0).fill(th.text.alpha(0.07));
+                list = list.child(row().key(format!("wait-{i}")).w_full().h(HIT).px(12.0).gap(12.0).center_y()
+                    .child(el().key("thumb").size(THUMB, THUMB).radius(6.0).fill(th.text.alpha(0.06)))
+                    .child(col().key("words").gap(7.0)
+                        .child(bar("w1", [180.0, 140.0, 210.0, 160.0][i % 4], 9.0))
+                        .child(bar("w2", [110.0, 90.0, 130.0, 100.0][i % 4], 7.0))));
+            }
+        }
         card = card.child(el().key("sep").mx(20.0).h(1.0).fill(th.text.alpha(0.08))).child(list);
     }
     if let Some(n) = &p.note {
         card = card.child(row().key("note").w_full().h(44.0).px(24.0).center_y().child(text(n.clone()).font(ts(13.0, 500.0)).color(th.text.alpha(0.75)).truncate()));
+    }
+    if !listed {
+        // the card is always the window's height: what's playing stays at its foot
+        card = card.child(el().key("room").w_full().grow(1.0));
     }
     if let Some(n) = &p.now {
         let mode = |on: bool| if on { th.text } else { th.text.alpha(0.4) };
@@ -598,7 +628,7 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
                 .on_press(move |p: &mut Panel| f(p))
                 .child(icon(i, 15.0).color(c))
         };
-        let art = el().key("now-art").size(34.0, 34.0).radius(6.0).clip_rounded(6.0).fill(th.text.alpha(0.08));
+        let art = el().key("now-art").size(THUMB, THUMB).radius(6.0).clip_rounded(6.0).fill(th.text.alpha(0.08));
         let art = match &n.cover {
             Some(img) => art.pixels_fit(img.pixels(), SurfaceFit::Fill),
             None => art,
@@ -611,7 +641,10 @@ pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
         if p.copied {
             foot = foot.child(text("link copied").font(ts(11.0, 500.0)).color(th.text));
         }
-        let foot = foot.child(el().key("gap").w(4.0))
+        // how far through the song it is, along the foot's bottom edge
+        let progress = el().key("now-progress").pin(Some(0.0), None, None, Some(0.0)).h(2.0)
+            .w(((WIDTH - 2.0 * MARGIN) * n.ratio()).round()).fill(th.accent);
+        let foot = foot.child(progress).child(el().key("gap").w(4.0))
             .child(small_btn("p-shuffle", &icons::SHUFFLE, mode(n.shuffle), |p| p.control(&["shuffle"], |n| n.shuffle = !n.shuffle)))
             .child(small_btn("p-play", if n.playing { &icons::PAUSE } else { &icons::PLAY }, th.text, |p| p.control(&["toggle"], |n| n.playing = !n.playing)))
             .child(small_btn("p-repeat", &icons::REPEAT, mode(n.repeat != Repeat::Off), |p| p.control(&["repeat"], |n| n.repeat = n.repeat.next())));
