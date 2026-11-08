@@ -13,7 +13,7 @@ use super::view::ts;
 use super::{Now, Ui, icons};
 use crate::*;
 
-const RECENT: usize = 7;
+const RECENT: usize = 8;
 const MINE: usize = 1; // of your playlists matching
 pub const WIDTH: f32 = 640.0;
 const MARGIN: f32 = 24.0; // around the card, for its shadow
@@ -25,7 +25,7 @@ const THUMB: f32 = 28.0;
 /// The window's height, always, so it never runs into the bottom of the screen and gets pushed
 /// up. Spotify's results (the top one, three songs, an album, an artist: four sections) fit in
 /// its list; past what fits, the rows scroll with the selection.
-pub const HEIGHT: f32 = 486.0;
+pub const HEIGHT: f32 = 492.0;
 /// What the list has room for, under the bar and over what's playing.
 const ROOM: f32 = HEIGHT - 2.0 * MARGIN - BAR - 12.0 - FOOT;
 
@@ -505,12 +505,12 @@ pub fn on_key(p: &mut Panel, ev: &KeyEvent, tx: &mut Tx) -> bool {
 }
 
 pub fn view(p: &Panel, cx: &mut Cx<Panel>) -> El {
-    let th = theme(cx.system_dark());
+    let th = theme(crate::theme::dark(cx.system_dark()));
     // most of the window's own background over the glass: one even surface, whatever desktop or
     // window is behind it, so text and the picked row read the same everywhere
     let tint = th.bg.alpha(if th.dark { 0.9 } else { 0.85 });
     let field = text_input(&p.query, ts(20.0, 450.0).lh(26.0)).key("query").single_line().grow(1.0)
-        .color(th.text).placeholder("Songs, albums, artists, your playlists", th.sub)
+        .color(th.text).caret(th.text, th.text.alpha(0.2)).placeholder("Songs, albums, artists, your playlists", th.sub)
         .on_edit(|p: &mut Panel| &mut p.query)
         .on_input_change(|p: &mut Panel, tx| {
             p.search();

@@ -167,7 +167,7 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
     for t in tracks {
         let _ = writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{:x}\t{}\t{}\t{}\t{}\t{}",
             t.uri,
             clean(&t.name),
             clean(&t.artists),
@@ -180,7 +180,8 @@ pub fn push_tracks<'a>(out: &mut String, tracks: impl IntoIterator<Item = &'a Tr
             t.disc,
             t.explicit as u8,
             t.added,
-            t.number
+            t.number,
+            t.more.iter().map(|(len, id)| format!("{len}:{id:x}")).collect::<Vec<_>>().join(",")
         );
     }
 }
@@ -205,14 +206,21 @@ pub fn parse_line(l: &str) -> Option<Track> {
         explicit: f.next() == Some("1"),
         added: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
         number: f.next().and_then(|x| x.parse().ok()).unwrap_or(0),
+        more: f.next().map_or(Vec::new(), |x| {
+            x.split(',').filter_map(|m| {
+                let (len, id) = m.split_once(':')?;
+                Some((len.parse().ok()?, u128::from_str_radix(id, 16).ok()?))
+            }).collect()
+        }),
     })
 }
 
 pub fn read_tracks(path: &std::path::Path) -> Vec<Track> {
     let s = fs::read_to_string(path).unwrap_or_default();
-    // lists cached before the explicit flag was kept load fresh, or they'd never get it (the
-    // date added, kept since, is filled in by the next refresh: see liked_tracks, playlist_tracks)
-    if s.lines().next().is_some_and(|l| l.split('\t').count() < 11) {
+    // lists cached before the explicit flag or every artist's id were kept load fresh, or they'd
+    // never get them (the date added, kept since, is filled in by the next refresh: see
+    // liked_tracks, playlist_tracks)
+    if s.lines().next().is_some_and(|l| l.split('\t').count() < 14) {
         return vec![];
     }
     s.lines().filter_map(parse_line).collect()
@@ -368,6 +376,19 @@ pub fn sock_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_artist_survives_the_cache_and_names_with_commas_stay_whole() {
+        let line = "spotify:track:x\tt\tTyler, the Creator, Kali Uchis, Bob\t18\tal\t\t1000\t1\ta\t1\t0\t0\t3\t10:b,3:c";
+        let t = parse_line(line).unwrap();
+        assert_eq!(t.credits(), vec![("Tyler, the Creator", 0xa), ("Kali Uchis", 0xb), ("Bob", 0xc)]);
+        let mut out = String::new();
+        push_tracks(&mut out, [&t]);
+        assert_eq!(out.trim_end(), line);
+        // cached before every artist was kept: only the first
+        let old = parse_line("spotify:track:x\tt\tA, B\t1\tal\t\t1000\t1\ta\t1\t0\t0\t3").unwrap();
+        assert_eq!(old.credits(), vec![("A", 0xa)]);
+    }
 
     #[test]
     fn concurrent_cache_writes_publish_complete_files() {

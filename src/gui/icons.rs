@@ -30,3 +30,9 @@ pub static PIN: Icon = i("pin", r#"<path d="M9 4.5H15L14 10L17 13.2V14.5H7V13.2L
 pub static HEART: Icon = i("heart", r#"<path d="M12 19.2C12 19.2 4.6 14.9 4.6 9.7C4.6 7.3 6.4 5.6 8.6 5.6C10 5.6 11.2 6.3 12 7.4C12.8 6.3 14 5.6 15.4 5.6C17.6 5.6 19.4 7.3 19.4 9.7C19.4 14.9 12 19.2 12 19.2Z" fill="currentColor"/>"#);
 pub static DOWN: Icon = i("down", r#"<path d="M12 5V19M6.5 13.5L12 19L17.5 13.5" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#);
 pub static UP: Icon = i("up", r#"<path d="M12 19V5M6.5 10.5L12 5L17.5 10.5" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#);
+pub static LINK: Icon = i("link", r#"<path d="M10.2 13.8C11.4 15 13.3 15 14.5 13.8L17.8 10.5C19 9.3 19 7.4 17.8 6.2C16.6 5 14.7 5 13.5 6.2L12.4 7.3M13.8 10.2C12.6 9 10.7 9 9.5 10.2L6.2 13.5C5 14.7 5 16.6 6.2 17.8C7.4 19 9.3 19 10.5 17.8L11.6 16.7" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>"#);
+pub static MINUS: Icon = i("minus", r#"<path d="M5.5 12H18.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>"#);
+pub static OPEN: Icon = i("open", r#"<path d="M8 16L16.5 7.5M9.5 7.5H16.5V14.5" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#);
+/// Arrows centered in their square (the chevrons above lean toward their point), for the swipe's.
+pub static ARROW_LEFT: Icon = i("arrow-left", r#"<path d="M18.5 12H5.5M10.5 7L5.5 12L10.5 17" stroke="currentColor" stroke-width="2.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#);
+pub static ARROW_RIGHT: Icon = i("arrow-right", r#"<path d="M5.5 12H18.5M13.5 7L18.5 12L13.5 17" stroke="currentColor" stroke-width="2.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/>"#);

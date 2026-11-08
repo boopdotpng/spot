@@ -67,7 +67,10 @@ pub fn items() -> Vec<MenuItem<Ui>> {
             ui.open_window();
             ui.after(tx);
         })
-        .menu("help"),
+        .menu("help")
+        // with a help menu, AppKit gives ⌘? to the menu's search field unless an item has it
+        .key_equivalent(key("cmd+shift+slash"))
+        .keys_first(),
     ]
 }
 
@@ -154,6 +157,32 @@ pub fn tidy() {
         }
     }
 }
+
+/// Light, dark or the system's, for the app's native parts too: the title bar's buttons, the
+/// panel's glass, tooltips and menus. Its windows follow the app's appearance, and Rune redraws
+/// them when theirs changes. Call it on the main thread, once the event loop runs (asking for
+/// the shared application earlier would make a plain one, not winit's).
+#[cfg(target_os = "macos")]
+pub fn set_appearance(a: crate::settings::Appearance) {
+    use crate::settings::Appearance;
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication};
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    // SAFETY: the names are AppKit's own constants, read on the main thread.
+    let name = unsafe {
+        match a {
+            Appearance::System => None,
+            Appearance::Light => Some(NSAppearanceNameAqua),
+            Appearance::Dark => Some(NSAppearanceNameDarkAqua),
+        }
+    };
+    let look = name.and_then(NSAppearance::appearanceNamed);
+    NSApplication::sharedApplication(mtm).setAppearance(look.as_deref());
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_appearance(_: crate::settings::Appearance) {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn tidy() {}

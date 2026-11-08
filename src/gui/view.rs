@@ -2,9 +2,10 @@
 // The surfaces lean toward the playing cover's hue, one accent taken from it marks what's
 // playing, and a list's header fades down from its own cover's color.
 
-use rune::{Color, Cursor, Cx, El, Phase, PopupItem, PopupMenu, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
+use rune::{Color, Cursor, Cx, El, Phase, ScrollSpec, SurfaceFit, TextStyle, Transition, col, el, icon, row, spacer, text, text_input};
 
-use super::{Ui, artist, icons, player, rows};
+use super::menu::{self, Menu};
+use super::{Ui, artist, icons, motion, player, rows};
 use crate::*;
 
 pub const ROW: f32 = 44.0; // a song's row (with its cover)
@@ -38,13 +39,50 @@ pub fn icon_button(key: &str, i: &'static rune::Icon, size: f32, color: Color, t
         .child(icon(i, size).color(color).group_opacity(0.75, 1.0))
 }
 
+/// `names`, with each artist in `links` (uri, name: the first of `names`, in order) a way to their
+/// page; past them, plain. `pre` runs before going (to pick a row); `help` is the first's.
+pub fn artist_line(key: impl Into<String>, names: &str, links: &[(String, String)], font: TextStyle, c: Color, hover: Color, help: &str, pre: impl Fn(&mut Ui) + Clone + 'static) -> El {
+    let mut line = row().key(key.into()).min_w(0.0).shrink();
+    let mut at = 0;
+    for (i, (uri, name)) in links.iter().enumerate() {
+        if !names[at..].starts_with(name.as_str()) {
+            break;
+        }
+        if i > 0 {
+            line = line.child(text(",\u{a0}").key(format!("sep-{i}")).font(font).color(c));
+        }
+        let (uri, n, pre) = (uri.clone(), name.clone(), pre.clone());
+        line = line.child(row().key(format!("a-{i}")).min_w(0.0).shrink().hover_group().cursor(Cursor::Pointer)
+            .help(if i == 0 { help.to_string() } else { format!("Go to {name}") })
+            .on_press_tx(move |ui: &mut Ui, tx| {
+                pre(ui);
+                ui.app.open_artist(uri.clone(), n.clone());
+                ui.after(tx);
+            })
+            .child(text(name.clone()).font(font).color(c).group_color(hover).truncate()));
+        at += name.len();
+        match names[at..].strip_prefix(", ") {
+            Some(_) if i + 1 < links.len() => at += 2,
+            _ => break,
+        }
+    }
+    if at < names.len() {
+        line = line.child(text(names[at..].to_string()).key("rest").font(font).color(c).truncate().shrink().help_when_truncated(names.to_string()));
+    }
+    line
+}
+
 /// A cover, or its stand-in while there's none.
 pub fn cover(key: String, image: Option<&rune::Image>, size: f32, radius: f32, th: &Theme, fallback: &'static rune::Icon) -> El {
-    // the picture is a child of its own, so one that arrives after the list shows fades in over
-    // the placeholder (an element mounted after the first frame does) instead of snapping in
+    // the picture is a child of its own, keyed by the picture, so one that arrives after the list
+    // shows comes into focus over the placeholder, and a new one over the one before it, instead
+    // of snapping in
     let base = el().key(key).size(size, size).radius(radius).clip_rounded(radius).fill(th.wash).center();
     match image {
-        Some(i) => base.child(el().key("pic").size(size, size).pixels_fit(i.pixels(), SurfaceFit::Fill)),
+        Some(i) => {
+            let id = u64::from_le_bytes(i.id()[..8].try_into().unwrap_or_default());
+            base.child(el().key(format!("pic-{id:x}")).size(size, size).pixels_fit(i.pixels(), SurfaceFit::Fill).transition(motion::focus()))
+        }
         None => base.child(icon(fallback, size * 0.4).key("glyph").color(th.dim)),
     }
 }
@@ -77,8 +115,8 @@ pub fn eq(color: Color, playing: bool, key: &str) -> El {
 }
 
 pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
-    DARK.store(cx.system_dark(), std::sync::atomic::Ordering::Relaxed);
-    let th = theme(cx.system_dark());
+    DARK.store(crate::theme::dark(cx.system_dark()), std::sync::atomic::Ordering::Relaxed);
+    let th = theme(crate::theme::dark(cx.system_dark()));
     let pane = if ui.prefs.open { super::prefs::page(ui, &th) } else { main_pane(ui, &th, cx) };
     let body = row().key("body").w_full().grow(1.0).min_h(0.0)
         .child(sidebar(ui, &th))
@@ -92,7 +130,7 @@ pub fn view(ui: &Ui, cx: &mut Cx<Ui>) -> El {
     if ui.app.help {
         root = root.child(help(&th));
     }
-    root
+    super::menu::view(ui, &th, root)
 }
 
 /// Whether the window last drew dark (rows are built where the view's `Cx` isn't at hand).
@@ -106,32 +144,33 @@ pub fn theme_now() -> Theme {
 
 // ---------- sidebar ----------
 
-/// What can be done with a playlist in the sidebar, as the system's menu.
-fn playlist_menu(ui: &Ui, i: usize, at: rune::PopupAnchor, tx: &mut rune::Tx) {
+/// What can be done with a playlist in the sidebar, as a menu.
+fn playlist_menu(ui: &mut Ui, i: usize, at: menu::At) {
     let Some(p) = ui.app.playlists.get(i) else { return };
-    let pin = if ui.app.is_pinned(p) { PopupItem::new("pin", "Unpin").symbol("pin.slash") } else { PopupItem::new("pin", "Pin to top").symbol("pin") };
-    let m = PopupMenu::new()
-        .item(PopupItem::new("open", "Open").symbol("music.note.list"))
-        .item(pin)
+    let pin = if ui.app.is_pinned(p) { "Unpin" } else { "Pin to top" };
+    let m = Menu::new()
+        .item("open", "Open", Some(&icons::OPEN))
+        .item("pin", pin, Some(&icons::PIN))
         .separator()
-        .item(PopupItem::new("copy", "Copy link").symbol("link"));
-    tx.popup_menu(m, at, move |ui: &mut Ui, picked, tx| {
-        match picked {
-            Some("open") => {
-                ui.app.focus = Focus::Playlists;
-                ui.app.pl_state.select(Some(i));
-                ui.app.enter();
-            }
-            Some("pin") => ui.app.toggle_pin(i),
-            Some("copy") => {
-                let uri = ui.app.playlists.get(i).map(Playlist::uri);
-                rows::copy_link(&mut ui.app, tx, uri);
-            }
-            _ => {}
+        .item("copy", "Copy link", Some(&icons::LINK));
+    menu::open(ui, m, at, move |ui: &mut Ui, picked, tx| match picked {
+        "open" => {
+            ui.app.focus = Focus::Playlists;
+            ui.app.pl_state.select(Some(i));
+            ui.app.enter();
         }
-        ui.after(tx);
+        "pin" => ui.app.toggle_pin(i),
+        "copy" => {
+            let uri = ui.app.playlists.get(i).map(Playlist::uri);
+            rows::copy_link(&mut ui.app, tx, uri);
+        }
+        _ => {}
     });
 }
+
+const SIDE_ROW: f32 = 32.0;
+const SIDE_GAP: f32 = 1.0;
+const SIDE_RULE: f32 = 9.0; // the hairline under the pinned lists, and the space around it
 
 fn sidebar(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
@@ -156,15 +195,23 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
         let open = a.view.key == key;
         let playing = Some(key) == playing_key;
         let key_owned = key.to_string();
-        // the open list and the keyboard's cursor are lit as the song list's cursor is
-        let fill = if open || (selected && focused) { th.sel } else { Color::TRANSPARENT };
-        let mut r = row().key(format!("side-{i}")).h(32.0).w_full().px(8.0).gap(10.0).center_y().radius(7.0)
-            .fill(fill).hover(if open { th.sel } else { th.wash }).hover_group().cursor(Cursor::Pointer)
+        let key_press = key_owned.clone();
+        // the keyboard's cursor is lit as the song list's cursor is; the open list sits on the
+        // highlight that slides from list to list (under the rows, below)
+        let fill = if !open && selected && focused { th.sel } else { Color::TRANSPARENT };
+        let mut r = row().key(format!("side-{i}")).h(SIDE_ROW).w_full().px(8.0).gap(10.0).center_y().radius(7.0)
+            .fill(fill).hover(if open { Color::TRANSPARENT } else { th.wash }).hover_group().cursor(Cursor::Pointer)
             .on_press_tx(move |ui: &mut Ui, tx| {
                 ui.prefs.open = false;
                 ui.app.focus = Focus::Playlists;
                 if ui.app.podcasts { ui.app.sh_state.select(Some(i)) } else { ui.app.pl_state.select(Some(i)) }
-                ui.app.enter();
+                // already open (as on a double click's second press): keep it, rather than open it
+                // again, which would reset its scroll and cursor and refetch it
+                if ui.app.view.key == key_press {
+                    ui.app.focus = Focus::Tracks;
+                } else {
+                    ui.app.enter();
+                }
                 ui.after(tx);
             })
             // a double click shuffles it and plays (the first click has opened it)
@@ -189,7 +236,19 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
         }
         r
     };
-    let mut list = col().key("side-rows").w_full().px(8.0).pt(4.0).pb(16.0).gap(1.0);
+    let mut list = col().key("side-rows").w_full().px(8.0).pt(4.0).pb(16.0).gap(SIDE_GAP);
+    // the open list's highlight: one element, under the rows, that slides to whichever list
+    // opens (its own for each tab, so changing tabs doesn't send it flying)
+    let keys: Vec<String> = if a.podcasts { a.shows.iter().map(|s| s.uri.clone()).collect() } else { a.playlists.iter().map(Playlist::key).collect() };
+    let split = (!a.podcasts && a.playlists.iter().any(|p| a.is_pinned(p)))
+        .then(|| a.playlists.iter().rposition(|p| p.id.is_none() || a.is_pinned(p))).flatten()
+        .filter(|&last| last + 1 < a.playlists.len());
+    if let Some(i) = keys.iter().position(|k| *k == a.view.key) {
+        let y = i as f32 * (SIDE_ROW + SIDE_GAP) + if split.is_some_and(|s| i > s) { SIDE_RULE + SIDE_GAP } else { 0.0 };
+        list = list.child(el().key(if a.podcasts { "side-lit-shows" } else { "side-lit-lists" })
+            .pin(Some(8.0), Some(4.0), Some(8.0), None).h(SIDE_ROW).radius(7.0).fill(th.sel)
+            .offset(0.0, y).offset_motion(motion::SLIDE));
+    }
     if a.podcasts {
         for (i, s) in a.shows.iter().enumerate() {
             let pinned = !is_show(&s.uri);
@@ -201,10 +260,7 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             list = list.child(row_for(i, &s.name, &s.uri, tile, a.sh_state.selected() == Some(i), false));
         }
     } else {
-        // Liked Songs and the pinned are one group, a hairline over the rest
-        let pins = a.playlists.iter().filter(|p| a.is_pinned(p)).count();
-        let split = (pins > 0).then(|| a.playlists.iter().rposition(|p| p.id.is_none() || a.is_pinned(p))).flatten()
-            .filter(|&last| last + 1 < a.playlists.len());
+        // Liked Songs and the pinned are one group, a hairline (`split`, above) over the rest
         for (i, p) in a.playlists.iter().enumerate() {
             let liked = p.id.is_none();
             let name = if liked { "Liked Songs" } else if p.name.trim().is_empty() { "Untitled playlist" } else { p.name.as_str() };
@@ -219,11 +275,14 @@ fn sidebar(ui: &Ui, th: &Theme) -> El {
             let pinned = a.is_pinned(p);
             let mut r = row_for(i, name, &p.key(), tile, a.pl_state.selected() == Some(i), pinned);
             if !liked {
-                r = r.on_secondary_press(move |ui: &mut Ui, at, tx| playlist_menu(ui, i, at.into(), tx));
+                r = r.on_secondary_press(move |ui: &mut Ui, at, tx| {
+                    playlist_menu(ui, i, at.into());
+                    ui.after(tx);
+                });
             }
             list = list.child(r);
             if split == Some(i) {
-                list = list.child(row().key("side-pins-rule").w_full().h(9.0).px(8.0).center_y()
+                list = list.child(row().key("side-pins-rule").w_full().h(SIDE_RULE).px(8.0).center_y()
                     .child(el().w_full().h(1.0).fill(th.line)));
             }
         }
@@ -362,10 +421,12 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         let bar_bg = col().key("top-bg").pin(Some(0.0), Some(0.0), Some(0.0), None).live_opacity(&ui.scrolled)
             .child(el().key("top-fill").w_full().h(artist::TOP_BAR).fill(th.bg))
             .child(el().key("top-rule").w_full().h(1.0).fill(th.line));
-        return col().key("main").grow(1.0).shrink().h_full().min_w(0.0)
+        let [back_mark, fwd_mark] = super::swipe::marks(ui, th);
+        return col().key("main").grow(1.0).shrink().h_full().min_w(0.0).on_wheel(super::swipe::wheel)
             .child(artist::overview(ui, th, cx))
             .child(bar_bg)
-            .child(top.pin(Some(0.0), Some(0.0), Some(0.0), None));
+            .child(top.pin(Some(0.0), Some(0.0), Some(0.0), None))
+            .child(back_mark).child(fwd_mark);
     }
 
     // title, and what's in it
@@ -398,16 +459,7 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     let mut line = row().key("hero-line").gap(14.0).center_y().min_w(0.0);
     if let Some(by) = &v.by {
         // an album's artist, as Spotify puts it: first on the line, and a way to their page
-        let name = text(by.names.clone()).font(ts(12.0, 650.0)).color(th.text).truncate();
-        let el = match by.artist.clone() {
-            Some((uri, n)) => row().key("by").min_w(0.0).shrink().hover_group().cursor(Cursor::Pointer).help("Go to artist")
-                .on_press_tx(move |ui: &mut Ui, tx| {
-                    ui.app.open_artist(uri.clone(), n.clone());
-                    ui.after(tx);
-                })
-                .child(name.group_color(th.text.alpha(0.75))),
-            None => row().key("by").min_w(0.0).shrink().child(name),
-        };
+        let el = artist_line("by", &by.names, &by.artists, ts(12.0, 650.0), th.text, th.text.alpha(0.75), "Go to artist", |_| {});
         line = line.child(row().key("by-meta").gap(6.0).center_y().min_w(0.0).shrink()
             .child(el)
             .child(text("·").font(SMALL).color(th.sub))
@@ -427,9 +479,13 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     } else if v.is_grid() {
         words = words.child(row().key("chips-pad").pt(8.0).child(artist::release_chips(ui, th)));
     }
-    let hero_row = row().key("hero-row").w_full().px(28.0).pt(2.0).pb(18.0).gap(22.0).items_end()
-        .child(hero_art(ui, th).transition(Transition::blur_replace()))
-        .child(words);
+    // a list opening (or coming back) makes an entrance: its art comes into focus and its words
+    // rise in just after, while the last list's header slips away. A search stays put as you type
+    let staged = if a.input.is_some() || a.live_search { "search".to_string() } else { v.id.to_string() };
+    let hero_row = row().key(format!("hero-row-{staged}")).w_full().px(28.0).pt(2.0).pb(18.0).gap(22.0).items_end()
+        .transition(motion::stage())
+        .child(hero_art(ui, th).transition(motion::focus()))
+        .child(words.transition(motion::rise(10.0)).enter_delay(0.05));
     let hero = col().key("hero").w_full().child(top).child(hero_row);
 
     let list: El = if v.len() == 0 && !v.loading && !v.key.is_empty() {
@@ -443,14 +499,16 @@ fn main_pane(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
     } else {
         rows::link_list(ui, th)
     };
-    let mut main = col().key("main").grow(1.0).shrink().h_full().min_w(0.0);
+    // two fingers across it go back and forward; over the list, its scroller hears them first
+    let mut main = col().key("main").grow(1.0).shrink().h_full().min_w(0.0).on_wheel(super::swipe::wheel);
     if let Some(tint) = hero_tint(ui) {
         // the list's cover's color at the top, fading into the window behind the header
-        main = main.child(el().key(format!("hero-wash-{}", v.id)).pin(Some(0.0), Some(0.0), Some(0.0), None).h(HERO_WASH)
+        main = main.child(el().key(format!("hero-wash-{staged}")).pin(Some(0.0), Some(0.0), Some(0.0), None).h(HERO_WASH)
             .gradient(crate::theme::backdrop(tint, th.dark), th.bg)
-            .transition(Transition::opacity()));
+            .transition(Transition::opacity().springs(motion::BLOOM)));
     }
-    main.child(hero).child(list)
+    let [back_mark, fwd_mark] = super::swipe::marks(ui, th);
+    main.child(hero).child(list).child(back_mark).child(fwd_mark)
 }
 
 /// Play the list: filled in the accent, the playing cover's color. Sorting is the date column's
@@ -464,7 +522,7 @@ fn hero_actions(ui: &Ui, th: &Theme) -> El {
             if playing_here { ui.app.toggle() } else { ui.app.play_from_view(None) }
             ui.after(tx);
         })
-        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 15.0).color(th.bg));
+        .child(icon(if playing_here { &icons::PAUSE } else { &icons::PLAY }, 15.0).key(if playing_here { "pause" } else { "play" }).color(th.bg).transition(motion::swap()));
     row().key("hero-actions").center_y().child(play)
 }
 
@@ -476,7 +534,7 @@ fn field(th: &Theme, key: &str, edit: &rune::TextEdit, w: f32, i: &'static rune:
         .fill(if focused { th.raised } else { th.wash })
         .border(1.0, if focused { th.text.alpha(0.22) } else { th.line })
         .child(icon(i, 14.0).color(if focused { th.text } else { th.dim }))
-        .child(wire(text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).placeholder(placeholder.to_string(), th.sub)))
+        .child(wire(text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).caret(th.text, th.text.alpha(0.2)).placeholder(placeholder.to_string(), th.sub)))
 }
 
 fn search_field(ui: &Ui, th: &Theme) -> El {
@@ -533,19 +591,41 @@ fn find_field(ui: &Ui, th: &Theme) -> El {
 
 /// While searching: what to search for, as chips (tab cycles them).
 fn kinds(ui: &Ui, th: &Theme) -> El {
-    let mut r = row().key("kinds").gap(6.0).pt(8.0);
-    for k in [Kind::Tracks, Kind::Albums, Kind::Artists, Kind::Shows] {
-        let on = ui.app.search_kind == k;
-        r = r.child(row().key(format!("kind-{}", k.label())).h(26.0).px(12.0).center().radius(13.0)
-            .fill(if on { th.text } else { th.text.alpha(0.06) })
-            .hover(if on { th.text } else { th.text.alpha(0.1) })
+    let opts = [Kind::Tracks, Kind::Albums, Kind::Artists, Kind::Shows].map(|k| (k, k.label()));
+    let on = opts.iter().position(|&(k, _)| k == ui.app.search_kind).unwrap_or(0);
+    let pick = |ui: &mut Ui, k: Kind| {
+        ui.app.search_kind = k;
+        ui.app.search_at = Some(Instant::now());
+    };
+    row().key("kinds").pt(8.0).child(segmented("kind", &opts, on, 78.0, "", th, pick))
+}
+
+/// One choice of a few, as chips all one width: the chosen one sits on a solid pill, and when
+/// the choice changes the pill slides over to it (with a little give at the end) while the
+/// labels' colors cross. One width means where the pill goes is known without measuring.
+pub fn segmented<T: Copy + 'static>(key: &str, opts: &[(T, &'static str)], on: usize, w: f32, help: &'static str, th: &Theme, pick: fn(&mut Ui, T)) -> El {
+    const GAP: f32 = 6.0;
+    const H: f32 = 26.0;
+    let pill = el().key("pill").absolute(0.0, 0.0).size(w, H).radius(H / 2.0).fill(th.text)
+        .offset(on as f32 * (w + GAP), 0.0).offset_motion(motion::SLIDE);
+    let mut r = row().key(key.to_string()).gap(GAP).child(pill);
+    for (i, &(v, label)) in opts.iter().enumerate() {
+        let chosen = i == on;
+        let mut chip = row().key(format!("chip-{label}")).size(w, H).center().radius(H / 2.0)
+            .fill(if chosen { Color::TRANSPARENT } else { th.text.alpha(0.06) })
             .cursor(Cursor::Pointer).press_scale(0.94)
             .on_press_tx(move |ui: &mut Ui, tx| {
-                ui.app.search_kind = k;
-                ui.app.search_at = Some(Instant::now());
+                pick(ui, v);
                 ui.after(tx);
             })
-            .child(text(k.label()).font(ts(12.0, 600.0)).color(if on { th.bg } else { th.sub })));
+            .child(text(label).font(ts(12.0, 600.0)).color(if chosen { th.bg } else { th.sub }));
+        if !chosen {
+            chip = chip.hover(th.text.alpha(0.1));
+        }
+        if !help.is_empty() {
+            chip = chip.help(help);
+        }
+        r = r.child(chip);
     }
     r
 }
@@ -568,7 +648,7 @@ fn message(ui: &Ui, th: &Theme) -> Option<El> {
         .child(row().key(format!("message-{s}")).max_w(620.0).h(34.0).px(16.0).gap(8.0).center_y().radius(17.0)
             .fill(th.raised).border(1.0, c.alpha(0.3))
             .shadow(6.0, 24.0, Color::BLACK.alpha(if th.dark { 0.4 } else { 0.12 }))
-            .transition(Transition::opacity().combined(Transition::offset(0.0, 8.0)))
+            .transition(motion::pop(12.0))
             .child(el().key("dot").size(7.0, 7.0).radius(3.5).fill(c))
             .child(text(s).font(BODY_MED).color(th.text).truncate())))
 }
@@ -594,12 +674,13 @@ fn help(th: &Theme) -> El {
         ("a  A", "album / artist"),
         ("v", "artist: overview / songs / releases"),
         ("f", "releases: all / albums / singles"),
-        ("esc", "back"),
+        ("esc  ⌘[", "back (or swipe right)"),
+        ("⌘]", "forward (or swipe left)"),
         ("tab", "switch pane"),
         ("g  M  G", "top / middle / bottom"),
         ("d", "playlist: sort by date added"),
         ("⌘,", "settings"),
-        ("⌘?", "these keys"),
+        ("⌘?  ?", "these keys"),
         ("⌘W", "close (keeps playing)"),
         ("⌘Q", "quit"),
     ];
@@ -623,7 +704,7 @@ fn help(th: &Theme) -> El {
     let card = col().key("help-card").padding(28.0).gap(18.0).radius(18.0)
         .fill(th.raised).border(1.0, th.line)
         .shadow(18.0, 60.0, Color::BLACK.alpha(if th.dark { 0.5 } else { 0.18 }))
-        .transition(Transition::opacity().combined(Transition::offset(0.0, 10.0)))
+        .transition(motion::pop(14.0))
         .child(row().key("help-head").gap(10.0).center_y()
             .child(icon(&icons::KEYS, 18.0).color(th.sub))
             .child(text("Keys").font(ts(18.0, 700.0)).color(th.text))

@@ -76,6 +76,7 @@ pub fn pb_track(uri: &str, t: &PbTrack) -> Track {
         ms: t.duration() as u64,
         album_id: id(t.album.gid()),
         artist_id: t.artist.first().map_or(0, |a| id(a.gid())),
+        more: t.artist.iter().skip(1).map(|a| (a.name().len(), id(a.gid()))).collect(),
         disc: t.disc_number().max(0) as u32,
         number: t.number().max(0) as u32,
         explicit: t.explicit(),

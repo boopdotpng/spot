@@ -2,11 +2,11 @@
 // plus the Spotify and Last.fm logins. Each change is written to config.toml as it's made,
 // keeping the rest of the file. Most apply when spot restarts, which the page offers to do.
 
-use rune::{Color, Cursor, El, ScrollSpec, TextEdit, Transition, col, el, row, text, text_input};
+use rune::{Color, Cursor, El, ScrollSpec, TextEdit, col, el, row, text, text_input};
 
 use super::view::{BODY, BODY_MED, LABEL, SMALL, TITLE, ts};
 use super::{Ui, icons};
-use crate::settings::Settings;
+use crate::settings::{Appearance, Settings};
 use crate::*;
 
 #[derive(Default)]
@@ -144,7 +144,7 @@ pub enum Kind {
 fn input(key: &'static str, edit: &TextEdit, w: f32, placeholder: &str, bad: bool, secure: bool, get: fn(&mut Ui) -> &mut TextEdit, submit: fn(&mut Ui)) -> El {
     let th = super::view::theme_now();
     let focused = edit.focused;
-    let mut field = text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text)
+    let mut field = text_input(edit, BODY).key(key.to_string()).single_line().grow(1.0).color(th.text).caret(th.text, th.text.alpha(0.2))
         .placeholder(placeholder.to_string(), th.sub)
         .on_edit(get)
         .on_submit(move |ui: &mut Ui, tx| {
@@ -187,6 +187,23 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
         let g = sizes[i];
         ui.prefs.saved.audio_cache_gb = g;
         save(ui, "audio_cache_gb", Some(g.to_string()));
+    });
+
+    let appearance = choice("appearance", Appearance::ALL.iter().map(|a| {
+        let label = match a {
+            Appearance::System => "Match system",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        };
+        (label.to_string(), s.appearance == *a)
+    }).collect(), |ui, i| {
+        let a = Appearance::ALL[i];
+        ui.prefs.saved.appearance = a;
+        // at once, unlike most settings: the colors read it on every draw
+        crate::theme::set_appearance(a);
+        super::menus::set_appearance(a);
+        ui.app.settings.appearance = a;
+        save(ui, "appearance", (a != Appearance::System).then(|| settings::quoted(a.name())));
     });
 
     let hotkey = input("hotkey", &p.hotkey, 170.0, "option+space", p.bad == Some("hotkey"), false, |ui| &mut ui.prefs.hotkey, |ui| {
@@ -259,6 +276,9 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
     let fm_secret = input("fm-secret", &p.fm_secret, 250.0, "Shared secret", false, true, |ui| &mut ui.prefs.fm_secret, connect_lastfm);
 
     let body = col().key("prefs-body").w_full().px(28.0).pb(24.0).gap(22.0)
+        .child(section("s-look", "Appearance", vec![
+            line("l-appearance", "Theme", "Light, dark, or whichever macOS is using.", appearance),
+        ]))
         .child(section("s-play", "Playback", vec![
             line("l-quality", "Quality", "kbps. 320 is the most Spotify streams to spot.", quality),
             line("l-normalize", "Even out loudness", "Plays every song at about the same volume.", normalize),
@@ -289,7 +309,7 @@ pub fn page(ui: &Ui, th: &Theme) -> El {
         .child(text("Settings").font(TITLE).color(th.text));
     let column = col().key("prefs-col").w_full().max_w(720.0).child(head).child(body);
     let mut page = col().key("prefs-page").grow(1.0).h_full().min_w(0.0).fill(th.bg)
-        .transition(Transition::opacity())
+        .transition(super::motion::rise(10.0))
         .child(top)
         .child(col().key("prefs-scroll").w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false }).scroll_edge_fade(18.0)
             .child(row().key("prefs-center").w_full().justify_center().child(column)));

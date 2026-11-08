@@ -246,12 +246,12 @@ impl App {
             Section::Related => self.open_artist(l.uri, l.name),
             Section::Releases => {
                 let name = self.view.artist.clone().unwrap_or_default();
-                let by = By { names: name.clone(), artist: Some((self.view.key.clone(), name)) };
+                let by = By::one(self.view.key.clone(), name);
                 self.open_album(l.uri, l.name, by, None);
             }
             Section::Appears => {
                 let names = l.sub.rsplit_once("· ").map_or(l.sub.as_str(), |(_, by)| by).to_string();
-                self.open_album(l.uri, l.name, By { names, artist: None }, None);
+                self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
             }
         }
     }

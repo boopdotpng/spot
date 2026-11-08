@@ -451,11 +451,11 @@ impl App {
 
     /// Keep up next views (open or in the history) showing what's coming as it changes.
     pub fn queue_changed(&mut self) {
-        if self.view.key != QUEUE_KEY && !self.history.iter().any(|(v, _)| v.key == QUEUE_KEY) {
+        if self.view.key != QUEUE_KEY && !self.history.iter().chain(&self.ahead).any(|(v, _)| v.key == QUEUE_KEY) {
             return;
         }
         let tracks = Arc::new(self.coming_up());
-        for v in std::iter::once(&mut self.view).chain(self.history.iter_mut().map(|(v, _)| v)) {
+        for v in std::iter::once(&mut self.view).chain(self.history.iter_mut().chain(self.ahead.iter_mut()).map(|(v, _)| v)) {
             if v.key == QUEUE_KEY {
                 v.tracks = tracks.clone();
             }

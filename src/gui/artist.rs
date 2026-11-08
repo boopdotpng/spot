@@ -4,11 +4,11 @@
 
 use std::borrow::Cow;
 
-use rune::{Color, Cursor, Cx, El, GrowthSpec, PopupItem, PopupMenu, ScrollSpec, SurfaceFit, col, el, icon, row, spacer, text};
+use rune::{Color, Cursor, Cx, El, GrowthSpec, ScrollSpec, SurfaceFit, col, el, icon, row, spacer, text};
 
 use super::rows::{pick, scroller, track_row};
 use super::view::{BODY, BODY_MED, LABEL, SMALL, cover, theme_now, ts};
-use super::{Ui, icons};
+use super::{Ui, icons, motion};
 use crate::artist::top_cols;
 use crate::*;
 
@@ -62,20 +62,8 @@ fn card(ui: &Ui, r: usize, l: &Link, w: f32, th: &Theme) -> El {
         })
         .on_secondary_press(move |ui: &mut Ui, at, tx| {
             pick(ui, r);
+            super::rows::link_menu(ui, at.into(), uri.clone());
             ui.after(tx);
-            let m = PopupMenu::new()
-                .item(PopupItem::new("open", "Open").symbol("arrow.up.right"))
-                .separator()
-                .item(PopupItem::new("copy", "Copy link").symbol("link"));
-            let uri = uri.clone();
-            tx.popup_menu(m, at, move |ui: &mut Ui, picked, tx| {
-                match picked {
-                    Some("open") => ui.app.enter(),
-                    Some("copy") => super::rows::copy_link(&mut ui.app, tx, Some(uri.clone())),
-                    _ => {}
-                }
-                ui.after(tx);
-            });
         })
         .child(cover("c".into(), img.as_ref(), side, if artist { side / 2.0 } else { 6.0 }, th, glyph))
         .child(col().key("words").w_full().min_w(0.0).gap(2.0)
@@ -108,25 +96,9 @@ fn text_button(key: &str, s: &str, th: &Theme, f: impl Fn(&mut Ui) + 'static) ->
 
 /// The discography's filter, as chips: all, albums, singles (`f` cycles them).
 pub fn release_chips(ui: &Ui, th: &Theme) -> El {
-    let mut r = row().key("chips").gap(6.0);
-    for f in [Releases::All, Releases::Albums, Releases::Singles] {
-        let on = ui.app.view.filter == f;
-        let label = match f {
-            Releases::All => "All",
-            Releases::Albums => "Albums",
-            Releases::Singles => "Singles",
-        };
-        r = r.child(row().key(format!("chip-{label}")).h(26.0).px(12.0).center().radius(13.0)
-            .fill(if on { th.text } else { th.text.alpha(0.06) })
-            .hover(if on { th.text } else { th.text.alpha(0.1) })
-            .cursor(Cursor::Pointer).press_scale(0.94).help("Releases  f")
-            .on_press_tx(move |ui: &mut Ui, tx| {
-                ui.app.set_releases(f);
-                ui.after(tx);
-            })
-            .child(text(label).font(ts(12.0, 600.0)).color(if on { th.bg } else { th.sub })));
-    }
-    r
+    let opts = [(Releases::All, "All"), (Releases::Albums, "Albums"), (Releases::Singles, "Singles")];
+    let on = opts.iter().position(|&(f, _)| f == ui.app.view.filter).unwrap_or(0);
+    super::view::segmented("chips", &opts, on, 70.0, "Releases  f", th, |ui, f| ui.app.set_releases(f))
 }
 
 fn heading(key: &str, s: &str, th: &Theme) -> El {
@@ -178,13 +150,16 @@ fn header(ui: &Ui, info: &ArtistInfo, th: &Theme) -> El {
     if let Some(i) = &img {
         // the portrait, blurred to a wash of its colors, fading into the window
         band = band
-            .child(el().key("ov-blur").pin(Some(-40.0), Some(-40.0), Some(-40.0), Some(-40.0)).pixels_fit(i.pixels(), SurfaceFit::Fill).blur(48.0).opacity(if th.dark { 0.45 } else { 0.35 }))
+            .child(el().key("ov-blur").pin(Some(-40.0), Some(-40.0), Some(-40.0), Some(-40.0)).pixels_fit(i.pixels(), SurfaceFit::Fill).blur(48.0).opacity(if th.dark { 0.62 } else { 0.35 })
+                .transition(rune::Transition::opacity().springs(motion::BLOOM)))
             .child(el().key("ov-fade").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
                 .linear_gradient(std::f32::consts::PI, [(0.0, th.bg.alpha(0.0)), (1.0, th.bg)]));
     }
     col().key("ov-header").w_full()
         .child(band)
-        .child(row().key("ov-hero").w_full().px(28.0).pt(TOP_BAR + 12.0).pb(8.0).gap(26.0).items_end().child(portrait).child(words))
+        .child(row().key("ov-hero").w_full().px(28.0).pt(TOP_BAR + 12.0).pb(8.0).gap(26.0).items_end()
+            .child(portrait.transition(motion::focus()))
+            .child(words.transition(motion::rise(10.0)).enter_delay(0.05)))
 }
 
 /// The artist's overview, all one scrolling page.
@@ -211,7 +186,7 @@ pub fn overview(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
             }
             columns = columns.child(column);
         }
-        let sec = col().key("popular").w_full().px(14.0)
+        let sec = col().key("popular").w_full().px(14.0).transition(motion::rise(12.0)).enter_delay(0.08)
             .child(row().key("popular-head").px(14.0).pb(8.0).child(heading("popular", "Popular", th)))
             .child(columns);
         page = page.child(sec);
@@ -224,7 +199,7 @@ pub fn overview(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
             .child(release_chips(ui, th))
             .child(spacer())
             .child(text_button("disc-all", "Show all", th, |ui| ui.app.open_artist_mode(ArtistMode::Releases, true)));
-        let mut sec = col().key("disc").w_full().px(PAD).gap(12.0).child(row().key("disc-pad").w_full().px(8.0).child(head));
+        let mut sec = col().key("disc").w_full().px(PAD).gap(12.0).transition(motion::rise(12.0)).enter_delay(0.14).child(row().key("disc-pad").w_full().px(8.0).child(head));
         sec = sec.child(if releases.is_empty() {
             text("none of these").key("disc-none").font(BODY).color(th.dim)
         } else {
@@ -238,13 +213,14 @@ pub fn overview(ui: &Ui, th: &Theme, cx: &mut Cx<Ui>) -> El {
         if cards.is_empty() {
             continue;
         }
-        page = page.child(col().key(key).w_full().px(PAD).gap(12.0)
+        page = page.child(col().key(key).w_full().px(PAD).gap(12.0).transition(motion::rise(12.0)).enter_delay(0.2)
             .child(row().key(format!("{key}-pad")).px(8.0).child(heading(key, title, th)))
             .child(card_lines(ui, &format!("{key}-cards"), start(s), &cards, cols, w, th)));
     }
     // no edge fade: the header's backdrop runs up to the window's top, under the top bar
     let scrolled = ui.scrolled.clone();
     col().key(format!("list-{}", v.id)).w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false })
+        .on_wheel(super::swipe::wheel)
         .on_scroll_offset(move |at| {
             scrolled.set((at.offset[1] / 24.0).clamp(0.0, 1.0));
         })
@@ -268,7 +244,7 @@ fn grid_line(ui: &Ui, l: usize, cols: usize, w: f32) -> El {
     let a = &ui.app;
     let th = theme_now();
     let shown = a.shown();
-    let mut line = row().key(format!("line-{l}")).w_full().gap(GAP).pb(GAP);
+    let mut line = row().key(format!("line-{l}")).w_full().gap(GAP).pb(GAP).transition(motion::rise(12.0)).enter_delay(motion::ripple(l * 3));
     for r in l * cols..(l + 1) * cols {
         if let Some(i) = shown.get(r) {
             line = line.child(card(ui, r, &a.view.links[i], w, &th));

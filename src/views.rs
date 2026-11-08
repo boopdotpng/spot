@@ -25,6 +25,8 @@ impl App {
             if self.history.len() > 50 {
                 self.history.remove(0);
             }
+            // going somewhere new leaves nothing to go forward to, as in a browser
+            self.ahead.clear();
         }
         self.refilter();
         self.tr_state = Sel::with(0);
@@ -32,7 +34,25 @@ impl App {
 
     pub fn back(&mut self) {
         let Some((v, sel)) = self.history.pop() else { return };
-        self.view = v;
+        let here = self.selected_track().unwrap_or(0);
+        let old = std::mem::replace(&mut self.view, v);
+        self.ahead.push((old, here));
+        self.returned_to(sel);
+    }
+
+    /// Forward again, to the view `back` left (⌘], or a swipe to the left).
+    pub fn forward(&mut self) {
+        let Some((v, sel)) = self.ahead.pop() else { return };
+        let here = self.selected_track().unwrap_or(0);
+        let old = std::mem::replace(&mut self.view, v);
+        if !old.key.is_empty() {
+            self.history.push((old, here));
+        }
+        self.returned_to(sel);
+    }
+
+    /// A view from the history is open again: its cursor back on the song it was on.
+    fn returned_to(&mut self, sel: usize) {
         self.find = None;
         self.refilter();
         self.tr_state = Sel::with(self.row_of(sel).unwrap_or(0));
@@ -44,7 +64,7 @@ impl App {
         if self.view.id == id {
             return Some(&mut self.view);
         }
-        self.history.iter_mut().map(|(v, _)| v).find(|v| v.id == id)
+        self.history.iter_mut().chain(self.ahead.iter_mut()).map(|(v, _)| v).find(|v| v.id == id)
     }
 
     pub fn session(&self) -> Option<Session> {
@@ -206,8 +226,8 @@ impl App {
         }
         // an artist's releases are theirs; a search result's line starts with whose it is
         let by = match &self.view.artist {
-            Some(name) => By { names: name.clone(), artist: Some((self.view.key.clone(), name.clone())) },
-            None => By { names: l.sub.split(" · ").next().unwrap_or_default().to_string(), artist: None },
+            Some(name) => By::one(self.view.key.clone(), name.clone()),
+            None => By { names: l.sub.split(" · ").next().unwrap_or_default().to_string(), artists: Vec::new() },
         };
         self.open_album(l.uri.clone(), l.name.clone(), by, None);
     }

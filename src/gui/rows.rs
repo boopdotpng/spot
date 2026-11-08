@@ -5,10 +5,11 @@
 
 use std::borrow::Cow;
 
-use rune::{Color, Cursor, Cx, El, GrowthSpec, PopupAnchor, PopupItem, PopupMenu, ScrollSpec, Tx, col, el, icon, memo, row, text};
+use rune::{Color, Cursor, Cx, El, GrowthSpec, ScrollSpec, Tx, col, el, icon, memo, row, text};
 
-use super::view::{BODY, BODY_MED, LABEL, LINK_ROW, NUM, ROW, SMALL, cover, eq, theme_now, tile, ts};
-use super::{Ui, icons};
+use super::view::{artist_line, BODY, BODY_MED, LABEL, LINK_ROW, NUM, ROW, SMALL, cover, eq, theme_now, tile, ts};
+use super::menu::{self, At, Menu};
+use super::{Ui, icons, motion};
 use crate::*;
 
 /// Rows are wide enough for an album column, and for a date added column.
@@ -93,6 +94,7 @@ pub(super) fn scroller(ui: &Ui, key: String, rows: El) -> El {
     let scrolled = ui.scrolled.clone();
     col().key(key).w_full().grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false })
         .scroll_edge_fade(16.0)
+        .on_wheel(super::swipe::wheel)
         .on_scroll_offset(move |at| {
             scrolled.set((at.offset[1] / 24.0).clamp(0.0, 1.0));
         })
@@ -246,10 +248,7 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
         let by_el = if episodes {
             text(by).key("by").font(SMALL).color(th.sub).truncate()
         } else {
-            link_text("by", by, SMALL, th.sub, th.text, move |ui| {
-                pick(ui, r);
-                ui.app.goto_artist();
-            })
+            artist_line("by", &by, &artist_links(t), SMALL, th.sub, th.text, "Go to artist  A", move |ui| pick(ui, r))
         };
         let title = col().key("t").grow(1.0).shrink().min_w(0.0).gap(1.0).child(title_line).child(by_el);
         let mut line = row().key("cells").w_full().h(ROW).px(12.0).gap(14.0).center_y().hover_group()
@@ -260,9 +259,9 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
                 pick(ui, r);
                 ui.app.enqueue_selected();
             }))
-            .child(row_button("more", &icons::MORE, th, "More", move |ui, tx| {
+            .child(row_button(&format!("more-{r}"), &icons::MORE, th, "More", move |ui, _| {
                 pick(ui, r);
-                track_menu(ui, PopupAnchor::from(format!("row-{r}/more")), tx);
+                track_menu(ui, At::Under(format!("more-{r}")));
             }));
         if episodes {
             if feed {
@@ -286,14 +285,15 @@ pub(super) fn track_row(ui: &Ui, r: usize, th: &Theme, wide: bool, dates: bool) 
             line = line.child(actions).child(row().key("time").w(44.0).justify_end().child(text(mmss(t.ms)).font(NUM).color(th.dim)));
         }
         // the playing row: a faint wash of the accent
-        let under = if playing { th.accent.alpha(if th.dark { 0.09 } else { 0.08 }) } else { Color::TRANSPARENT };
+        let under = if playing { th.accent.alpha(if th.dark { 0.14 } else { 0.08 }) } else { Color::TRANSPARENT };
         let line = pickable(line.radius(8.0), r, selected, focused, under, th)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);
+                track_menu(ui, at.into());
                 ui.after(tx);
-                track_menu(ui, at.into(), tx);
             });
-        let mut cell = col().key(format!("row-{r}")).w_full();
+        // a list that just opened ripples in, row by row down the first screenful
+        let mut cell = col().key(format!("row-{r}")).w_full().transition(motion::rise(8.0)).enter_delay(motion::ripple(r));
         if let Some(h) = header {
             cell = cell.child(row().key("disc").h(34.0).px(14.0).pt(if r == 0 { 0.0 } else { 10.0 }).items_end()
                 .child(text(h.to_uppercase()).font(LABEL).color(th.dim)));
@@ -322,48 +322,61 @@ pub fn copy_link(a: &mut App, tx: &mut Tx, uri: Option<String>) {
     }
 }
 
-/// What can be done with the song under the cursor, as the system's menu.
-fn track_menu(ui: &Ui, at: PopupAnchor, tx: &mut Tx) {
+/// What can be done with the song under the cursor, as a menu.
+fn track_menu(ui: &mut Ui, at: At) {
     let a = &ui.app;
     let Some(t) = a.selected_track().and_then(|i| a.view.tracks.get(i)) else { return };
     let episode = t.is_episode();
     let up_next = a.view.key == QUEUE_KEY;
-    let mut m = PopupMenu::new()
-        .item(PopupItem::new("play", "Play").symbol("play.fill"))
-        .item(PopupItem::new("next", "Play next").symbol("text.line.first.and.arrowtriangle.forward"))
-        .item(PopupItem::new("queue", "Add to queue").symbol("text.badge.plus").enabled(!up_next))
+    let mut m = Menu::new()
+        .item("play", "Play", Some(&icons::PLAY))
+        .item("next", "Play next", Some(&icons::NEXT))
+        .item("queue", "Add to queue", Some(&icons::PLUS)).enabled(!up_next)
         .separator();
     if episode {
-        m = m.item(PopupItem::new("album", "Go to podcast").symbol("mic"));
+        m = m.item("album", "Go to podcast", Some(&icons::MIC));
     } else {
-        m = m.item(PopupItem::new("album", "Go to album").symbol("square.stack"))
-            .item(PopupItem::new("artist", "Go to artist").symbol("music.mic"));
+        m = m.item("album", "Go to album", Some(&icons::ALBUM))
+            .item("artist", "Go to artist", Some(&icons::PERSON));
     }
     if up_next {
-        m = m.separator().item(PopupItem::new("remove", "Remove from queue").symbol("minus.circle"));
+        m = m.separator().item("remove", "Remove from queue", Some(&icons::MINUS));
     }
-    m = m.separator().item(PopupItem::new("copy", "Copy link").symbol("link"));
-    tx.popup_menu(m, at, |ui: &mut Ui, picked, tx| {
+    m = m.separator().item("copy", "Copy link", Some(&icons::LINK));
+    menu::open(ui, m, at, |ui: &mut Ui, picked, tx| {
         let a = &mut ui.app;
         match picked {
-            Some("play") => a.enter(),
-            Some("next") => {
+            "play" => a.enter(),
+            "next" => {
                 if let Some(t) = a.selected_track().and_then(|i| a.view.tracks.get(i)).cloned() {
                     a.flash(format!("{} plays next", t.name));
                     a.enqueue_at(0, [t]);
                 }
             }
-            Some("queue") => a.enqueue_selected(),
-            Some("album") => a.goto_album(),
-            Some("artist") => a.goto_artist(),
-            Some("remove") => a.dequeue_selected(),
-            Some("copy") => {
+            "queue" => a.enqueue_selected(),
+            "album" => a.goto_album(),
+            "artist" => a.goto_artist(),
+            "remove" => a.dequeue_selected(),
+            "copy" => {
                 let uri = a.selected_track().and_then(|i| a.view.tracks.get(i)).map(|t| t.uri.clone());
                 copy_link(a, tx, uri);
             }
             _ => {}
         }
-        ui.after(tx);
+    });
+}
+
+/// What can be done with an album, artist or podcast in a list or a grid: open it, or copy its
+/// link.
+pub(super) fn link_menu(ui: &mut Ui, at: At, uri: String) {
+    let m = Menu::new()
+        .item("open", "Open", Some(&icons::OPEN))
+        .separator()
+        .item("copy", "Copy link", Some(&icons::LINK));
+    menu::open(ui, m, at, move |ui: &mut Ui, picked, tx| match picked {
+        "open" => ui.app.enter(),
+        "copy" => copy_link(&mut ui.app, tx, Some(uri.clone())),
+        _ => {}
     });
 }
 
@@ -402,23 +415,12 @@ fn link_row(ui: &Ui, r: usize, th: &Theme) -> El {
         };
         let uri = l.uri.clone();
         pickable(row().key(format!("row-{r}")).w_full().h(LINK_ROW).px(12.0).gap(14.0).center_y().radius(8.0), r, selected, focused, Color::TRANSPARENT, th)
+            .transition(motion::rise(8.0)).enter_delay(motion::ripple(r))
             .cursor(Cursor::Pointer)
             .on_secondary_press(move |ui: &mut Ui, at, tx| {
                 pick(ui, r);
+                link_menu(ui, at.into(), uri.clone());
                 ui.after(tx);
-                let m = PopupMenu::new()
-                    .item(PopupItem::new("open", "Open").symbol("arrow.up.right"))
-                    .separator()
-                    .item(PopupItem::new("copy", "Copy link").symbol("link"));
-                let uri = uri.clone();
-                tx.popup_menu(m, at, move |ui: &mut Ui, picked, tx| {
-                    match picked {
-                        Some("open") => ui.app.enter(),
-                        Some("copy") => copy_link(&mut ui.app, tx, Some(uri.clone())),
-                        _ => {}
-                    }
-                    ui.after(tx);
-                });
             })
             .child(tile)
             .child(row().key("name").grow(1.0).shrink().min_w(0.0).child(text(l.name.clone()).font(BODY_MED).color(th.text).truncate().help_when_truncated(l.name.clone())))

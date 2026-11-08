@@ -4,7 +4,8 @@
 // what's playing (its row, its playlist, the play button) and how far through it is.
 
 use rune::Color;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use crate::settings::Appearance;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering::Relaxed};
 
 /// The window's colors, light or dark.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -40,6 +41,22 @@ pub fn art_key() -> u32 {
     ART.load(Relaxed)
 }
 
+/// The appearance setting, as `Appearance as u8`: the window and the panel both read it.
+static MODE: AtomicU8 = AtomicU8::new(Appearance::System as u8);
+
+pub fn set_appearance(a: Appearance) {
+    MODE.store(a as u8, Relaxed);
+}
+
+/// Whether to draw dark, given whether the system is: the setting, unless it follows the system.
+pub fn dark(system_dark: bool) -> bool {
+    match MODE.load(Relaxed) {
+        m if m == Appearance::Light as u8 => false,
+        m if m == Appearance::Dark as u8 => true,
+        _ => system_dark,
+    }
+}
+
 /// 0xRRGGBB (sRGB) as a color.
 pub fn rgb(h: u32) -> Color {
     let ch = |sh: u32| rune::color::srgb_decode(((h >> sh) & 0xff) as f32 / 255.0);
@@ -67,14 +84,16 @@ fn surface_hue() -> Option<f32> {
 
 pub fn theme(dark: bool) -> Theme {
     // the surfaces take the playing cover's hue, just enough to feel: the window least, the
-    // sidebar and the player a little more
+    // sidebar and the player a little more. Dark takes about twice the chroma light does: the
+    // eye sees far less of it in a dark color than in a pale one, and at light's amounts a dark
+    // window reads as plain grey
     let hue = surface_hue();
     let surface = |l: f32, quiet: f32, tinted: f32| match hue {
         Some(h) => rune::color::oklch(l, tinted, h),
         None => grey(l, quiet),
     };
     let (bg, side, raised, text, sub, dim, err) = if dark {
-        (surface(0.175, 0.003, 0.006), surface(0.158, 0.003, 0.010), surface(0.225, 0.004, 0.010), grey(0.935, 0.012), grey(0.70, 0.006), grey(0.52, 0.005), rgb(0xe0705e))
+        (surface(0.175, 0.003, 0.014), surface(0.158, 0.003, 0.021), surface(0.225, 0.004, 0.018), grey(0.935, 0.012), grey(0.70, 0.006), grey(0.52, 0.005), rgb(0xe0705e))
     } else {
         (surface(0.987, 0.002, 0.006), surface(0.968, 0.003, 0.010), Color::WHITE, grey(0.24, 0.008), grey(0.47, 0.006), grey(0.64, 0.005), rgb(0xc2402f))
     };
@@ -90,27 +109,43 @@ pub fn theme(dark: bool) -> Theme {
     Theme { accent, text, sub, dim, err, bg, side, raised, line, wash, sel, dark }
 }
 
-/// A cover's color as the accent: its hue, held to a quiet chroma and a lightness that reads on
-/// the window, so a neon sleeve doesn't shout and a grey one still shows as a color.
+/// A cover's color as the accent: its hue, held to a chroma and a lightness that read on the
+/// window, so a neon sleeve doesn't shout and a grey one still shows as a color. On dark it's
+/// lighter and more saturated than on light: a light color on a dark window needs more chroma
+/// to look as colorful as a dark one does on a pale window.
 fn quiet(hex: u32, dark: bool) -> Color {
     let (l, chroma, hue) = lch(hex);
     if chroma < 0.02 {
         // no real color in it: a plain light grey
         return grey(if dark { 0.80 } else { 0.42 }, 0.0);
     }
-    let (lo, hi) = if dark { (0.70, 0.80) } else { (0.45, 0.56) };
-    let c = chroma.clamp(0.05, 0.14);
-    Color::from_oklab([l.clamp(lo, hi), c * hue.cos(), c * hue.sin(), 1.0])
+    let (lo, hi, cmin, cmax) = if dark { (0.72, 0.84, 0.08, 0.17) } else { (0.45, 0.56, 0.05, 0.14) };
+    in_gamut(l.clamp(lo, hi), chroma.clamp(cmin, cmax), hue)
 }
 
-/// A cover's color (sRGB 0..1) as the wash at the top of a list's header: deep and quiet on
+/// An oklab color by lightness, chroma and hue (radians), its chroma brought in until sRGB can
+/// show it, so a bright blue or yellow keeps its hue instead of clipping to another.
+fn in_gamut(l: f32, mut c: f32, hue: f32) -> Color {
+    loop {
+        let (a, b) = (c * hue.cos(), c * hue.sin());
+        let col = Color::from_oklab([l, a, b, 1.0]);
+        // from_oklab clips to sRGB: one that comes back as it went in fit
+        let [l2, a2, b2, _] = col.to_oklab();
+        if c <= 0.0 || (l2 - l).abs() + (a2 - a).abs() + (b2 - b).abs() < 0.003 {
+            return col;
+        }
+        c = (c - 0.004).max(0.0);
+    }
+}
+
+/// A cover's color (sRGB 0..1) as the wash at the top of a list's header: deep and rich on
 /// dark, pale on light, fading down into the window.
 pub fn backdrop([r, g, b]: [f32; 3], dark: bool) -> Color {
     let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
     let (_, chroma, hue) = lch(c(r) << 16 | c(g) << 8 | c(b));
-    let (l, cap) = if dark { (0.30, 0.07) } else { (0.92, 0.045) };
+    let (l, cap) = if dark { (0.35, 0.12) } else { (0.92, 0.045) };
     let c = if chroma < 0.02 { 0.0 } else { chroma.min(cap) };
-    Color::from_oklab([l, c * hue.cos(), c * hue.sin(), 1.0])
+    in_gamut(l, c, hue)
 }
 
 #[cfg(test)]
@@ -152,6 +187,20 @@ mod tests {
             }
         }
         set_art(None);
+    }
+
+    #[test]
+    fn accents_keep_their_hue() {
+        // a saturated blue, held in gamut, is still blue rather than clipped toward purple
+        for hex in [0x0000ff, 0xffe800, 0x00ff00, 0xff0000] {
+            let (_, _, want) = lch(hex);
+            for dark in [true, false] {
+                let [_, a, b, _] = quiet(hex, dark).to_oklab();
+                let got = b.atan2(a);
+                let d = (got - want).sin().atan2((got - want).cos()).abs();
+                assert!(d < 0.05, "{hex:06x} dark={dark}: {d}");
+            }
+        }
     }
 
     #[test]

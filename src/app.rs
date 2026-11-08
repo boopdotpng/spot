@@ -8,31 +8,47 @@ pub enum Focus {
     Tracks,
 }
 
-/// Whose an album is: the names to show, and the (first) artist to go to, when that's known.
+/// Whose an album is: the names to show, and the artists among them to go to (uri, name), in
+/// order from the first, as far as they're known.
 #[derive(Clone)]
 pub struct By {
     pub names: String,
-    pub artist: Option<(String, String)>, // uri, name
+    pub artists: Vec<(String, String)>,
 }
 
 impl By {
-    /// Whose `t`'s album is, going by the song: its artists, the first to go to.
+    /// Whose `t`'s album is, going by the song: its artists.
     pub fn of(t: &Track) -> By {
-        By { names: t.artists.clone(), artist: id_uri("artist", t.artist_id).map(|u| (u, t.artists[..t.lead].to_string())) }
+        By { names: t.artists.clone(), artists: artist_links(t) }
     }
 
-    /// A search result or "appears on" card only knows the names: find the first artist's page
-    /// among the album's songs, by a song led by that name.
+    /// One artist's.
+    pub fn one(uri: String, name: String) -> By {
+        By { names: name.clone(), artists: vec![(uri, name)] }
+    }
+
+    /// A search result or "appears on" card only knows the names: find the artists' pages among
+    /// the album's songs, by a song with the same names, else one led by the first.
     pub fn find_artist(&mut self, tracks: &[Track]) {
-        if self.artist.is_some() {
+        if !self.artists.is_empty() {
             return;
         }
-        self.artist = tracks.iter().find_map(|t| {
-            let lead = &t.artists[..t.lead];
-            let named = !lead.is_empty() && self.names.starts_with(lead);
-            named.then(|| id_uri("artist", t.artist_id).map(|u| (u, lead.to_string()))).flatten()
-        });
+        if let Some(t) = tracks.iter().find(|t| t.artists == self.names) {
+            self.artists = artist_links(t);
+        }
+        if self.artists.is_empty() {
+            self.artists = tracks.iter().find_map(|t| {
+                let lead = &t.artists[..t.lead];
+                let named = !lead.is_empty() && self.names.starts_with(lead);
+                named.then(|| id_uri("artist", t.artist_id).map(|u| (u, lead.to_string()))).flatten()
+            }).into_iter().collect();
+        }
     }
+}
+
+/// A song's artists that have a page (uri, name), from the first up to one that doesn't.
+pub fn artist_links(t: &Track) -> Vec<(String, String)> {
+    t.credits().into_iter().map_while(|(n, id)| Some((id_uri("artist", id)?, n.to_string()))).collect()
 }
 
 pub struct View {
@@ -131,6 +147,7 @@ pub struct App {
     pub view: View,
     pub view_seq: u64,                  // last view id handed out
     pub history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row
+    pub ahead: Vec<(View, usize)>,      // and to go forward to again, having gone back (⌘])
     pub grid_cols: std::cell::Cell<usize>, // cards to a line on artist pages, as the window last laid them out
     pub releases: Releases,             // which releases new artist pages list (remembered)
     pub tr_state: Sel,

@@ -34,7 +34,7 @@ rune = { git = "https://github.com/boopdotpng/rune", rev = "e4e97b1d44c3ad6f85e3
 objc2 = "0.5.2"
 block2 = "0.5"
 objc2-foundation = { version = "0.2.2", features = ["block2", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSThread"] }
-objc2-app-kit = { version = "0.2.2", features = ["block2", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSWindow", "NSWorkspace"] }
+objc2-app-kit = { version = "0.2.2", features = ["block2", "NSAppearance", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSWindow", "NSWorkspace"] }
 
 # Local release builds (bundle.sh, `cargo build --release`) are incremental: an edit rebuilds in
 # seconds rather than minutes. Published builds use the dist profile below.

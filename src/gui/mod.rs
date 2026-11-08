@@ -20,10 +20,13 @@ use crate::*;
 mod artist;
 mod icons;
 mod launcher;
+mod menu;
 mod menus;
+mod motion;
 mod panel;
 mod player;
 mod rows;
+mod swipe;
 mod prefs;
 mod view;
 
@@ -106,6 +109,10 @@ pub struct Ui {
     told: Option<Now>, // what the panel last heard
     told_lists: String, // and of the recently played and the playlists, as their uris and names
     seen: (u64, bool, bool, Option<usize>), // view, focus, sidebar, cursor: scrolled to when it moves
+    pub swipe: swipe::Swipe, // two fingers across the trackpad: back or forward
+    pub swipe_back: swipe::Mark,
+    pub swipe_fwd: swipe::Mark,
+    pub menu: Option<menu::Menu>, // the right click's (or a row's "more") menu, while it's open
 }
 
 impl Ui {
@@ -134,6 +141,10 @@ impl Ui {
             told: None,
             told_lists: String::new(),
             seen: (0, false, false, None),
+            swipe: swipe::Swipe::default(),
+            swipe_back: swipe::Mark::new(),
+            swipe_fwd: swipe::Mark::new(),
+            menu: None,
         }
     }
 
@@ -462,6 +473,15 @@ impl Ui {
 
 /// The view's key events, as the player's keys. Typing in a field never gets here.
 fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if ui.menu.is_some() {
+        // a menu's open: esc closes it, and the rest is the menu's (its arrows and return), not
+        // the list's behind it
+        if ev.key == rune::Key::Escape {
+            ui.menu = None;
+            return true;
+        }
+        return false;
+    }
     if ui.prefs.open {
         // the page takes the keys, but for esc and the window's own (⌘Q, ⌘W)
         match &ev.key {
@@ -489,6 +509,15 @@ fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
             true
         }
         rune::Key::Command(c) => match c {
+            // back and forward, as in a browser (esc goes back too)
+            '[' => {
+                ui.app.back();
+                true
+            }
+            ']' => {
+                ui.app.forward();
+                true
+            }
             'f' => {
                 ui.open_find();
                 true
@@ -520,6 +549,11 @@ fn on_key(ui: &mut Ui, ev: &KeyEvent, tx: &mut Tx) -> bool {
             "u" | "\u{15}" => ui.app.on_key(Key::PageUp, false),
             _ => false,
         },
+        // ? alone too: ⌘? can be taken before the window sees it (macOS's own "Show Help menu")
+        rune::Key::Text(s) if s == "?" => {
+            ui.app.help = !ui.app.help;
+            true
+        }
         rune::Key::Text(s) if s == "/" && !ui.app.help => {
             ui.focus_search();
             true
@@ -601,6 +635,8 @@ fn drive(rx: mpsc::Receiver<Msg>, ui: AppHandle<Ui>, wake: Arc<Mutex<Wake>>) {
 /// Run spot: the window (open now if `show`) and the panel. Returns only to quit.
 pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>) {
     let hotkey = app.settings.hotkey.clone();
+    let appearance = app.settings.appearance;
+    crate::theme::set_appearance(appearance);
     let tx = app.tx.clone();
     let rt = app.rt.handle().clone();
     let wake = Arc::new(Mutex::new(Wake::default()));
@@ -674,6 +710,7 @@ pub fn run(app: App, rx: mpsc::Receiver<Msg>, show: bool, lock: Option<fs::File>
 
     let (h, p) = (me.clone(), panel.clone());
     me.update(move |ui, tx| {
+        menus::set_appearance(appearance); // before the window opens, so its title bar starts right
         ui.me = Some(h.clone());
         ui.panel = Some(p.clone());
         if show {
@@ -701,7 +738,7 @@ pub fn problem(e: String) {
     let _ = WHY.set(e);
     fn view(_: &(), cx: &mut rune::Cx<()>) -> rune::El {
         use rune::{col, text, TextStyle};
-        let th = theme(cx.system_dark());
+        let th = theme(crate::theme::dark(cx.system_dark()));
         let why = WHY.get().map_or("", String::as_str);
         col().w_full().h_full().fill(th.bg).padding(36.0).pt(56.0).gap(14.0).window_drag()
             .child(text("spot can't start").font(TextStyle::new(22.0, 650.0)).color(th.text))

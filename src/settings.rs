@@ -14,6 +14,7 @@ const TEMPLATE: &str = "\
 # audio_cache_gb = 1    # played songs kept on disk; 0 turns it off
 # normalize = true      # play every song at about the same loudness
 # hotkey = \"option+space\"  # what opens the quick search, from any app
+# appearance = \"system\"  # \"system\", \"light\" or \"dark\"
 ";
 
 pub struct Settings {
@@ -22,11 +23,34 @@ pub struct Settings {
     pub audio_cache_gb: f64, // played songs kept on disk; 0 = off
     pub normalize: bool, // Spotify's loudness data evens out songs
     pub hotkey: String, // the launcher's, as hotkey() writes it
+    pub appearance: Appearance, // light, dark, or the system's
+}
+
+/// Light or dark: the system's (and following it when it changes), or one of them always.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    /// As config.toml writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Appearance::System => "system",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { client_id: None, quality: 320, audio_cache_gb: 1.0, normalize: true, hotkey: "option+space".into() }
+        Settings { client_id: None, quality: 320, audio_cache_gb: 1.0, normalize: true, hotkey: "option+space".into(), appearance: Appearance::System }
     }
 }
 
@@ -132,6 +156,10 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
                 Some(h) => s.hotkey = h,
                 None => bad.push("hotkey: modifiers and a key, like \"ctrl+option+space\"".into()),
             },
+            ("appearance", v) => match v.as_str().and_then(|a| Appearance::ALL.into_iter().find(|x| x.name() == a)) {
+                Some(a) => s.appearance = a,
+                None => bad.push("appearance: \"system\", \"light\" or \"dark\"".into()),
+            },
             // themes are gone (the accent comes from the playing cover), and so is the now
             // playing popup; old ones are let be
             ("themes" | "popup" | "popup_seconds", _) => {}
@@ -186,7 +214,7 @@ mod tests {
         let d = Settings::default();
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!((s.quality, s.audio_cache_gb), (d.quality, d.audio_cache_gb));
-        assert_eq!((s.normalize, &s.hotkey), (d.normalize, &d.hotkey));
+        assert_eq!((s.normalize, &s.hotkey, s.appearance), (d.normalize, &d.hotkey, d.appearance));
     }
 
     #[test]
@@ -257,6 +285,15 @@ mod tests {
             let (s, errs) = parse(&format!("hotkey = {bad}"));
             assert_eq!((s.hotkey.as_str(), errs.len()), (d.hotkey.as_str(), 1), "{bad}");
         }
+    }
+
+    #[test]
+    fn appearance_is_one_of_three() {
+        let (s, bad) = parse("appearance = \"dark\"\n");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(s.appearance, Appearance::Dark);
+        let (s, bad) = parse("appearance = \"dim\"\n");
+        assert_eq!((s.appearance, bad.len()), (Appearance::System, 1));
     }
 
     #[test]

@@ -2,10 +2,10 @@
 // drags (its fill is the one accent, the cover's color), and the volume, which also takes the
 // scroll wheel. Everything but the song is white or grey and a little faded until hovered.
 
-use rune::{Color, Cursor, El, Phase, Transition, col, el, icon, row, spacer, text};
+use rune::{Color, Cursor, El, Phase, col, el, icon, row, spacer, text};
 
-use super::view::{NUM, SMALL, cover, icon_button, ts};
-use super::{Ui, icons};
+use super::view::{NUM, artist_line, SMALL, cover, icon_button, ts};
+use super::{Ui, icons, motion};
 use crate::*;
 
 pub const PLAYER: f32 = 84.0;
@@ -14,15 +14,15 @@ const VOL_W: f32 = 92.0;
 pub fn player(ui: &Ui, th: &Theme) -> El {
     let a = &ui.app;
     let cur = a.now();
-    // the song, and where it's playing from
-    let now_img = ui.cover.as_ref().filter(|(u, _)| cur.and_then(|t| t.cover.as_ref()) == Some(u)).map(|(_, i)| i);
+    // the song, and where it's playing from. While the next song's cover is on its way the last
+    // one stays, so the new one comes into focus over it rather than over a blank square
+    let now_img = ui.cover.as_ref().filter(|_| cur.is_some_and(|t| t.cover.is_some())).map(|(_, i)| i);
     let art = cover("now-cover".into(), now_img, 52.0, 6.0, th, &icons::NOTE)
         .cursor(Cursor::Pointer).help("Go to playing  o")
         .on_press_tx(|ui: &mut Ui, tx| {
             ui.app.show_queue();
             ui.after(tx);
-        })
-        .transition(Transition::blur_replace());
+        });
     let mut left = row().key("now").w(300.0).gap(14.0).center_y().child(art);
     if let Some(t) = cur {
         let ctx = if a.queued.is_some() { Some("Queue".to_string()) } else { a.queue.as_ref().map(|q| q.name.trim_start_matches(['♥', ' ']).to_string()) };
@@ -34,15 +34,13 @@ pub fn player(ui: &Ui, th: &Theme) -> El {
                 })
                 .child(text(s).font(font).color(c).group_color(hover).truncate())
         };
-        let mut words = col().key("now-words").grow(1.0).shrink().min_w(0.0).gap(2.0)
-            .child(link(format!("now-name-{}", t.uri), t.name.clone(), ts(13.5, 620.0), th.text, th.text.alpha(0.8), "Go to album  a", |ui| {
+        // a new song's name and artists roll up into place as the last one's roll away
+        let mut words = col().key(format!("now-words-{}", t.uri)).transition(motion::roll(10.0)).grow(1.0).shrink().min_w(0.0).gap(2.0)
+            .child(link("now-name".into(), t.name.clone(), ts(13.5, 620.0), th.text, th.text.alpha(0.8), "Go to album  a", |ui| {
                 ui.app.focus = Focus::Playlists; // goto acts on what's playing, not the cursor
                 ui.app.goto_album();
             }))
-            .child(link("now-by".into(), t.artists.clone(), SMALL, th.sub, th.text, "Go to artist  A", |ui| {
-                ui.app.focus = Focus::Playlists;
-                ui.app.goto_artist();
-            }));
+            .child(artist_line("now-by", &t.artists, &artist_links(t), SMALL, th.sub, th.text, "Go to artist  A", |_| {}));
         if let Some(c) = ctx {
             words = words.child(link("now-ctx".into(), c, ts(11.0, 500.0), th.dim, th.sub, "Show where it's playing from  o", |ui| ui.app.show_queue()));
         }
@@ -51,11 +49,14 @@ pub fn player(ui: &Ui, th: &Theme) -> El {
         left = left.child(text("nothing playing").font(SMALL).color(th.dim));
     }
 
-    // transport: modes go white when on, with a dot under them
+    // transport: modes go white when on, with a dot popping up under them
     let mode = |key: &str, i: &'static rune::Icon, on: bool, help: &str, f: fn(&mut Ui)| {
         let b = icon_button(key, i, 16.0, if on { th.text } else { th.dim }, th, help, f);
-        row().key(format!("{key}-wrap")).child(b)
-            .child(el().key("lit").pin(Some(13.0), Some(27.0), None, None).size(4.0, 4.0).radius(2.0).fill(if on { th.text } else { Color::TRANSPARENT }))
+        let mut r = row().key(format!("{key}-wrap")).child(b);
+        if on {
+            r = r.child(el().key("lit").pin(Some(13.0), Some(27.0), None, None).size(4.0, 4.0).radius(2.0).fill(th.text).transition(motion::swap()));
+        }
+        r
     };
     let play_icon = if a.want_play { &icons::PAUSE } else { &icons::PLAY };
     let play = row().key("play").size(34.0, 34.0).radius(17.0).center().fill(th.text.alpha(0.88)).hover(th.text).cursor(Cursor::Pointer).press_scale(0.88)
@@ -64,7 +65,7 @@ pub fn player(ui: &Ui, th: &Theme) -> El {
             ui.app.toggle();
             ui.after(tx);
         })
-        .child(icon(play_icon, 16.0).color(th.bg));
+        .child(icon(play_icon, 16.0).key(if a.want_play { "pause" } else { "play" }).color(th.bg).transition(motion::swap()));
     let repeat_help = match a.repeat {
         Repeat::Off => "Repeat  r",
         Repeat::All => "Repeating the list  r",
@@ -72,7 +73,7 @@ pub fn player(ui: &Ui, th: &Theme) -> El {
     };
     let mut repeat = mode("repeat", &icons::REPEAT, a.repeat != Repeat::Off, repeat_help, |ui| ui.app.cycle_repeat());
     if a.repeat == Repeat::One {
-        repeat = repeat.child(row().key("one").pin(Some(19.0), Some(4.0), None, None).size(11.0, 11.0).radius(5.5).fill(th.text).center()
+        repeat = repeat.child(row().key("one").pin(Some(19.0), Some(4.0), None, None).size(11.0, 11.0).radius(5.5).fill(th.text).center().transition(motion::swap())
             .child(text("1").font(ts(8.0, 800.0)).color(th.bg)));
     }
     let controls = row().key("controls").gap(10.0).center_y()

@@ -13,6 +13,7 @@ pub struct Track {
     pub ms: u64,
     pub album_id: u128, // SpotifyIds for goto album / artist (first artist); 0 = unknown
     pub artist_id: u128,
+    pub more: Vec<(usize, u128)>, // the other artists: each one's name's byte length and id
     pub disc: u32, // disc number on its album; 0 = unknown
     pub number: u32, // track number on its disc; 0 = unknown
     pub explicit: bool,
@@ -24,6 +25,20 @@ pub struct Track {
 impl Track {
     pub fn is_episode(&self) -> bool {
         self.uri.starts_with("spotify:episode:")
+    }
+
+    /// Each artist's name and id (0 = unknown), cut from `artists` by `lead` and `more`. Ends
+    /// early if those don't fit it (lists cached before `more` was kept have only the first).
+    pub fn credits(&self) -> Vec<(&str, u128)> {
+        let Some(first) = self.artists.get(..self.lead).filter(|n| !n.is_empty()) else { return Vec::new() };
+        let mut out = vec![(first, self.artist_id)];
+        let mut at = self.lead;
+        for &(len, id) in &self.more {
+            let Some(name) = self.artists.get(at..).and_then(|r| r.strip_prefix(", ")).and_then(|r| r.get(..len)) else { break };
+            out.push((name, id));
+            at += 2 + len;
+        }
+        out
     }
 }
 

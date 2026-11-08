@@ -20,6 +20,7 @@ its default.
 | `audio_cache_gb` | `1` | `0` or above; decimals work | How much played music to keep on disk, least recently played dropped first. `0` turns the cache off. `SPOT_AUDIO_CACHE_GB` overrides it. |
 | `normalize` | `true` | `true`, `false` | Play every song at about the same loudness, using Spotify's loudness data. |
 | `hotkey` | `"option+space"` | modifiers (`ctrl`, `option`, `cmd`, `shift`) and a key (a letter, digit, `space`, `return`, `tab`, `f1`-`f12`), joined with `+`; f-keys need no modifier | What opens the `⌥Space` search, from any app. Takes effect when spot restarts. |
+| `appearance` | `"system"` | `"system"`, `"light"`, `"dark"` | Light or dark colors. `"system"` follows macOS, and changes with it. Takes effect at once from Settings. |
 
 ```toml
 client_id = "0123456789abcdef0123456789abcdef"
@@ -27,6 +28,7 @@ quality = 320
 audio_cache_gb = 1
 normalize = true
 hotkey = "option+space"
+appearance = "system"
 ```
 
 `client_id` goes above any section, like every key in this table. Installs from before
@@ -34,5 +36,5 @@ config.toml keep theirs in `~/.config/spot/client_id`, which still works.
 
 ## Colors
 
-spot has no themes: the window is near-monochrome, and its one accent comes from the playing
+spot has no color themes (`appearance` above picks only light or dark): the window is near-monochrome, and its one accent comes from the playing
 song's cover. `[themes…]` sections from older versions are ignored.

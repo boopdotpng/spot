@@ -338,6 +338,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },
         view_seq: 0,
         history: vec![],
+        ahead: vec![],
         grid_cols: std::cell::Cell::new(4),
         releases: Releases::All,
         tr_state: Sel::default(),
