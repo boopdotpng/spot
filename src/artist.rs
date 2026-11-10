@@ -1,6 +1,6 @@
 // Artist pages: the overview (popular songs, then the discography and more as cards), every
 // song, and the discography as a grid; `v` cycles them. Cards sit in a grid the keyboard walks
-// by line and by card, as many to a line as the window fits (the window says how many).
+// by line and by card, as many to a line as the terminal fits (ui.rs says how many).
 
 use crate::*;
 
@@ -271,16 +271,16 @@ impl App {
             Section::Releases if self.view.artist.is_none() => {
                 // a search's album: its line starts with whose it is
                 let names = l.sub.split(" · ").next().unwrap_or_default().to_string();
-                self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
+                self.open_album(l.uri, l.name, By { names, artists: Vec::new() });
             }
             Section::Releases => {
                 let name = self.view.artist.clone().unwrap_or_default();
                 let by = By::one(self.view.key.clone(), name);
-                self.open_album(l.uri, l.name, by, None);
+                self.open_album(l.uri, l.name, by);
             }
             Section::Appears => {
                 let names = l.sub.rsplit_once("· ").map_or(l.sub.as_str(), |(_, by)| by).to_string();
-                self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
+                self.open_album(l.uri, l.name, By { names, artists: Vec::new() });
             }
         }
     }
@@ -313,7 +313,7 @@ impl App {
             return self.open_artist(l.uri, l.name);
         }
         let names = l.sub.split(" · ").next().unwrap_or_default().to_string();
-        self.open_album(l.uri, l.name, By { names, artists: Vec::new() }, None);
+        self.open_album(l.uri, l.name, By { names, artists: Vec::new() });
     }
 
     /// The artist page's play: every song they have, shuffled. At once from the cache (and

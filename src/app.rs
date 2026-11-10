@@ -62,7 +62,7 @@ pub struct View {
     pub artist: Option<String>, // artist page (key = artist uri): name, for switching songs/releases
     pub releases: Vec<Link>,    // artist page: every release, of which `links` is the `filter`ed part
     pub filter: Releases,
-    pub want: Option<String>,   // track uri to select once it loads (goto album)
+    pub want: Option<String>,   // episode uri to select once it loads (goto show)
     pub order: Vec<usize>,      // the rows, sorted by date added; empty = as listed (see refilter)
     pub info: Option<Arc<ArtistInfo>>, // an artist's overview: `tracks` is its popular songs shown
     pub portrait: Option<String>, // artist pages: theirs, as last seen
@@ -144,14 +144,15 @@ pub struct App {
     pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
     pub sh_state: Sel,
     pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
-    pub recent: Vec<Link>,   // what was played lately, newest first: the ⌥Space panel's empty bar
     pub view: View,
     pub view_seq: u64,                  // last view id handed out
     pub history: Vec<(View, usize)>,    // views to go back to (esc), with their selected row
-    pub ahead: Vec<(View, usize)>,      // and to go forward to again, having gone back (⌘])
-    pub grid_cols: std::cell::Cell<usize>, // cards to a line on artist pages, as the window last laid them out
+    pub ahead: Vec<(View, usize)>,      // and to go forward to again, having gone back (`]`)
+    pub grid_cols: std::cell::Cell<usize>, // cards to a line on artist pages, as the terminal last laid them out
     pub releases: Releases,             // which releases new artist pages list (remembered)
     pub tr_state: Sel,
+    pub tr_off: usize, // the right pane's first line on screen (the terminal keeps the cursor in view)
+    pub side_off: usize, // and the sidebar's
     pub focus: Focus,
     pub input: Option<String>,
     pub live_search: bool, // the open view is this prompt's results, so the next ones replace it
@@ -184,15 +185,15 @@ pub struct App {
     pub want_play: bool,        // intent, flips immediately (playing lags until the player confirms)
     pub fade_gen: Arc<std::sync::atomic::AtomicU64>, // bumps cancel an in-flight fade
     pub vol_until: Option<Instant>, // volume meter shows until then, after a change
-    pub help: bool,                 // key help on the bottom line
+    pub help: bool,                 // key help at the bottom
     pub lastfm: Option<Arc<LastFm>>,
     pub listen: Option<Listen>, // current play, for scrobbling (only with lastfm)
     pub plays: u64,             // bumped per song started, so `spot watch` can tell plays apart
     pub finished: bool,         // the queue ran out
     pub ctl: ctl::State,
     pub quit: bool,
+    pub terminal: Option<terminal::Display>, // the attached TUI, if one is
     pub art: art::Art,
-    pub show: bool,          // `spot show`: bring the window up
     pub shuffle_on_load: Option<u64>, // a view to shuffle and play once it's all loaded
 }
 
@@ -200,6 +201,15 @@ impl App {
     /// Act on one message from the main loop's channel.
     pub fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Key(k) => self.on_press(k),
+            Msg::Attach(a) => self.attach_terminal(a),
+            Msg::Terminal { id, event } => self.terminal_event(id, event),
+            Msg::Scheme(light) => {
+                LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
+                // the background changed with it: ask for the new one (answered as Msg::Background)
+                self.query_background();
+            }
+            Msg::Background(bg) => BG.store(bg, std::sync::atomic::Ordering::Relaxed),
             Msg::Player(ev) => self.on_player(ev),
             Msg::Playlists(mut p) => {
                 let n = p.len();
@@ -262,7 +272,7 @@ impl App {
                 if self.tr_state.selected().is_none() && !self.view.tracks.is_empty() {
                     self.tr_state.select(Some(0));
                 }
-                // goto album: land on the song we came from
+                // goto show: land on the episode we came from
                 if self.find.is_none()
                     && let Some(w) = &self.view.want
                     && let Some(i) = self.view.tracks.iter().position(|t| &t.uri == w)
@@ -359,8 +369,6 @@ impl App {
             Msg::Loaded(reply, then, list) => self.on_loaded(reply, then, list),
             Msg::Watch(w) => self.watch(w),
             Msg::Art(url, art) => self.on_art(url, art),
-            Msg::Show => self.show = true,
-            Msg::Tick => {}
             Msg::Quit => self.quit = true,
         }
     }

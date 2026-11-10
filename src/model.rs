@@ -193,6 +193,14 @@ pub enum Repeat {
 }
 
 impl Repeat {
+    pub fn name(self) -> &'static str {
+        match self {
+            Repeat::Off => "off",
+            Repeat::All => "all",
+            Repeat::One => "one",
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Repeat::Off => Repeat::All,
@@ -228,13 +236,18 @@ pub struct Hit {
     pub song: Option<Track>,
 }
 
-/// A song (or an episode) as the recently played keep it.
+/// A song (or an episode) as a card: a search's top result.
 pub fn song_link(t: &Track) -> Link {
     let kind = if t.uri.starts_with("spotify:episode:") { "Episode" } else { "Song" };
     Link { uri: t.uri.clone(), name: t.name.clone(), sub: format!("{kind} · {}", t.artists), single: false, image: t.cover.clone() }
 }
 
 pub enum Msg {
+    Key(Press),
+    Attach(terminal::Attachment),
+    Terminal { id: u64, event: terminal::Event },
+    Scheme(bool), // terminal switched color scheme; true = light
+    Background(u32), // terminal's background color (OSC 11 reply)
     Player(PlayerEvent),
     Playlists(Vec<Playlist>),
     Shows(Vec<Link>), // the podcasts the user follows
@@ -251,11 +264,9 @@ pub enum Msg {
     Connected(Result<Session, String>),
     Status(String),
     Ctl(Vec<String>, ctl::Reply), // a `spot <command>` request
-    Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `queue add` named, fetched
+    Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `spot queue` named, fetched
     Watch(ctl::Watcher),
-    Art(String, Option<art::Cover>), // a cover's url, and the image (None: couldn't get it)
-    Show, // `spot` / `spot show`: open the window
-    Tick, // nothing new; a timer is due (or one was just set)
+    Art(String, Option<ratatui_image::protocol::Protocol>), // a cover's url, and it drawn for the terminal
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }
 

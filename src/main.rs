@@ -1,7 +1,7 @@
-// spot: a tiny Spotify player. librespot for audio, the Web API for library and search, Rune for
-// the window. This file: the command line's way in, startup (logins, the player, the threads
-// feeding it) and shutdown. The player lives on the main thread with the window (gui.rs), which
-// keeps running with the window closed; the command line talks to it over a socket (ctl.rs).
+// spot: a tiny Spotify TUI. librespot for audio, the Web API for library and search, ratatui for
+// the UI. This file: the command line's way in, startup (logins, the player, the threads feeding
+// it) and the main loop. The player stays in the background; terminal.rs handles the disposable
+// TUI connections, and the command line talks to it over the same socket (ctl.rs).
 // The imports here are shared by every module (`use crate::*`).
 
 use std::{
@@ -23,6 +23,13 @@ use librespot_playback::{
     mixer::{self, Mixer, MixerConfig},
     player::{Player, PlayerEvent},
 };
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+};
 use serde_json::Value;
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
@@ -30,7 +37,6 @@ mod app;
 mod art;
 mod artist;
 mod fmt;
-mod gui;
 mod auth;
 mod cache;
 mod cli;
@@ -42,7 +48,9 @@ mod metadata;
 mod model;
 mod playback;
 mod settings;
+mod terminal;
 mod theme;
+mod ui;
 mod views;
 mod webapi;
 
@@ -56,6 +64,7 @@ use lists::*;
 use metadata::*;
 use model::*;
 use theme::*;
+use ui::*;
 use webapi::*;
 
 // Each user brings their own Spotify developer app (the shared librespot client id is permanently
@@ -77,7 +86,13 @@ const API: &str = "https://api.spotify.com/v1";
 const SKIP_SETTLE: Duration = Duration::from_millis(500);
 /// View key of the queue (`Q`); has a colon, so it's never a playlist id.
 const QUEUE_KEY: &str = "queue:";
-const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal, or open Spot.app, to log in";
+const NOT_SET_UP: &str = "not set up yet: run `spot` once in a terminal to log in";
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRunLoopRun();
+}
 
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
@@ -94,7 +109,7 @@ pub fn trim_heap() {
 }
 
 /// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log: the player
-/// runs without a terminal. The previous run's log is kept as log.1.
+/// runs without a terminal of its own. The previous run's log is kept as log.1.
 fn init_log() {
     let spec = "info,spot=debug,librespot=debug,symphonia_bundle_mp3=error";
     let path = cache_dir().join("log");
@@ -121,11 +136,10 @@ fn init_log() {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // from a terminal: open the window (starting spot if needed, after any first-run setup);
-        // from Finder or `open`: this is the app
-        None if std::io::stdin().is_terminal() => std::process::exit(cli::open()),
-        None => player(true),
-        Some("--app") if args.len() <= 2 && args.get(1).is_none_or(|a| a == "--show") => player(args.len() == 2),
+        // the TUI, starting the player in the background first if it isn't running
+        None => std::process::exit(terminal::launch()),
+        Some("--headless") if args.len() == 1 => player(),
+        Some("clean") if args.len() == 1 => std::process::exit(clean_cache()),
         Some("-v" | "--version") if args.len() == 1 => println!("spot {}", env!("CARGO_PKG_VERSION")),
         Some(c) if cli::COMMANDS.contains(&c) => std::process::exit(cli::client(args)),
         Some(a) => {
@@ -136,61 +150,89 @@ fn main() {
     }
 }
 
-/// The player, with its window (shown now if `show`). Returns only to quit.
-fn player(show: bool) {
+/// The background player (`spot --headless`, which `spot start` and plain `spot` run detached).
+/// Returns only to quit.
+fn player() {
     // One player at a time: a second would fight the first over the audio session and the
     // resume point. The lock goes when the process does, crash or not.
     let _ = fs::create_dir_all(cache_dir());
-    let lock = match fs::File::create(cache_dir().join("lock")) {
+    let _lock = match fs::File::create(cache_dir().join("lock")) {
         Ok(f) => match f.try_lock() {
             Ok(()) => Some(f),
             Err(fs::TryLockError::WouldBlock) => {
-                // it's running: bring its window up instead
-                if show {
-                    let _ = cli::send(&["show"]);
-                } else {
-                    eprintln!("spot is already running. Control it with `spot status`, `spot play …` (see `spot help`).");
-                }
-                std::process::exit(if show { 0 } else { 1 });
+                eprintln!("spot is already running. Open it with `spot`, or control it with `spot status`, `spot play <uri>` (see `spot help`).");
+                std::process::exit(1);
             }
             Err(_) => None,
         },
         Err(_) => None,
     };
     init_log();
-    rune::prewarm_gpu();
-    match start(false, show) {
-        Ok(Some((app, rx))) => gui::run(app, rx, show, lock),
+    let main_loop = std::thread::spawn(move || match start(false) {
+        Ok(Some((app, rx))) => run(app, rx),
         Ok(None) => {}
         Err(e) => {
             log::error!("exiting: {e}");
             eprintln!("spot: {e}");
-            // opened from Finder there's no terminal to say it in
-            if !std::io::stderr().is_terminal() {
-                gui::problem(e);
-            }
             std::process::exit(1);
         }
+    });
+    // macOS delivers media key / Now Playing commands on the main run loop.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        CFRunLoopRun()
+    };
+    let _ = main_loop.join();
+}
+
+/// macOS sends Control Center the supported commands from the main thread, once: attaching from
+/// another, it snapshots them part way through and the rest stay greyed out for good.
+#[cfg(target_os = "macos")]
+fn on_main<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    dispatch::Queue::main().exec_sync(f)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn on_main<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// The main loop: messages in, the attached terminal (if any) redrawn after each batch.
+fn run(mut app: App, rx: mpsc::Receiver<Msg>) {
+    while !app.quit {
+        app.draw_terminal();
+        // only wake for timers (and the clock while a terminal shows it); otherwise sleep until a message
+        let timeout = app.next_wake(app.terminal.is_some()).map_or(Duration::from_secs(3600), |t| t.saturating_duration_since(Instant::now()));
+        let first = match rx.recv_timeout(timeout) {
+            Ok(m) => Some(m),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(_) => break,
+        };
+        for m in first.into_iter().chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+            app.on_msg(m);
+        }
+        app.tick();
     }
+    app.shutdown()
 }
 
 /// Log in and start the player: the app and the channel it runs on. `setup_only` completes the
-/// interactive first-run approvals in a terminal, then stops (None), before `spot` starts the app.
-/// Call it on the main thread: macOS sends Control Center the supported commands from there, once;
-/// attaching media controls from another, it snapshots them part way and the rest stay greyed out.
-pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, String> {
+/// interactive first-run approvals in a terminal, then stops (None), before `spot` starts the
+/// player in the background.
+pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, String> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    // This thread (the window's, for good) runs inside the runtime from here on, so whatever the
-    // app starts finds it, after this returns too.
+    // This thread (the main loop's, for good) runs inside the runtime from here on, so whatever
+    // the app starts finds it, after this returns too.
     let handle: &'static tokio::runtime::Handle = Box::leak(Box::new(rt.handle().clone()));
     std::mem::forget(handle.enter());
 
     settings::write_template();
     let (mut settings, problems) = settings::load();
+    use_themes(std::mem::take(&mut settings.themes));
     problems.iter().for_each(|p| log::warn!("{p}"));
 
     let dir = cache_dir();
@@ -212,9 +254,8 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
 
     // Web API token: refreshed lazily from the saved refresh token; browser login only the first time.
     let saved = fs::read_to_string(&refresh_path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-    // a terminal, or the window (opened by hand, so a browser tab is expected), can log in;
-    // `spot start` and the login item can't
-    let interactive = std::io::stdin().is_terminal() || window;
+    // a terminal can log in; `spot start` can't
+    let interactive = std::io::stdin().is_terminal();
     let tok = match saved {
         Some(refresh) => Tok { access: String::new(), refresh, exp: Instant::now(), failed_login: None },
         None if !interactive => return Err(NOT_SET_UP.into()),
@@ -287,6 +328,11 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
     rt.spawn(load_playlists(api.clone(), tx.clone()));
     rt.spawn(load_shows(api.clone(), tx.clone()));
 
+    let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
+    if let Some(i) = families().iter().position(|(name, ..)| name == theme.trim()) {
+        FAMILY.store(i, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let mut events = player.get_player_event_channel();
     let ptx = tx.clone();
     rt.spawn(async move {
@@ -313,11 +359,13 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         .ok()
         .and_then(|mut m| {
             let mtx = tx.clone();
-            m.attach(move |ev| {
-                let _ = mtx.send(Msg::Media(ev));
+            on_main(move || {
+                m.attach(move |ev| {
+                    let _ = mtx.send(Msg::Media(ev));
+                })
+                .ok()?;
+                Some(m)
             })
-            .ok()?;
-            Some(m)
         });
 
     let mut app = App {
@@ -339,9 +387,11 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         view_seq: 0,
         history: vec![],
         ahead: vec![],
-        grid_cols: std::cell::Cell::new(4),
+        grid_cols: std::cell::Cell::new(1),
         releases: Releases::All,
         tr_state: Sel::default(),
+        tr_off: 0,
+        side_off: 0,
         focus: Focus::Playlists,
         input: None,
         live_search: false,
@@ -360,7 +410,6 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         cur: None,
         episode: None,
         continuing: read_tracks(&continuing_path()),
-        recent: read_links(&recent_path()),
         progress: read_progress(),
         loaded: false,
         load_at: None,
@@ -382,8 +431,8 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
         finished: false,
         ctl: ctl::State::default(),
         quit: false,
+        terminal: None,
         art: Default::default(),
-        show: false,
         shuffle_on_load: None,
     };
 
@@ -397,7 +446,7 @@ pub fn start(setup_only: bool, window: bool) -> Result<Option<(App, mpsc::Receiv
 
 impl App {
     /// Run the timers that are due: popups and the volume meter going away, a skip settling,
-    /// typing stopping. True when that changed what the window shows.
+    /// typing stopping. True when that changed what the TUI shows.
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
         let mut changed = false;
@@ -436,30 +485,10 @@ impl App {
         next
     }
 
-    /// Quit, and open the window again once this process is gone (it holds the player's lock):
-    /// for settings that only apply at start, and logging in again.
-    pub fn restart(&mut self) -> ! {
-        use std::os::unix::process::CommandExt;
-        if let Ok(exe) = std::env::current_exe() {
-            let r = std::process::Command::new("/bin/sh")
-                .args(["-c", "while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; exec \"$1\" --app --show"])
-                .arg(std::process::id().to_string())
-                .arg(exe)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .process_group(0) // outlives this one, and a login item's job
-                .spawn();
-            if let Err(e) = r {
-                log::warn!("restart: {e}");
-            }
-        }
-        self.shutdown()
-    }
-
     /// Stop: save where it was, send the last scrobble, and exit.
     pub fn shutdown(&mut self) -> ! {
         ctl::unlink();
+        self.detach_terminal();
         self.save_last();
         self.player.stop();
         self.end_listen();

@@ -2,7 +2,7 @@
 
 use crate::*;
 
-/// How long typing has to stop for before searching; the launcher's wait.
+/// How long typing has to stop for before searching.
 const SEARCH_SETTLE: Duration = Duration::from_millis(140);
 
 fn search_key(kind: Option<Kind>, q: &str) -> String {
@@ -12,7 +12,7 @@ fn search_key(kind: Option<Kind>, q: &str) -> String {
 /// The songs, albums and artists a search of everything shows: the top result, five songs, and
 /// a line each of artists and albums (as many as Spotify gives one request).
 fn found(q: &str, v: &Value) -> (Option<Hit>, ArtistInfo) {
-    let m = ctl::mixed(q, v);
+    let m = mixed(q, v);
     let hit = m.top.and_then(|(kind, i)| match kind {
         "track" => parse_track(i).map(|t| Hit { link: song_link(&t), song: Some(t) }),
         _ => parse_link(kind, i).map(|link| Hit { link, song: None }),
@@ -57,7 +57,7 @@ impl App {
         self.returned_to(sel);
     }
 
-    /// Forward again, to the view `back` left (⌘], or a swipe to the left).
+    /// Forward again, to the view `back` left (`]`).
     pub fn forward(&mut self) {
         let Some((v, sel)) = self.ahead.pop() else { return };
         let here = self.selected_track().unwrap_or(0);
@@ -249,9 +249,9 @@ impl App {
     }
 
     /// An album, titled by its name; `by` shows under it (the artist goes to their page).
-    pub fn open_album(&mut self, uri: String, name: String, mut by: By, want: Option<String>) {
+    pub fn open_album(&mut self, uri: String, name: String, mut by: By) {
+        // always at the top, even when it was opened from one of its songs
         let mut v = self.new_view(uri.clone(), name, Kind::Tracks);
-        v.want = want;
         let cached = Arc::new(read_tracks(&tracks_path(&uri_key(&uri))));
         by.find_artist(&cached);
         v.by = Some(by);
@@ -272,7 +272,7 @@ impl App {
             Some(name) => By::one(self.view.key.clone(), name.clone()),
             None => By { names: l.sub.split(" · ").next().unwrap_or_default().to_string(), artists: Vec::new() },
         };
-        self.open_album(l.uri.clone(), l.name.clone(), by, None);
+        self.open_album(l.uri.clone(), l.name.clone(), by);
     }
 
     /// What goto album/artist acts on: the highlighted song, else the one playing.
@@ -292,7 +292,7 @@ impl App {
             return self.goto_show(t);
         }
         let Some(uri) = id_uri("album", t.album_id) else { return };
-        self.open_album(uri, t.album.clone(), By::of(&t), Some(t.uri));
+        self.open_album(uri, t.album.clone(), By::of(&t));
     }
 
     pub fn goto_artist(&mut self) {

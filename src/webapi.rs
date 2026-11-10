@@ -50,6 +50,7 @@ impl Api {
 
     pub async fn get(&self, url: &str) -> Result<Value, String> {
         let mut force = false;
+        let mut last = 0;
         for _ in 0..4 {
             let tok = self.token(force).await?;
             let r = self
@@ -60,6 +61,7 @@ impl Api {
                 .await
                 .map_err(|e| format!("network: {e}"))?;
             let status = r.status().as_u16();
+            last = status;
             match status {
                 200..=299 => {
                     let body = r.text().await.map_err(|e| e.to_string())?;
@@ -84,7 +86,10 @@ impl Api {
                 }
             }
         }
-        Err("request failed after retries".into())
+        Err(match last {
+            401 => "Spotify refused the login (HTTP 401), even after a fresh token".into(),
+            s => format!("Spotify isn't answering (HTTP {s}); try again in a bit"),
+        })
     }
 }
 
@@ -223,6 +228,65 @@ pub async fn search_all(api: &Api, q: &str, n: usize) -> Result<Value, String> {
     api.get(url.as_str()).await.map_err(|e| format!("search: {e}"))
 }
 
+/// Of the first artist, song and album (in that order of preference on a tie), the one the
+/// words name best; the song when none of them matches.
+pub fn top_pick(q: &str, names: [Option<&str>; 3]) -> Option<usize> {
+    let best = names.iter().enumerate().filter_map(|(i, n)| Some((i, match_score(q, (*n)?)))).fold(None, |b: Option<(usize, u8)>, (i, sc)| match b {
+        Some((_, bs)) if bs >= sc => b,
+        _ => Some((i, sc)),
+    });
+    match best {
+        Some((i, sc)) if sc > 0 => Some(i),
+        _ => names[1].is_some().then_some(1).or(names.iter().position(Option::is_some)),
+    }
+}
+
+/// One search's songs, albums and artists, sorted out: the top result (`"artist"`, `"track"` or
+/// `"album"`, and which) is whichever of the first artist, song and album the words name best.
+/// A song or album that's on several releases (a deluxe edition, a single and its album) is
+/// kept once, the first time; the top result isn't repeated after it. Artists far less known
+/// than the best of them are dropped: searching an album's name finds accounts named after it.
+pub struct Mixed<'a> {
+    pub top: Option<(&'static str, &'a Value)>,
+    pub tracks: Vec<&'a Value>,
+    pub albums: Vec<&'a Value>,
+    pub artists: Vec<&'a Value>,
+}
+
+pub fn mixed<'a>(q: &str, v: &'a Value) -> Mixed<'a> {
+    fn items<'a>(v: &'a Value, k: &str) -> Vec<&'a Value> {
+        v[k]["items"].as_array().map(|a| a.iter().collect()).unwrap_or_default()
+    }
+    let (tracks, albums, mut artists) = (items(v, "tracks"), items(v, "albums"), items(v, "artists"));
+    let fame = |i: &Value| i["popularity"].as_u64();
+    if let Some(best) = artists.iter().filter_map(|i| fame(i)).max() {
+        artists.retain(|i| fame(i).is_none_or(|p| p * 4 >= best));
+    }
+    // the same song or album: its name and its artists'
+    let same = |i: &Value| {
+        let by: Vec<String> = i["artists"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).map(str::to_lowercase).collect()).unwrap_or_default();
+        format!("{}\t{}", i["name"].as_str().unwrap_or("").trim().to_lowercase(), by.join(", "))
+    };
+    let mut seen = HashSet::new();
+    let mut fresh = |kind: &str, i: &Value| seen.insert(format!("{kind}\t{}", same(i)));
+    fn name<'a>(l: &[&'a Value]) -> Option<&'a str> {
+        l.first().and_then(|i| i["name"].as_str())
+    }
+    let top = match top_pick(q, [name(&artists), name(&tracks), name(&albums)]) {
+        Some(0) => Some(("artist", artists[0])),
+        Some(1) => Some(("track", tracks[0])),
+        Some(2) => Some(("album", albums[0])),
+        _ => None,
+    };
+    if let Some((kind, i)) = top {
+        fresh(kind, i);
+    }
+    let tracks = tracks.into_iter().filter(|i| fresh("track", i)).collect();
+    let albums = albums.into_iter().filter(|i| fresh("album", i)).collect();
+    let artists = artists.into_iter().filter(|i| fresh("artist", i)).collect();
+    Mixed { top, tracks, albums, artists }
+}
+
 /// Search Spotify for `n` results of a type (track, album, artist, playlist, show or episode), each page handed
 /// to `page` as it comes, with whether it's the last. Dev-mode apps get 10 results per call.
 pub async fn search(api: &Api, q: &str, ty: &str, n: usize, mut page: impl FnMut(&[Value], bool)) -> Result<(), String> {
@@ -243,4 +307,23 @@ pub async fn search(api: &Api, q: &str, ty: &str, n: usize, mut page: impl FnMut
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_top_result_is_what_the_words_name() {
+        let names = [Some("The Weeknd"), Some("Blinding Lights"), Some("After Hours")];
+        assert_eq!(top_pick("the weeknd", names), Some(0));
+        assert_eq!(top_pick("weeknd", names), Some(0));
+        assert_eq!(top_pick("blinding", names), Some(1));
+        assert_eq!(top_pick("after hours", names), Some(2));
+        assert_eq!(top_pick("something else", names), Some(1));
+        // a single shares its song's name: the song
+        assert_eq!(top_pick("blinding lights", [Some("Nobody"), Some("Blinding Lights"), Some("Blinding Lights")]), Some(1));
+        assert_eq!(top_pick("x", [Some("Artist"), None, None]), Some(0));
+        assert_eq!(top_pick("x", [None, None, None]), None);
+    }
 }

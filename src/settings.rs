@@ -13,8 +13,10 @@ const TEMPLATE: &str = "\
 # quality = 320         # 96, 160 or 320 kbps
 # audio_cache_gb = 1    # played songs kept on disk; 0 turns it off
 # normalize = true      # play every song at about the same loudness
-# hotkey = \"option+space\"  # what opens the quick search, from any app
-# appearance = \"system\"  # \"system\", \"light\" or \"dark\"
+
+# Your own colors for the TUI: change a built-in theme, or add one to ctrl+t.
+# [themes.moss.dark]
+# accent = \"#88cc55\"
 ";
 
 pub struct Settings {
@@ -22,35 +24,12 @@ pub struct Settings {
     pub quality: u16, // kbps: 96, 160 or 320
     pub audio_cache_gb: f64, // played songs kept on disk; 0 = off
     pub normalize: bool, // Spotify's loudness data evens out songs
-    pub hotkey: String, // the launcher's, as hotkey() writes it
-    pub appearance: Appearance, // light, dark, or the system's
-}
-
-/// Light or dark: the system's (and following it when it changes), or one of them always.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Appearance {
-    #[default]
-    System,
-    Light,
-    Dark,
-}
-
-impl Appearance {
-    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
-
-    /// As config.toml writes it.
-    pub fn name(self) -> &'static str {
-        match self {
-            Appearance::System => "system",
-            Appearance::Light => "light",
-            Appearance::Dark => "dark",
-        }
-    }
+    pub themes: Vec<Family>, // added to the built-in ones, or replacing them by name
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { client_id: None, quality: 320, audio_cache_gb: 1.0, normalize: true, hotkey: "option+space".into(), appearance: Appearance::System }
+        Settings { client_id: None, quality: 320, audio_cache_gb: 1.0, normalize: true, themes: vec![] }
     }
 }
 
@@ -88,51 +67,6 @@ fn with_client_id(text: &str, id: &str) -> String {
     format!("client_id = \"{id}\"\n\n{text}")
 }
 
-/// Save one setting from the settings page, keeping the rest of the file: `value` is TOML (a
-/// string in quotes), or None to drop the line and go back to the default.
-pub fn set(key: &str, value: Option<&str>) -> Result<(), String> {
-    let text = fs::read_to_string(path()).unwrap_or_else(|_| TEMPLATE.into());
-    fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
-    fs::write(path(), with_key(&text, key, value)).map_err(|e| e.to_string())
-}
-
-pub fn quoted(s: &str) -> String {
-    Value::String(s.into()).to_string()
-}
-
-/// The file with `key` set: its line replaced (or its commented-out one from the template), else
-/// a new one at the top, above any [section] it would otherwise belong to.
-fn with_key(text: &str, key: &str, value: Option<&str>) -> String {
-    let names = |l: &str| l.strip_prefix(key).is_some_and(|r| r.trim_start().starts_with('='));
-    let mut section = false;
-    let mut lines: Vec<(bool, bool, &str)> = vec![]; // (top level, commented out, line)
-    for l in text.lines() {
-        let t = l.trim_start();
-        section |= t.starts_with('[');
-        let off = t.strip_prefix('#').map(str::trim_start);
-        lines.push((!section && names(off.unwrap_or(t)), off.is_some(), l));
-    }
-    let set = |out: &mut Vec<String>| value.map(|v| out.push(format!("{key} = {v}")));
-    let active = lines.iter().any(|(k, off, _)| *k && !off);
-    let mut done = value.is_none();
-    let mut out = vec![];
-    for (k, off, l) in lines {
-        // the live line, or else the template's commented-out one, takes the value; others stay
-        if k && (!off || !active) && !done {
-            set(&mut out);
-            done = true;
-        } else if !(k && !off) {
-            out.push(l.to_string());
-        }
-    }
-    if !done {
-        let mut top = vec![];
-        set(&mut top);
-        out.splice(0..0, top);
-    }
-    out.join("\n") + "\n"
-}
-
 fn parse(text: &str) -> (Settings, Vec<String>) {
     let mut s = Settings::default();
     let mut bad = vec![];
@@ -152,17 +86,16 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
             },
             ("normalize", Value::Boolean(b)) => s.normalize = *b,
             ("normalize", _) => bad.push("normalize: true or false".into()),
-            ("hotkey", v) => match v.as_str().and_then(hotkey) {
-                Some(h) => s.hotkey = h,
-                None => bad.push("hotkey: modifiers and a key, like \"ctrl+option+space\"".into()),
-            },
-            ("appearance", v) => match v.as_str().and_then(|a| Appearance::ALL.into_iter().find(|x| x.name() == a)) {
-                Some(a) => s.appearance = a,
-                None => bad.push("appearance: \"system\", \"light\" or \"dark\"".into()),
-            },
-            // themes are gone (the accent comes from the playing cover), and so is the now
-            // playing popup; old ones are let be
-            ("themes" | "popup" | "popup_seconds", _) => {}
+            ("themes", Value::Table(themes)) => {
+                for (name, t) in themes {
+                    match t {
+                        Value::Table(t) => s.themes.push(custom_theme(name, t, &mut bad)),
+                        _ => bad.push(format!("themes.{name}: not a table")),
+                    }
+                }
+            }
+            // settings of spot's window, and of the old ⌥Space launcher: let be
+            ("hotkey" | "appearance" | "popup" | "popup_seconds", _) => {}
             _ => bad.push(format!("unknown setting {key}")),
         }
     }
@@ -170,33 +103,41 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
     (s, bad)
 }
 
-/// A hotkey spot can register, written one way: its modifiers in a fixed order, then the
-/// key (a letter, digit, space, return, tab or f1-f12). Only f-keys work without a modifier.
-pub fn hotkey(s: &str) -> Option<String> {
-    let s = s.to_lowercase();
-    let mut parts: Vec<&str> = s.split('+').map(str::trim).collect();
-    let key = parts.pop()?;
-    let f_key = key.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()).is_some_and(|n| (1..=12).contains(&n));
-    let single = key.len() == 1 && key.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    if !(f_key || single || matches!(key, "space" | "return" | "tab")) {
-        return None;
+/// A theme's colors over the built-in of that name, or desert's for a new one. A new theme with
+/// no `light` uses its dark colors for both.
+fn custom_theme(name: &str, t: &Table, bad: &mut Vec<String>) -> Family {
+    let builtin = FAMILIES.iter().find(|f| f.0 == name);
+    let base = builtin.unwrap_or(&FAMILIES[0]);
+    let (mut dark, mut light) = (base.1, base.2);
+    for (key, v) in t {
+        match (key.as_str(), v) {
+            ("dark", Value::Table(c)) => colors(name, key, c, &mut dark, bad),
+            ("light", Value::Table(c)) => colors(name, key, c, &mut light, bad),
+            _ => bad.push(format!("themes.{name}: expected [themes.{name}.dark] or .light, not {key}")),
+        }
     }
-    let mut mods = [false; 4]; // ctrl, option, cmd, shift
-    for m in parts {
-        let i = match m {
-            "ctrl" | "control" => 0,
-            "option" | "opt" | "alt" => 1,
-            "cmd" | "command" => 2,
-            "shift" => 3,
-            _ => return None,
+    if builtin.is_none() && !t.contains_key("light") {
+        light = dark;
+    }
+    (name.to_string(), dark, light)
+}
+
+fn colors(name: &str, mode: &str, t: &Table, palette: &mut [u32; 10], bad: &mut Vec<String>) {
+    for (key, v) in t {
+        let Some(i) = COLOR_NAMES.iter().position(|c| c == key) else {
+            bad.push(format!("themes.{name}.{mode}: unknown color {key}"));
+            continue;
         };
-        mods[i] = true;
+        match v.as_str().and_then(hex) {
+            Some(c) => palette[i] = c,
+            None => bad.push(format!("themes.{name}.{mode}.{key}: a color like \"#d0924a\"")),
+        }
     }
-    if !f_key && !mods.contains(&true) {
-        return None;
-    }
-    let names = ["ctrl", "option", "cmd", "shift"].iter().zip(mods).filter(|(_, on)| *on).map(|(n, _)| *n);
-    Some(names.chain([key]).collect::<Vec<_>>().join("+"))
+}
+
+fn hex(s: &str) -> Option<u32> {
+    let h = s.strip_prefix('#')?;
+    if h.len() == 6 { u32::from_str_radix(h, 16).ok() } else { None }
 }
 
 #[cfg(test)]
@@ -214,7 +155,8 @@ mod tests {
         let d = Settings::default();
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!((s.quality, s.audio_cache_gb), (d.quality, d.audio_cache_gb));
-        assert_eq!((s.normalize, &s.hotkey, s.appearance), (d.normalize, &d.hotkey, d.appearance));
+        assert_eq!(s.normalize, d.normalize);
+        assert_eq!(s.themes.len(), 1);
     }
 
     #[test]
@@ -223,24 +165,6 @@ mod tests {
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(s.client_id.as_deref(), Some("abc123"));
         assert_eq!(s.quality, 160);
-    }
-
-    #[test]
-    fn settings_page_edits_keep_the_rest() {
-        let t = with_key(TEMPLATE, "quality", Some("160"));
-        assert!(t.contains("\nquality = 160\n") && !t.contains("# quality"), "{t}");
-        assert_eq!(parse(&t).0.quality, 160);
-        let t = with_key(&t, "quality", Some("96"));
-        assert_eq!(t.matches("quality =").count(), 1);
-        let t = with_key(&t, "audio_cache_gb", Some("2"));
-        assert_eq!(parse(&t).0.audio_cache_gb, 2.0);
-        let t = with_key(&t, "quality", None);
-        assert_eq!(parse(&t).0.quality, 320);
-        // no line for it at all: it goes on top, above any section
-        let t = with_key("[themes.mine.dark]\naccent = \"#112233\"\n", "normalize", Some("false"));
-        let (s, bad) = parse(&t);
-        assert!(bad.is_empty(), "{bad:?}");
-        assert!(!s.normalize);
     }
 
     #[test]
@@ -271,36 +195,51 @@ mod tests {
     }
 
     #[test]
-    fn normalize_and_hotkey() {
-        let d = Settings::default();
-        assert!(d.normalize);
+    fn normalize() {
+        assert!(Settings::default().normalize);
         assert!(!parse("normalize = false").0.normalize);
         assert_eq!(parse("normalize = 1").1.len(), 1);
-        assert_eq!(parse("hotkey = \"Space + ALT + Cmd\"").1.len(), 1); // the key goes last
-        assert_eq!(parse("hotkey = \"Cmd + ALT + Space\"").0.hotkey, "option+cmd+space");
-        assert_eq!(parse("hotkey = \"control+shift+m\"").0.hotkey, "ctrl+shift+m");
-        assert_eq!(parse("hotkey = \"f13\"").1.len(), 1);
-        assert_eq!(parse("hotkey = \"f5\"").0.hotkey, "f5");
-        for bad in ["\"space\"", "\"m\"", "\"hyper+space\"", "\"option+\"", "\"option+pgup\"", "3"] {
-            let (s, errs) = parse(&format!("hotkey = {bad}"));
-            assert_eq!((s.hotkey.as_str(), errs.len()), (d.hotkey.as_str(), 1), "{bad}");
-        }
     }
 
     #[test]
-    fn appearance_is_one_of_three() {
-        let (s, bad) = parse("appearance = \"dark\"\n");
+    fn window_and_launcher_settings_are_let_be() {
+        let (_, bad) = parse("hotkey = \"option+space\"\nappearance = \"dark\"\npopup = \"off\"\npopup_seconds = 5\n");
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!(s.appearance, Appearance::Dark);
-        let (s, bad) = parse("appearance = \"dim\"\n");
-        assert_eq!((s.appearance, bad.len()), (Appearance::System, 1));
     }
 
     #[test]
-    fn old_themes_are_let_be() {
-        let (_, bad) = parse("[themes.moss.dark]\naccent = \"#112233\"\n");
+    fn a_theme_overrides_only_what_it_names() {
+        let (s, bad) = parse("[themes.moss.dark]\naccent = \"#112233\"\n");
         assert!(bad.is_empty(), "{bad:?}");
-        let (_, bad) = parse("popup = \"off\"\npopup_seconds = 5\n"); // the popup's gone too
-        assert!(bad.is_empty(), "{bad:?}");
+        let moss = FAMILIES.iter().find(|f| f.0 == "moss").unwrap();
+        let (name, dark, light) = &s.themes[0];
+        assert_eq!(name, "moss");
+        assert_eq!(dark[0], 0x112233);
+        assert_eq!(dark[1..], moss.1[1..]);
+        assert_eq!(*light, moss.2);
+    }
+
+    #[test]
+    fn a_new_theme_without_light_uses_dark() {
+        let (s, _) = parse("[themes.mine.dark]\nerr = \"#ff0000\"\n");
+        let (_, dark, light) = &s.themes[0];
+        assert_eq!(dark[9], 0xff0000);
+        assert_eq!(dark, light);
+    }
+
+    #[test]
+    fn bad_colors_are_reported() {
+        let (s, bad) = parse("[themes.mine.dark]\naccent = \"red\"\nfoo = \"#000000\"\n");
+        assert_eq!(bad.len(), 2, "{bad:?}");
+        assert_eq!(s.themes[0].1[0], FAMILIES[0].1[0]);
+    }
+
+    #[test]
+    fn config_themes_join_the_built_in_ones() {
+        let (s, _) = parse("[themes.mine.dark]\n[themes.moss.dark]\naccent = \"#112233\"\n");
+        let all = merged(s.themes);
+        assert_eq!(all.len(), FAMILIES.len() + 1);
+        assert_eq!(all.iter().find(|f| f.0 == "moss").unwrap().1[0], 0x112233);
+        assert_eq!(all.last().unwrap().0, "mine");
     }
 }

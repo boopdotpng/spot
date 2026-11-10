@@ -1,6 +1,6 @@
-// Keyboard: what each key does. The window turns its key events into `Key`s; typing in the
-// search and find fields arrives as their text (set_search, set_find), the keys that aren't
-// typing (enter, esc, tab, arrows) as `Key`s.
+// Keyboard: reading keys from the terminal, and what each one does. Typing in the search and
+// find prompts edits their text (set_search, set_find); the keys that aren't typing (enter, esc,
+// tab, arrows) go to on_search_key / on_find_key, and the rest to on_key.
 
 use crate::*;
 
@@ -22,7 +22,85 @@ pub enum Key {
     Backspace,
 }
 
+/// A key from the terminal, and whether ctrl was held.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Press {
+    pub key: Key,
+    pub ctrl: bool,
+}
+
+const DETACHED: &str = "detached; `spot` brings it back";
+
 impl App {
+    /// A key from the terminal: the prompts' typing, keys only the TUI has, then on_key.
+    pub fn on_press(&mut self, Press { key: k, ctrl }: Press) {
+        // wherever you are: like closing the terminal, not like q
+        if ctrl && k == Key::Char('c') {
+            return self.detach_terminal_saying(DETACHED);
+        }
+        if let Some(mut text) = self.find.clone() {
+            match k {
+                Key::Char('n') if ctrl => self.move_sel(1),
+                Key::Char('p') if ctrl => self.move_sel(-1),
+                Key::Backspace => {
+                    text.pop();
+                    self.set_find(&text);
+                }
+                Key::Char(c) if !ctrl => {
+                    text.push(c);
+                    self.set_find(&text);
+                }
+                _ => {
+                    self.on_find_key(k);
+                }
+            }
+            return;
+        }
+        if let Some(mut text) = self.input.clone() {
+            match k {
+                Key::Backspace => {
+                    text.pop();
+                    self.set_search(&text);
+                }
+                Key::Char(c) if !ctrl => {
+                    text.push(c);
+                    self.set_search(&text);
+                }
+                _ => {
+                    self.on_search_key(k);
+                }
+            }
+            return;
+        }
+        if self.help {
+            // any key closes the key help
+            self.help = false;
+            return;
+        }
+        self.status.clear();
+        match k {
+            Key::Char('q') if !ctrl => self.quit = true,
+            Key::Char('d') if !ctrl => self.detach_terminal_saying(DETACHED),
+            Key::Char('/') if !ctrl => self.input = Some(String::new()),
+            Key::Char('?') => self.help = true,
+            Key::Char('t') if ctrl => self.flash(format!("theme: {}", cycle_family())),
+            Key::Char('f') if ctrl => self.set_find(""),
+            Key::Char('d') if ctrl => self.move_sel(15),
+            Key::Char('u') if ctrl => self.move_sel(-15),
+            Key::Char('[') => self.back(),
+            Key::Char(']') => self.forward(),
+            Key::Char('*') if self.focus == Focus::Playlists && !self.podcasts => {
+                if let Some(i) = self.pl_state.selected() {
+                    self.toggle_pin(i);
+                }
+            }
+            _ if ctrl => {}
+            _ => {
+                self.on_key(k, false);
+            }
+        }
+    }
+
     /// The find field's text changed.
     pub fn set_find(&mut self, text: &str) {
         self.focus = Focus::Tracks;
@@ -101,17 +179,17 @@ impl App {
         self.search_at = Some(Instant::now()); // nothing being typed to wait for
     }
 
-    /// A key while no field has the keyboard. `cmd` is ⌘ (or ⌃) held. True when it did something.
+    /// A key while no prompt has the keyboard. `cmd`: a modifier was held. True when it did something.
     pub fn on_key(&mut self, k: Key, cmd: bool) -> bool {
         if self.help {
             // any key closes the key help
             self.help = false;
             return true;
         }
-        self.status.clear();
         match k {
             _ if cmd => return false,
-            Key::Char('d') if self.dated() => self.set_sort(self.sort.next()),
+            Key::Char('S') if self.dated() => self.set_sort(self.sort.next()),
+            Key::Char('S') => self.flash("S sorts playlists by date added"),
             // cards: left and right go card to card, up and down line to line
             Key::Left | Key::Char('h') if self.focus == Focus::Tracks && self.grid_move(-1, 0) == Some(true) => {}
             Key::Right | Key::Char('l') if self.focus == Focus::Tracks && self.grid_move(1, 0).is_some() => {}
@@ -159,7 +237,7 @@ impl App {
         true
     }
 
-    /// Enter (or a double click): open the sidebar's list, or play / open the row.
+    /// Enter: open the sidebar's list, or play / open the row.
     pub fn enter(&mut self) {
         match self.focus {
             Focus::Playlists if self.podcasts => {
@@ -180,5 +258,127 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// Parse raw terminal input. Crossterm's reader can't be used: it treats the terminal's color
+/// scheme report (`CSI ? 997 ; 1|2 n`) as an unfinished sequence and swallows the keys after it.
+pub fn parse_input(b: &[u8]) -> Vec<Msg> {
+    let key = |key| Msg::Key(Press { key, ctrl: false });
+    let ctrl = |c: u8| Msg::Key(Press { key: Key::Char(c as char), ctrl: true });
+    let mut out = vec![];
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            // a lone ESC at the end of a read is the Esc key; otherwise it starts a sequence
+            0x1b if i + 1 == b.len() => {
+                out.push(key(Key::Esc));
+                i += 1;
+            }
+            0x1b => match b[i + 1] {
+                b'[' => {
+                    let start = i + 2;
+                    let Some(len) = b[start..].iter().position(|c| (0x40..=0x7e).contains(c)) else { break };
+                    let (params, fin) = (&b[start..start + len], b[start + len]);
+                    i = start + len + 1;
+                    let first = params.split(|&c| c == b';').next().unwrap_or(b"");
+                    out.extend(match (fin, first) {
+                        (b'A', _) => Some(key(Key::Up)),
+                        (b'B', _) => Some(key(Key::Down)),
+                        (b'C', _) => Some(key(Key::Right)),
+                        (b'D', _) => Some(key(Key::Left)),
+                        (b'H', _) | (b'~', b"1" | b"7") => Some(key(Key::Home)),
+                        (b'F', _) | (b'~', b"4" | b"8") => Some(key(Key::End)),
+                        (b'~', b"5") => Some(key(Key::PageUp)),
+                        (b'~', b"6") => Some(key(Key::PageDown)),
+                        (b'Z', _) => Some(key(Key::BackTab)),
+                        (b'n', _) if params == b"?997;1" || params == b"?997;2" => {
+                            Some(Msg::Scheme(params == b"?997;2"))
+                        }
+                        _ => None,
+                    });
+                }
+                b'O' if i + 2 < b.len() => {
+                    out.extend(match b[i + 2] {
+                        b'A' => Some(key(Key::Up)),
+                        b'B' => Some(key(Key::Down)),
+                        b'C' => Some(key(Key::Right)),
+                        b'D' => Some(key(Key::Left)),
+                        b'H' => Some(key(Key::Home)),
+                        b'F' => Some(key(Key::End)),
+                        _ => None,
+                    });
+                    i += 3;
+                }
+                // OSC: the background color we ask for when the scheme changes; skip anything else
+                b']' => {
+                    i += 2;
+                    let start = i;
+                    while i < b.len() && b[i] != 0x07 && !(b[i] == 0x1b && b.get(i + 1) == Some(&b'\\')) {
+                        i += 1;
+                    }
+                    out.extend(parse_bg_reply(&b[start..i]).map(Msg::Background));
+                    i += if b.get(i) == Some(&0x1b) { 2 } else { 1 };
+                }
+                // Alt+key: unused, drop both bytes
+                _ => i += 2,
+            },
+            b'\r' | b'\n' => {
+                out.push(key(Key::Enter));
+                i += 1;
+            }
+            b'\t' => {
+                out.push(key(Key::Tab));
+                i += 1;
+            }
+            0x7f | 0x08 => {
+                out.push(key(Key::Backspace));
+                i += 1;
+            }
+            c @ 0x01..=0x1a => {
+                out.push(ctrl(b'a' + c - 1));
+                i += 1;
+            }
+            c if c < 0x20 => i += 1,
+            c => {
+                let len = match c {
+                    0xf0.. => 4,
+                    0xe0.. => 3,
+                    0xc0.. => 2,
+                    _ => 1,
+                };
+                if let Some(ch) = b.get(i..i + len).and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.chars().next()) {
+                    out.push(key(Key::Char(ch)));
+                }
+                i += len;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(b: &[u8]) -> Vec<(Key, bool)> {
+        parse_input(b).into_iter().filter_map(|m| match m {
+            Msg::Key(p) => Some((p.key, p.ctrl)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn reads_keys_arrows_and_ctrl() {
+        assert_eq!(keys(b"j\x1b[A\x06\r\t\x7f"), [(Key::Char('j'), false), (Key::Up, false), (Key::Char('f'), true), (Key::Enter, false), (Key::Tab, false), (Key::Backspace, false)]);
+        assert_eq!(keys(b"\x1b"), [(Key::Esc, false)]);
+        assert_eq!(keys("é".as_bytes()), [(Key::Char('é'), false)]);
+    }
+
+    #[test]
+    fn color_scheme_reports_dont_eat_keys() {
+        let m = parse_input(b"\x1b[?997;2nq");
+        assert!(matches!(m[0], Msg::Scheme(true)));
+        assert!(matches!(m[1], Msg::Key(Press { key: Key::Char('q'), ctrl: false })));
     }
 }

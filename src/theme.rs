@@ -1,211 +1,210 @@
-// Colors: one near-monochrome palette, light and dark, and a single accent taken from the
-// playing song's cover. The covers are the color in the window: the surfaces lean a hair toward
-// the playing cover's hue, so the window warms or cools with each song, and the accent marks
-// what's playing (its row, its playlist, the play button) and how far through it is.
+// Colors: the theme families, light / dark, and the terminal's own background.
 
-use rune::Color;
-use crate::settings::Appearance;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering::Relaxed};
+use crate::*;
 
-/// The window's colors, light or dark.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// One palette per theme family and light/dark; ANSI fallback without truecolor.
 pub struct Theme {
-    pub accent: Color, // what's playing, and the bar's fill: the cover's color, quietened
-    pub text: Color,   // a warm off-white (or near-black)
+    pub accent: Color,  // focus, playing
+    pub accent2: Color, // context name
+    pub deep: Color,    // unfocused selection, progress track
+    pub hl: Color,      // focused selection background
+    pub text: Color,
     pub sub: Color,
-    pub dim: Color, // numbers, durations, column heads
+    pub dim: Color, // borders, durations
+    pub gold: Color, // shuffle / repeat / prompt labels
+    pub pink: Color, // Liked Songs
     pub err: Color,
-    pub bg: Color,     // the window
-    pub side: Color,   // the sidebar and the player: a hair off the window
-    pub raised: Color, // fields, cards, menus
-    pub line: Color,   // hairlines between regions
-    pub wash: Color,   // quiet fills: empty covers, tracks of bars, the keyboard's cursor
-    pub sel: Color,    // the open list in the sidebar, the selected row: a lighter surface
-    pub dark: bool,
 }
 
-/// The playing cover's color as 0x01RRGGBB (sRGB), or 0 with nothing playing.
-static ART: AtomicU32 = AtomicU32::new(0);
+/// Ask the terminal for its background (OSC 11): sets BG, and LIGHT unless `SPOT_THEME=light|dark`
+/// forces it. Must run before the input thread starts reading stdin, or it eats the reply.
+pub fn probe_terminal() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use terminal_colorsaurus::{QueryOptions, ThemeMode, color_palette};
+    let p = color_palette(QueryOptions::default()).ok();
+    if let Some(p) = &p {
+        let (r, g, b) = p.background.scale_to_8bit();
+        BG.store(u32::from_be_bytes([0, r, g, b]), Relaxed);
+    }
+    let light = match std::env::var("SPOT_THEME").as_deref() {
+        Ok("light") => true,
+        Ok("dark") => false,
+        _ => p.is_some_and(|p| p.theme_mode() == ThemeMode::Light),
+    };
+    LIGHT.store(light, Relaxed);
+}
 
-/// The playing cover's color (sRGB 0..1), or None: the accent follows it.
-pub fn set_art(tint: Option<[f32; 3]>) {
-    let v = tint.map_or(0, |[r, g, b]| {
-        let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
-        0x0100_0000 | c(r) << 16 | c(g) << 8 | c(b)
+/// Terminal background as 0xRRGGBB; NO_BG until the terminal tells us.
+pub static BG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(NO_BG);
+pub const NO_BG: u32 = u32::MAX;
+
+/// `a` moved `t` of the way toward `b` (0xRRGGBB).
+pub fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as f32;
+    [16, 8, 0].iter().fold(0, |acc, &sh| acc | (((ch(a, sh) + (ch(b, sh) - ch(a, sh)) * t).round() as u32) << sh))
+}
+
+pub fn rgb_hex(c: Color) -> Option<u32> {
+    match c {
+        Color::Rgb(r, g, b) => Some(u32::from_be_bytes([0, r, g, b])),
+        _ => None,
+    }
+}
+
+pub fn bg_hex() -> Option<u32> {
+    Some(BG.load(std::sync::atomic::Ordering::Relaxed)).filter(|&b| b != NO_BG)
+}
+
+pub fn hex_rgb(h: u32) -> Color {
+    Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8)
+}
+
+/// Background for the sidebar and player bar: the terminal's own background nudged a few percent
+/// toward the theme's text color. None without truecolor or a known background (no tint then).
+pub fn panel(th: &Theme) -> Option<u32> {
+    let light = LIGHT.load(std::sync::atomic::Ordering::Relaxed);
+    Some(mix(bg_hex()?, rgb_hex(th.text)?, if light { 0.045 } else { 0.06 }))
+}
+
+/// OSC 11 reply body, `11;rgb:RRRR/GGGG/BBBB` (1-4 hex digits per channel), as 0xRRGGBB.
+pub fn parse_bg_reply(body: &[u8]) -> Option<u32> {
+    let rest = std::str::from_utf8(body).ok()?.strip_prefix("11;rgb:")?;
+    let mut out = 0;
+    for part in rest.split('/') {
+        if !(1..=4).contains(&part.len()) {
+            return None;
+        }
+        let max = (1u32 << (4 * part.len())) - 1;
+        out = (out << 8) | (u32::from_str_radix(part, 16).ok()? * 255 / max);
+    }
+    Some(out)
+}
+
+/// Current light/dark mode; flipped live when the terminal reports a color scheme change.
+pub static LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Index into families(), cycled with ctrl+t and remembered in the cache dir.
+pub static FAMILY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Theme families as (name, dark, light). Each palette is
+/// [accent, accent2, deep, hl, text, sub, dim, gold, pink, err] (see Theme).
+pub const FAMILIES: [(&str, [u32; 10], [u32; 10]); 7] = [
+    // muted desert sunset: amber sky, dusky mountains, dark scrub; at midday for light
+    ("desert",
+     [0xd0924a, 0xb08a66, 0x2e2722, 0x5c4128, 0xd6c8b4, 0x8f8679, 0x4f4a55, 0xd9b066, 0xa58b98, 0xc26a50],
+     [0xa8621c, 0x8a6440, 0xe8dfd3, 0xf0d3a8, 0x3a3029, 0x6e655a, 0xa39a90, 0x9a7014, 0x8f5f78, 0xb0472f]),
+    // shallow water: teal, slate blue, coral reef
+    ("lagoon",
+     [0x4fb3a9, 0x7fa8b8, 0x1d2b2e, 0x1f4a4c, 0xcfdcda, 0x7f9796, 0x3f5256, 0xe39a7b, 0xd98ba0, 0xe0685e],
+     [0x16857c, 0x3f6f86, 0xdcebea, 0xbfe3df, 0x23393b, 0x56706f, 0x9db3b2, 0xc0623f, 0xb4506e, 0xc23b30]),
+    // forest floor: sage, lichen, wild plum
+    ("moss",
+     [0x9cbf6b, 0xb5a77a, 0x262b22, 0x3d4a2c, 0xd8dccb, 0x8d9581, 0x4a5243, 0xe0b45e, 0xc08aa8, 0xd46a5a],
+     [0x5b8a2a, 0x7d6e3f, 0xe5eadb, 0xd6e6bd, 0x2e3326, 0x626b55, 0xa7ae98, 0xa8781a, 0x96507a, 0xb5402f]),
+    // twilight: violet, periwinkle, peach
+    ("iris",
+     [0xa98be0, 0x8fa0d8, 0x26223a, 0x3e3466, 0xdcd6ec, 0x928ba8, 0x4b4663, 0xf0b48a, 0xe58fb6, 0xe86f7a],
+     [0x6c4cc4, 0x4a5fb0, 0xe8e3f4, 0xd9cff5, 0x2d2840, 0x625b78, 0xaaa3c0, 0xb8673a, 0xb03f7a, 0xc2364a]),
+    // pastels; light variants are deepened so they stay readable on white
+    // cherry blossom: rose, lavender, cream
+    ("blossom",
+     [0xf5a6c8, 0xc6a8f0, 0x2a2430, 0x4a3550, 0xeadff0, 0xa597b0, 0x564b60, 0xf6d3a1, 0xe8a0d8, 0xf28b9a],
+     [0xc4467e, 0x7f5cc4, 0xf3e6ef, 0xf6d4e5, 0x3d2f3f, 0x7a6a80, 0xbfaec4, 0xb27a28, 0xa850a0, 0xcc3b55]),
+    // mint and sky
+    ("mint",
+     [0x94e2c0, 0x89c4f4, 0x1f2a2a, 0x2f4a48, 0xdcefea, 0x92aaa8, 0x46585a, 0xf9e2af, 0xf5b8d0, 0xf38ba8],
+     [0x1f9a73, 0x2f7fc4, 0xe0f1ec, 0xc6ebde, 0x26393a, 0x5d7473, 0xa5bab8, 0xb8861c, 0xc0507e, 0xd0304f]),
+    // peach sorbet with lilac
+    ("sorbet",
+     [0xfab387, 0xcba6f7, 0x2c2626, 0x4d3a36, 0xf0e2da, 0xab9a92, 0x5a4e4c, 0xf9e2af, 0xf5c2e7, 0xf38ba8],
+     [0xd0601c, 0x8839ef, 0xf6e8e0, 0xfad8c4, 0x40302a, 0x7d6a62, 0xc4b2aa, 0xb07a10, 0xc0479a, 0xd20f39]),
+];
+
+/// A theme: its name and palettes, dark and light.
+pub type Family = (String, [u32; 10], [u32; 10]);
+/// The palette's colors, as config.toml names them.
+pub const COLOR_NAMES: [&str; 10] = ["accent", "accent2", "deep", "hl", "text", "sub", "dim", "gold", "pink", "err"];
+
+static LIVE: std::sync::OnceLock<Vec<Family>> = std::sync::OnceLock::new();
+
+/// The built-in themes with config.toml's: same name replaces, a new one goes at the end.
+pub fn merged(custom: Vec<Family>) -> Vec<Family> {
+    let mut all: Vec<Family> = FAMILIES.iter().map(|(n, d, l)| (n.to_string(), *d, *l)).collect();
+    for f in custom {
+        match all.iter_mut().find(|a| a.0 == f.0) {
+            Some(a) => *a = f,
+            None => all.push(f),
+        }
+    }
+    all
+}
+
+/// Before anything draws: the first call to families() settles them.
+pub fn use_themes(custom: Vec<Family>) {
+    let _ = LIVE.set(merged(custom));
+}
+
+pub fn families() -> &'static [Family] {
+    LIVE.get_or_init(|| merged(vec![]))
+}
+
+pub fn theme() -> &'static Theme {
+    use std::sync::atomic::Ordering::Relaxed;
+    static T: std::sync::OnceLock<Vec<Theme>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        let truecolor = std::env::var("COLORTERM").is_ok_and(|v| v.contains("truecolor") || v.contains("24bit"));
+        families().iter().flat_map(|(_, dark, light)| [palette(truecolor.then_some(dark), false), palette(truecolor.then_some(light), true)]).collect()
     });
-    ART.store(v, Relaxed);
+    &t[FAMILY.load(Relaxed) * 2 + LIGHT.load(Relaxed) as usize]
 }
 
-/// Changes when the accent does, for rows' memo versions.
-pub fn art_key() -> u32 {
-    ART.load(Relaxed)
-}
-
-/// The appearance setting, as `Appearance as u8`: the window and the panel both read it.
-static MODE: AtomicU8 = AtomicU8::new(Appearance::System as u8);
-
-pub fn set_appearance(a: Appearance) {
-    MODE.store(a as u8, Relaxed);
-}
-
-/// Whether to draw dark, given whether the system is: the setting, unless it follows the system.
-pub fn dark(system_dark: bool) -> bool {
-    match MODE.load(Relaxed) {
-        m if m == Appearance::Light as u8 => false,
-        m if m == Appearance::Dark as u8 => true,
-        _ => system_dark,
+pub fn palette(hex: Option<&[u32; 10]>, light: bool) -> Theme {
+    let rgb = |h: u32| Color::Rgb((h >> 16) as u8, (h >> 8) as u8, h as u8);
+    match (hex, light) {
+        (Some(h), _) => Theme {
+            accent: rgb(h[0]),
+            accent2: rgb(h[1]),
+            deep: rgb(h[2]),
+            hl: rgb(h[3]),
+            text: rgb(h[4]),
+            sub: rgb(h[5]),
+            dim: rgb(h[6]),
+            gold: rgb(h[7]),
+            pink: rgb(h[8]),
+            err: rgb(h[9]),
+        },
+        (None, false) => Theme {
+            accent: Color::Yellow,
+            accent2: Color::Yellow,
+            deep: Color::DarkGray,
+            hl: Color::DarkGray,
+            text: Color::White,
+            sub: Color::Gray,
+            dim: Color::DarkGray,
+            gold: Color::LightYellow,
+            pink: Color::Magenta,
+            err: Color::Red,
+        },
+        (None, true) => Theme {
+            accent: Color::Yellow,
+            accent2: Color::Yellow,
+            deep: Color::Gray,
+            hl: Color::Gray,
+            text: Color::Black,
+            sub: Color::DarkGray,
+            dim: Color::Gray,
+            gold: Color::Red,
+            pink: Color::Magenta,
+            err: Color::Red,
+        },
     }
 }
 
-/// 0xRRGGBB (sRGB) as a color.
-pub fn rgb(h: u32) -> Color {
-    let ch = |sh: u32| rune::color::srgb_decode(((h >> sh) & 0xff) as f32 / 255.0);
-    Color { r: ch(16), g: ch(8), b: ch(0), a: 1.0 }
-}
-
-/// A warm grey: the window's text is all on one hue, barely tinted.
-fn grey(l: f32, c: f32) -> Color {
-    rune::color::oklch(l, c, 75.0)
-}
-
-/// A cover's color (0xRRGGBB) as oklab lightness, chroma and hue (radians).
-fn lch(hex: u32) -> (f32, f32, f32) {
-    let [l, a, b, _] = rgb(hex).to_oklab();
-    (l, (a * a + b * b).sqrt(), b.atan2(a))
-}
-
-/// The playing cover's hue in degrees, if it has a real color; else the warm grey's.
-fn surface_hue() -> Option<f32> {
-    match ART.load(Relaxed) {
-        0 => None,
-        v => Some(lch(v & 0xff_ffff)).filter(|&(_, c, _)| c >= 0.02).map(|(_, _, h)| h.to_degrees()),
-    }
-}
-
-pub fn theme(dark: bool) -> Theme {
-    // the surfaces take the playing cover's hue, just enough to feel: the window least, the
-    // sidebar and the player a little more. Dark takes about twice the chroma light does: the
-    // eye sees far less of it in a dark color than in a pale one, and at light's amounts a dark
-    // window reads as plain grey
-    let hue = surface_hue();
-    let surface = |l: f32, quiet: f32, tinted: f32| match hue {
-        Some(h) => rune::color::oklch(l, tinted, h),
-        None => grey(l, quiet),
-    };
-    let (bg, side, raised, text, sub, dim, err) = if dark {
-        (surface(0.175, 0.003, 0.014), surface(0.158, 0.003, 0.021), surface(0.225, 0.004, 0.018), grey(0.935, 0.012), grey(0.70, 0.006), grey(0.52, 0.005), rgb(0xe0705e))
-    } else {
-        (surface(0.987, 0.002, 0.006), surface(0.968, 0.003, 0.010), Color::WHITE, grey(0.24, 0.008), grey(0.47, 0.006), grey(0.64, 0.005), rgb(0xc2402f))
-    };
-    let (line, wash, sel) = if dark {
-        (text.alpha(0.07), text.alpha(0.05), text.alpha(0.08))
-    } else {
-        (text.alpha(0.09), text.alpha(0.045), text.alpha(0.07))
-    };
-    let accent = match ART.load(Relaxed) {
-        0 => sub,
-        v => quiet(v & 0xff_ffff, dark),
-    };
-    Theme { accent, text, sub, dim, err, bg, side, raised, line, wash, sel, dark }
-}
-
-/// A cover's color as the accent: its hue, held to a chroma and a lightness that read on the
-/// window, so a neon sleeve doesn't shout and a grey one still shows as a color. On dark it's
-/// lighter and more saturated than on light: a light color on a dark window needs more chroma
-/// to look as colorful as a dark one does on a pale window.
-fn quiet(hex: u32, dark: bool) -> Color {
-    let (l, chroma, hue) = lch(hex);
-    if chroma < 0.02 {
-        // no real color in it: a plain light grey
-        return grey(if dark { 0.80 } else { 0.42 }, 0.0);
-    }
-    let (lo, hi, cmin, cmax) = if dark { (0.72, 0.84, 0.08, 0.17) } else { (0.45, 0.56, 0.05, 0.14) };
-    in_gamut(l.clamp(lo, hi), chroma.clamp(cmin, cmax), hue)
-}
-
-/// An oklab color by lightness, chroma and hue (radians), its chroma brought in until sRGB can
-/// show it, so a bright blue or yellow keeps its hue instead of clipping to another.
-fn in_gamut(l: f32, mut c: f32, hue: f32) -> Color {
-    loop {
-        let (a, b) = (c * hue.cos(), c * hue.sin());
-        let col = Color::from_oklab([l, a, b, 1.0]);
-        // from_oklab clips to sRGB: one that comes back as it went in fit
-        let [l2, a2, b2, _] = col.to_oklab();
-        if c <= 0.0 || (l2 - l).abs() + (a2 - a).abs() + (b2 - b).abs() < 0.003 {
-            return col;
-        }
-        c = (c - 0.004).max(0.0);
-    }
-}
-
-/// A cover's color (sRGB 0..1) as the wash at the top of a list's header: deep and rich on
-/// dark, pale on light, fading down into the window.
-pub fn backdrop([r, g, b]: [f32; 3], dark: bool) -> Color {
-    let c = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u32;
-    let (_, chroma, hue) = lch(c(r) << 16 | c(g) << 8 | c(b));
-    let (l, cap) = if dark { (0.35, 0.12) } else { (0.92, 0.045) };
-    let c = if chroma < 0.02 { 0.0 } else { chroma.min(cap) };
-    in_gamut(l, c, hue)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn contrast(x: Color, y: Color) -> f32 {
-        let (a, b) = (x.luminance() + 0.05, y.luminance() + 0.05);
-        a.max(b) / a.min(b)
-    }
-
-    #[test]
-    fn text_reads_on_the_window() {
-        for dark in [true, false] {
-            let th = theme(dark);
-            assert!(contrast(th.text, th.bg) > 7.0);
-            assert!(contrast(th.sub, th.bg) > 4.5);
-        }
-    }
-
-    #[test]
-    fn any_cover_gives_an_accent_that_reads() {
-        for hex in [0xff0000, 0x00ff00, 0x0000ff, 0x101010, 0xfafafa, 0x7a3fd0, 0xffe800] {
-            for dark in [true, false] {
-                let c = quiet(hex, dark);
-                assert!(contrast(c, theme(dark).bg) > 3.0, "{hex:06x} dark={dark}");
-            }
-        }
-    }
-
-    #[test]
-    fn text_reads_on_any_tinted_window() {
-        for hex in [0xff0000, 0x00ff00, 0x0000ff, 0x7a3fd0, 0xffe800] {
-            set_art(Some([((hex >> 16) & 0xff) as f32 / 255.0, ((hex >> 8) & 0xff) as f32 / 255.0, (hex & 0xff) as f32 / 255.0]));
-            for dark in [true, false] {
-                let th = theme(dark);
-                assert!(contrast(th.text, th.bg) > 7.0 && contrast(th.text, th.side) > 7.0, "{hex:06x} dark={dark}");
-                assert!(contrast(th.accent, th.bg) > 3.0, "{hex:06x} dark={dark}");
-            }
-        }
-        set_art(None);
-    }
-
-    #[test]
-    fn accents_keep_their_hue() {
-        // a saturated blue, held in gamut, is still blue rather than clipped toward purple
-        for hex in [0x0000ff, 0xffe800, 0x00ff00, 0xff0000] {
-            let (_, _, want) = lch(hex);
-            for dark in [true, false] {
-                let [_, a, b, _] = quiet(hex, dark).to_oklab();
-                let got = b.atan2(a);
-                let d = (got - want).sin().atan2((got - want).cos()).abs();
-                assert!(d < 0.05, "{hex:06x} dark={dark}: {d}");
-            }
-        }
-    }
-
-    #[test]
-    fn hex_is_srgb() {
-        assert_eq!(rgb(0xffffff), Color::WHITE);
-        assert!((rgb(0x808080).r - 0.2158).abs() < 0.001);
-    }
+/// Switch to the next theme family and remember it.
+pub fn cycle_family() -> &'static str {
+    let all = families();
+    use std::sync::atomic::Ordering::Relaxed;
+    let i = (FAMILY.load(Relaxed) + 1) % all.len();
+    FAMILY.store(i, Relaxed);
+    let _ = fs::write(cache_dir().join("theme"), &all[i].0);
+    &all[i].0
 }

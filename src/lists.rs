@@ -1,5 +1,6 @@
 // Track lists: Liked Songs, playlists, albums, artists (every song) and shows (every episode),
-// fetched fresh and compared with the cached copy; and an artist's releases.
+// fetched fresh and compared with the cached copy; an artist's releases; and the songs a uri
+// names, for playing it (resolve).
 
 use crate::*;
 
@@ -459,6 +460,57 @@ pub async fn artist_albums(session: &Session, uri: &str) -> Result<Vec<String>, 
         .remove(uri)
         .ok_or("artist not found")?;
     Ok(group_uris(&a.album_group).chain(group_uris(&a.single_group)).collect())
+}
+
+/// The songs behind a uri, and the list's name. Albums and artists come from the cache when
+/// they're in it; Liked Songs and playlists change, so they're refreshed.
+pub async fn resolve(api: Arc<Api>, sess: Sess, uri: &str, name: Option<String>) -> Result<(String, Vec<Track>), String> {
+    if uri.starts_with("spotify:track:") {
+        let session = ready(sess).await?;
+        let t = batch_meta::<PbTrack>(&session, &[uri.to_string()], ExtensionKind::TRACK_V4).await?.remove(uri).ok_or("song not found")?;
+        let t = pb_track(uri, &t);
+        return Ok((format!("{} — {}", t.name, t.artists), vec![t]));
+    }
+    if let Some(id) = uri.strip_prefix("spotify:episode:") {
+        let v = api.get(&format!("{API}/episodes/{id}")).await?;
+        let t = parse_episode(&v, None).ok_or("episode not found")?;
+        return Ok((format!("{} — {}", t.name, t.artists), vec![t]));
+    }
+    let cached = read_tracks(&tracks_path(&list_key(uri)));
+    if is_show(uri) && cached.is_empty() {
+        // a show never opened: its newest page is enough to play, where all of a long-running
+        // show's episodes would take a request per 50 of them
+        let tracks = show_newest(&api, uri).await?;
+        let name = name.unwrap_or_else(|| tracks.first().map_or("podcast".into(), |t| t.artists.clone()));
+        return if tracks.is_empty() { Err(format!("{name} has no episodes")) } else { Ok((name, tracks)) };
+    }
+    let changes = uri == "liked" || uri.starts_with("spotify:playlist:") || is_show(uri);
+    let tracks = if changes || cached.is_empty() {
+        let (nobody, _) = mpsc::channel(); // the songs would stream to a view; none is showing this
+        fetch_list(api, sess.clone(), uri, &cached, &nobody, 0).await?.unwrap_or(cached)
+    } else {
+        cached
+    };
+    let name = match name {
+        Some(n) => n,
+        None if uri == "liked" => "Liked Songs".into(),
+        None if uri.starts_with("spotify:playlist:") => {
+            use librespot_metadata::Metadata;
+            let session = ready(sess).await?;
+            let u = SpotifyUri::from_uri(uri).map_err(|e| e.to_string())?;
+            librespot_metadata::Playlist::get(&session, &u).await.map_or("playlist".into(), |p| p.name().to_string())
+        }
+        None if uri.starts_with("spotify:artist:") => {
+            let by = tracks.iter().find(|t| id_uri("artist", t.artist_id).as_deref() == Some(uri));
+            format!("{} · all songs", by.map_or("artist", |t| &t.artists[..t.lead]))
+        }
+        None if is_show(uri) => tracks.first().map_or("podcast".into(), |t| t.artists.clone()),
+        None => tracks.first().map_or("album".into(), |t| t.album.clone()),
+    };
+    if tracks.is_empty() {
+        return Err(format!("{name} has no songs to play"));
+    }
+    Ok((name, tracks))
 }
 
 #[cfg(test)]

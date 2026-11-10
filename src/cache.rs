@@ -112,11 +112,6 @@ pub fn save_progress(progress: &HashMap<String, u64>) {
     write_atomic(&episodes_path(), &s);
 }
 
-/// Lists and songs played lately, newest first, for the ⌥Space panel. Not a cache either.
-pub fn recent_path() -> PathBuf {
-    cache_dir().join("recent")
-}
-
 /// Episodes part way through, last played first. Not a cache either.
 pub fn continuing_path() -> PathBuf {
     cache_dir().join("continuing")
@@ -338,13 +333,12 @@ pub fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
     write_atomic(&last_path(), &s);
 }
 
-/// `spot clean`: drop everything that's only a cache. Login, settings, the resume point and
-/// unsent scrobbles stay.
-/// What the cache keeps that can go (songs, lists and covers; never the login or the resume point).
+/// What the cache keeps that can go (songs, lists and covers; never the login, the resume point
+/// or unsent scrobbles).
 const CLEARABLE: [&str; 7] = ["audio", "lists", "releases", "artists", "playlists", "shows", "art"];
 
 /// Bytes the clearable cache takes on disk.
-pub fn cache_size() -> u64 {
+fn cache_size() -> u64 {
     fn size(p: &std::path::Path) -> u64 {
         match fs::symlink_metadata(p) {
             Ok(m) if m.is_dir() => fs::read_dir(p).into_iter().flatten().flatten().map(|e| size(&e.path())).sum(),
@@ -355,17 +349,25 @@ pub fn cache_size() -> u64 {
     CLEARABLE.iter().map(|n| size(&cache_dir().join(n))).sum()
 }
 
-/// Settings' "Clear": the player restarts right after, so nothing holds on to what's gone.
-pub fn clean_cache() {
+/// `spot clean`: drop everything that's only a cache, with the player stopped so nothing holds
+/// on to what's gone.
+pub fn clean_cache() -> i32 {
+    if std::os::unix::net::UnixStream::connect(sock_path()).is_ok() {
+        eprintln!("spot: the player is running; `spot quit` first");
+        return 1;
+    }
+    let size = cache_size();
     for name in CLEARABLE {
         let p = cache_dir().join(name);
         let r = if p.is_dir() { fs::remove_dir_all(&p) } else { fs::remove_file(&p) };
         if let Err(e) = r
             && e.kind() != std::io::ErrorKind::NotFound
         {
-            log::warn!("couldn't remove {}: {e}", p.display());
+            eprintln!("spot: couldn't remove {}: {e}", p.display());
         }
     }
+    println!("Cleared {:.1} MB of cache from {}.", (size - cache_size()) as f64 / 1e6, cache_dir().display());
+    0
 }
 
 /// The running player's control socket (ctl.rs).

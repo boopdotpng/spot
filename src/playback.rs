@@ -341,52 +341,10 @@ impl App {
 
     /// Make `q` the queue and play it from `start` (None: the top, or a random song if shuffling).
     pub fn play_queue(&mut self, mut q: Queue, start: Option<usize>) {
-        if let Some(l) = self.recent_link(&q) {
-            self.remember(l);
-        }
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
         self.queued = None;
         self.play_fresh();
-    }
-
-    /// What playing `q` adds to the recently played: the list it is, or the song when it's one
-    /// song. Searches, the queue and the podcast lists aren't kept.
-    fn recent_link(&self, q: &Queue) -> Option<Link> {
-        let first = q.tracks.first();
-        let link = |uri: String, name: String, sub: String, image: Option<String>| Some(Link { uri, name, sub, single: false, image });
-        let key = q.key.as_str();
-        if key == "liked" {
-            return link("liked".into(), "Liked Songs".into(), "Playlist".into(), None);
-        }
-        let artist = key.strip_prefix("top:").unwrap_or(key);
-        if artist.starts_with("spotify:artist:") {
-            let name = first.map(|t| t.artists[..t.lead].to_string()).filter(|n| !n.is_empty() && q.tracks.iter().all(|t| t.artists.starts_with(n.as_str())));
-            let name = name.unwrap_or_else(|| q.name.split(" · ").next().unwrap_or(&q.name).to_string());
-            return link(artist.into(), name, "Artist".into(), read_artist(artist).and_then(|a| a.portrait));
-        }
-        if key.starts_with("spotify:track:") || key.starts_with("spotify:episode:") {
-            return first.map(song_link);
-        }
-        if key.starts_with("spotify:album:") {
-            return link(key.into(), q.name.clone(), format!("Album · {}", first.map_or("", |t| t.artists.as_str())), first.and_then(|t| t.cover.clone()));
-        }
-        if key.starts_with("spotify:show:") {
-            return link(key.into(), q.name.clone(), "Podcast".into(), first.and_then(|t| t.cover.clone()));
-        }
-        if key.contains(':') {
-            return None; // a search, the queue, the podcast lists
-        }
-        let image = self.playlists.iter().find(|p| p.id.as_deref() == Some(key)).and_then(|p| p.image.clone());
-        link(format!("spotify:playlist:{key}"), q.name.clone(), "Playlist".into(), image)
-    }
-
-    /// Put `l` first among the recently played (once), and keep the list on disk.
-    pub fn remember(&mut self, l: Link) {
-        self.recent.retain(|r| r.uri != l.uri);
-        self.recent.insert(0, l);
-        self.recent.truncate(12);
-        save_links(&recent_path(), &self.recent);
     }
 
     /// Play what's now current, as a new choice: no retry spent on it, no skip still settling.

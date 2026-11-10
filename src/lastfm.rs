@@ -72,30 +72,8 @@ pub fn lastfm_creds() -> Option<(String, String)> {
     Some((lines.next()?.into(), lines.next()?.into()))
 }
 
-/// The API key and shared secret, as the settings page saves them.
-pub fn save_lastfm_creds(key: &str, secret: &str) -> Result<(), String> {
-    fs::create_dir_all(config_dir()).map_err(|e| e.to_string())?;
-    let path = config_dir().join("lastfm");
-    save_refresh(&path, &format!("{}\n{}\n", key.trim(), secret.trim()));
-    if path.exists() { Ok(()) } else { Err(format!("couldn't write {}", path.display())) }
-}
-
 fn session_path() -> PathBuf {
     cache_dir().join("lastfm_session")
-}
-
-/// Stop scrobbling: forget the login (the keys stay, to connect again).
-pub fn lastfm_disconnect() {
-    let _ = fs::remove_file(session_path());
-}
-
-/// The settings page's Connect: the browser login, then a session. Blocks until the browser
-/// comes back (or five minutes pass), so run it off the window's thread.
-pub fn lastfm_connect(rt: &tokio::runtime::Handle, redirect: &str, tx: mpsc::Sender<Msg>) -> Result<Arc<LastFm>, String> {
-    let (key, secret) = lastfm_creds().ok_or("add your API key and shared secret first")?;
-    let http = reqwest::Client::new();
-    let sk = lastfm_login(rt, &http, &key, &secret, redirect)?;
-    Ok(LastFm::new(http, key, secret, sk, tx))
 }
 
 /// The browser login, then the session key it gives, saved for next time.

@@ -8,67 +8,42 @@ use std::{
 
 use crate::*;
 
-pub const COMMANDS: &[&str] = &[
-    "start", "quit", "status", "play", "resume", "pause", "toggle", "next", "prev", "seek", "vol", "volume", "shuffle", "repeat", "queue",
-    "search", "playlists", "podcasts", "watch", "wait",
-    "songs", // the ⌥Space panel's, as `search --tsv` rows; not in the help
-];
+pub const COMMANDS: &[&str] = &["start", "quit", "status", "library", "search", "play", "queue", "set", "next", "prev", "watch"];
 
 pub const USAGE: &str = "\
-spot: tiny Spotify player, and a command line for the one that's running
+spot: a small Spotify player. `spot` alone opens the TUI, starting the player in the background
+if needed (and taking the TUI from any other terminal); d closes it and the music keeps playing.
+These commands control the running player, for scripts and agents. Things are named by uri:
+status, search and library print them (open.spotify.com links work too).
 
-  spot                       open spot's window, starting spot if needed (the first time, it
-                             logs you in here); closing the window keeps the music playing
-  spot start                 start it in the background, without a window, and return once
-                             it's ready (what scripts and agents should use); ⌥Space
-                             opens the search, `spot` the window
-  spot quit                  stop the player (it resumes where it was next start)
+  spot start                 start it in the background, without a TUI; returns once it's ready.
+                             Exit code 3 from any command means it isn't running
+  spot --headless            the same in the foreground, for a launchd / systemd service
+  spot quit                  stop it (the next start is paused where it was)
+  spot clean                 clear cached songs, lists and covers (keeps the login)
   spot -v, --version         which spot this is
-
-Control the running player, from any terminal, script or agent:
-  spot status                what's playing, position, queue, modes, volume, what's next
-  spot search <words>        search songs (the default), or with --albums, --artists,
-                             --playlists, --podcasts or --episodes one of those instead;
-                             -n 20 for more than 10.
-                             Spotify's field filters narrow it down:
-                             spot search 'track:one more time artist:daft punk'
-                             spot search 'artist:radiohead year:1997' --albums
-  spot play <uri>            a song plays now, then the queue and the list carry on; an album,
-                             artist (all songs) or playlist replaces the list
-                             (--from <song uri> starts there, --show opens it in the window)
-  spot play 3                the 3rd result of the last search or `spot playlists` (queue add
-                             takes these too)
-  spot play liked            Liked Songs
-  spot play <words>          one of your playlists by name, else the top song on Spotify
-  spot play album <words>    the top album (or artist, song, playlist: yours first, then Spotify's;
-                             podcast, episode)
-  spot play | pause | toggle
+  spot status [-n 5]         what's playing, the list it's from, shuffle, repeat, volume, the
+                             queue, then the list's next 5 songs
+  spot library               Liked Songs, your playlists, and the podcasts you follow
+  spot search <words> [--type track|album|artist|playlist|show|episode] [-n 10]
+                             songs by default; Spotify's filters work: 'artist:radiohead year:1997'
+  spot play <uri> [--from <song uri>]
+                             a song or episode plays now, then the queue and the list carry on;
+                             an album, artist (all its songs), playlist or show becomes the list
+                             (--from starts it at that song)
+  spot queue <uri>...        set the whole queue, in order (what's queued now and isn't listed is
+                             dropped); it plays before the list carries on. An album or playlist
+                             adds all its songs. A first song that has started playing since you
+                             read the queue is left out. `spot queue clear` empties it
+  spot set paused=yes volume=40 shuffle=on repeat=all seek=1:30
+                             any of them, at once; volume and seek take +10 / -10 too,
+                             repeat is off, all or one
   spot next | prev
-  spot seek 1:30 | +10 | -10
-  spot vol [60 | +10 | -10]  volume in percent
-  spot shuffle [on | off]    no argument toggles
-  spot repeat [off | all | one]   no argument cycles
-  spot queue [-n 20]         the queue, then what the list plays after it
-  spot queue [add] <what>... add to the end of the queue: result numbers, uris, or words as in
-                             play (`spot queue 2` = result 2). Songs play before the list carries
-                             on; an album or playlist queues all its songs
-  spot queue add --at 2 <what>...   the same, in at that position of the queue (1 plays next)
-  spot queue rm 2 5-8        remove songs from the queue: numbers in `spot queue`, ranges, or uris
-                             (a uri still means the same song if the queue has moved on)
-  spot queue mv 5 1          move songs to a position: the same numbers, ranges or uris, then
-                             where the first goes (`spot queue mv 3-5 1`); they stay in order
-  spot queue clear           empty the queue
-  spot playlists             your playlists, numbered, with uris
-  spot podcasts              the podcasts you follow, numbered, with uris
-  spot watch [--before 30]   a line per event as it happens: track (new song), playing,
-                             paused, modes, skip (a media key skipped or seeked), end (nothing left to
-                             play), ending (the song ends in 30s; says what's next, so there's
-                             time to `queue add` something else)
-  spot wait <event> [--before 30]   wait for the next such event, print it, exit
+  spot watch [--before 30]   a line per event as it happens: track (a new song), playing, paused,
+                             modes, skip (a media key skipped or seeked), end (nothing left to
+                             play), ending (30s before a song ends, with what's next)
 
-Finding music: `spot play <words>` plays the top hit and says so; to choose, `spot search` and
-`spot play N`. Several of your playlists matching lists them, numbered for `spot play N`.
-Spotify links (https://open.spotify.com/...) work anywhere a uri does.";
+Whatever changes something prints the status after.";
 
 /// True once no player holds the lock: after a quit, the old one may still be finishing up
 /// (sending a scrobble) for a moment after its socket is gone.
@@ -90,10 +65,10 @@ fn wait_for(secs: u64, ok: impl Fn() -> bool) -> bool {
 }
 
 /// Send the arguments, print the reply: an exit code line, then text (an error's on stderr).
-/// `watch` and `wait` keep printing event lines as they come.
+/// `watch` keeps printing event lines as they come.
 pub fn client(args: Vec<String>) -> i32 {
     match args[0].as_str() {
-        "start" => return launch(false, true),
+        "start" => return launch(true),
         "quit" => return quit(),
         _ => {}
     }
@@ -101,7 +76,7 @@ pub fn client(args: Vec<String>) -> i32 {
         Ok(c) => c,
         Err(code) => return code,
     };
-    let watching = matches!(args[0].as_str(), "watch" | "wait");
+    let watching = args[0] == "watch";
     if !watching {
         let _ = conn.set_read_timeout(Some(Duration::from_secs(100)));
     }
@@ -126,42 +101,19 @@ pub fn client(args: Vec<String>) -> i32 {
         }
         printed = true;
     }
-    // the player hung up on a watcher: it quit (a `wait` is hung up on once its event came)
-    if watching && code == 0 && !(args[0] == "wait" && printed) {
+    // the player hung up on a watcher: it quit
+    if watching && code == 0 {
         println!("spot quit");
         return 3;
     }
     code
 }
 
-/// Plain `spot` in a terminal: bring up the running spot's window, or log in if this is the first
-/// run and then start spot with its window open.
-pub fn open() -> i32 {
-    if send(&["show"]).is_ok() {
-        return 0;
-    }
-    if let Err(e) = crate::start(true, false) {
-        eprintln!("spot: {e}");
-        return 1;
-    }
-    launch(true, false)
-}
-
-/// One request to the running spot, its reply's text; Err if it isn't running or said no.
-pub fn send(args: &[&str]) -> Result<String, String> {
-    let conn = UnixStream::connect(sock_path()).map_err(|e| e.to_string())?;
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
-    (&conn).write_all(format!("{}\n", args.join("\t")).as_bytes()).map_err(|e| e.to_string())?;
-    let mut lines = BufReader::new(&conn).lines().map_while(Result::ok);
-    let code = lines.next().and_then(|l| l.parse::<i32>().ok()).ok_or("no reply")?;
-    let text = lines.collect::<Vec<_>>().join("\n");
-    if code == 0 { Ok(text) } else { Err(text) }
-}
-
-/// `spot start`, or `spot` after first-run setup: run `spot --app` detached from this terminal (its own process group, no stdio, so whatever
-/// started it can exit or close), with its window if `show`, and wait until it answers. `say`
-/// prints how that went.
-fn launch(show: bool, say: bool) -> i32 {
+/// `spot start`, or `spot` before it attaches: run `spot --headless` detached from this terminal
+/// (its own process group, no stdio, so whatever started it can exit or close), and wait until it
+/// answers. `say` prints how that went; the TUI doesn't, or the line would be waiting in the
+/// terminal when it closes.
+pub fn launch(say: bool) -> i32 {
     if UnixStream::connect(sock_path()).is_ok() {
         if say {
             println!("spot is already running");
@@ -178,11 +130,9 @@ fn launch(show: bool, say: bool) -> i32 {
         return 1;
     }
     use std::{os::unix::process::CommandExt, process::Stdio};
-    // the real file, so a `spot` linked from inside Spot.app runs as that app (its icon and name)
-    let exe = std::env::current_exe().and_then(fs::canonicalize).unwrap_or_else(|_| "spot".into());
+    let exe = std::env::current_exe().unwrap_or_else(|_| "spot".into());
     let mut child = match std::process::Command::new(exe)
-        .arg("--app")
-        .args(show.then_some("--show"))
+        .arg("--headless")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -248,7 +198,7 @@ fn connect() -> Result<UnixStream, i32> {
     UnixStream::connect(sock_path()).map_err(|e| {
         use std::io::ErrorKind::*;
         if matches!(e.kind(), NotFound | ConnectionRefused) {
-            eprintln!("spot isn't running: `spot start` starts it in the background (or `spot` opens its window)");
+            eprintln!("spot isn't running: `spot start` starts it in the background (or run `spot` in a terminal)");
             3
         } else {
             eprintln!("spot: {}: {e}", sock_path().display());

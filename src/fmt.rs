@@ -1,4 +1,4 @@
-// Numbers and times as spot writes them, in the window and on the command line.
+// Numbers and times as spot writes them, in the TUI and on the command line.
 
 use crate::*;
 

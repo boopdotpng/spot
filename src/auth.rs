@@ -108,10 +108,3 @@ pub async fn browser_login(oauth: Arc<OAuthClient>, redirect: &str) -> Result<li
         }
     }
 }
-
-/// Log out of Spotify: forget the Web API's refresh token and the audio session's saved login.
-/// The next start logs in again, in the browser.
-pub fn forget_spotify() {
-    let _ = fs::remove_file(cache_dir().join("refresh_token"));
-    let _ = fs::remove_file(cache_dir().join("credentials.json"));
-}

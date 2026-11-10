@@ -1,28 +1,22 @@
 # spot
 
-Tiny Spotify player for the Mac: playlists, Liked Songs, search, albums, artists and podcasts,
-with audio streamed by [librespot](https://github.com/librespot-org/librespot), so no Spotify app
-is needed. A native window drawn with [Rune](https://github.com/anomalyco/rune), `⌥Space` search
-from any app, and a command line for scripts and agents. Needs Spotify Premium and an Apple
-Silicon Mac (macOS 14+, Liquid Glass on 26+).
+Tiny Spotify TUI for the Mac: playlists, Liked Songs, search, albums, artists and podcasts, with
+audio streamed by [librespot](https://github.com/librespot-org/librespot), so no Spotify app is
+needed, and a command line for scripts and agents. The player keeps playing in the background;
+the TUI attaches to it from any terminal. Needs Spotify Premium and an Apple Silicon Mac.
 
-![spot playing an album](assets/screenshot.png)
-
-![the ⌥Space launcher searching songs](assets/launcher.png)
+![spot playing an album in Ghostty](assets/screenshot.png)
 
 ## Install
 
 Build it from source. You need a Rust toolchain (https://rustup.rs) and the Xcode command line
 tools (`xcode-select --install`):
 
-    git clone https://github.com/boopdotpng/spot && spot/macos/bundle.sh
+    git clone https://github.com/boopdotpng/spot && spot/install.sh
 
-That installs `Spot.app` to `~/Applications` (set `SPOT_APP_DIR` to change) and links `spot` in
-`~/.local/bin` (set `SPOT_INSTALL_DIR` to change) to the binary inside it. It also has spot start
-at login without its window, so `⌥Space` always works (`macos/bundle.sh --no-login` leaves that
-out; the login item is `~/Library/LaunchAgents/com.github.boopdotpng.spot.plist`), and removes
-the separate `Spot Launcher.app` from versions before 2.0. The first build takes a few minutes.
-To update, `git pull` and run `macos/bundle.sh` again, then `spot quit` and `spot`.
+That installs `spot` to `~/.local/bin` (set `SPOT_INSTALL_DIR` to change). It also removes
+`Spot.app` and its login item, if you had the 2.0 window version. The first build takes a few
+minutes. To update, `git pull` and run `install.sh` again, then `spot quit` and `spot`.
 Builds use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to
 build with vergen 9.1.
 
@@ -38,10 +32,11 @@ spot needs a Spotify app of your own (free, takes a minute). On first start it a
 3. Tick **Web API** and save.
 4. Paste the app's Client ID when spot asks for it.
 
-It's saved as `client_id` in `~/.config/spot/config.toml` (change it in Settings, `⌘,`, or set
+It's saved as `client_id` in `~/.config/spot/config.toml` (delete that line to set up again, or set
 `SPOT_CLIENT_ID` to override). Using a different redirect URI? Set `SPOT_REDIRECT` to match.
 Then log in through the browser; there's one more one-time approval for the audio session.
-**Log out** in Settings (`⌘,`) forgets both logins and restarts spot, which asks again.
+To log out, `spot quit` and delete `~/.cache/spot/refresh_token` and
+`~/.cache/spot/credentials.json`; the next `spot` asks again.
 
 ## Last.fm (optional)
 
@@ -50,11 +45,11 @@ spot can scrobble what you play to Last.fm:
 
 1. Create an API account at https://www.last.fm/api/account/create with callback URL
    `http://127.0.0.1:19872/lastfm` (same host and port as `SPOT_REDIRECT`, if you changed it).
-2. Open Settings (`⌘,`), paste the API key and shared secret under Last.fm, and press **Connect**.
-   Approve spot in the browser (once; the session is kept in `~/.cache/spot/lastfm_session`).
-   The keys are saved to `~/.config/spot/lastfm`, one per line; `LASTFM_API_KEY` and
-   `LASTFM_SECRET` work too. **Disconnect** stops scrobbling and keeps the keys.
-   Press `enter` to skip the approval and start without scrobbling.
+2. Put the API key and shared secret in `~/.config/spot/lastfm`, one per line (or set
+   `LASTFM_API_KEY` and `LASTFM_SECRET`).
+3. `spot quit`, then start spot from a terminal and approve it in the browser (once; the session
+   is kept in `~/.cache/spot/lastfm_session`). Press `enter` to skip the approval and start
+   without scrobbling. Delete that file to stop scrobbling and keep the keys.
 
 To turn scrobbling off without deleting the keys, set `SPOT_LASTFM=off`.
 
@@ -63,101 +58,76 @@ whichever comes first. Only time actually playing counts, so seeking ahead doesn
 shows as "now playing" on your profile while it plays. Scrobbles that can't be sent (offline)
 wait in `~/.cache/spot/scrobbles` and go out later.
 
-## The window
+## The TUI
 
-`spot` opens it. The sidebar lists your playlists (or podcasts), the middle the open list with
-each song's cover (and, in playlists, when it was added), and the player runs along the bottom.
-The window is near-monochrome: the covers are its color, and a single accent, taken from the
-playing song's cover, marks what's playing and fills the progress bar. Click a playlist to open it, double-click a song to play it (the rest of the
-list plays after it); click the playing song's name for its album, the artist for their page.
-Closing the window (`⌘W`) keeps the music playing; `⌘Q` quits.
+`spot` opens it. The sidebar lists your playlists (or podcasts), the right pane the open list,
+and the player runs along the bottom with the playing song's cover (drawn with kitty graphics,
+sixels or iTerm2 images where the terminal has them, half blocks elsewhere). The status line
+shows what's next, notices, and the search and find prompts. Colors come from a theme (`ctrl+t`),
+light or dark following the terminal.
 
 | key | action |
 |---|---|
-| `/`, `⌘K` | search as you type (`tab` in the field cycles all / songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
-| `enter` | play song (the rest of the list plays after it) · open album / artist |
-| `d` | playlists: sort by date added (newest first, oldest first, as listed); also the DATE ADDED column's head; remembered |
-| `⌘F` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
+| `/` | search as you type (`tab` in the prompt cycles all / songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
+| `enter` | play song (the rest of the list plays after it) · open album / artist / card |
+| `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
 | `space` | pause / resume (with a short volume fade); right after launch, resumes what was playing at quit |
 | `s` | shuffle on/off |
 | `r` | repeat: off → repeat list → repeat one song |
-| `P` | play the whole open list (from a random song if shuffle is on) |
+| `P` | play the whole open list (from a random song if shuffle is on); on an artist's overview, shuffle every song they have |
 | `n` / `p` | next / previous (previous restarts the song if >3s in) |
 | `,` / `.` | seek −10s / +10s |
 | `+` / `-` | volume |
 | `o` | jump to the list that's playing |
 | `e` | add the highlighted song to the queue (queued songs play before the list carries on) |
 | `Q` | up next: the queue, then the rest of the list. `enter` plays a song from it now, `x` removes a queued one |
+| `S` | playlists: sort by date added (newest first, oldest first, as listed); remembered |
 | `m` | switch the sidebar between playlists and podcasts |
+| `*` | pin the highlighted playlist to the top of the sidebar, or unpin it |
 | `a` / `A` | go to the album / artist of the highlighted song (or the playing one, from the sidebar) |
 | `v` | on an artist page: overview → all songs → discography |
 | `f` | on an artist's overview or discography: all → albums (incl. EPs) → singles (remembered) |
-| `esc`, `backspace` | back to the previous list |
+| `esc`, `backspace`, `[` | back to the previous list |
+| `]` | forward again |
 | `tab`, `h`/`l`, `←`/`→` | switch pane (on cards, `h`/`l` move card to card; left off a line's first card goes to the sidebar) |
 | `j`/`k`, `↑`/`↓`, `ctrl+d`/`ctrl+u` | move |
 | `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
-| `⌘?` | key help (any key closes it) |
-| `⌘O` | the `⌥Space` search |
-| `⌘W` | close the window; music keeps playing (`spot`, `⌥Space` then `⌘O`, or opening Spot.app brings it back) |
-| `⌘Q` | quit |
+| `ctrl+t` | next theme (desert, lagoon, moss, iris, blossom, mint, sorbet, and yours); remembered |
+| `?` | key help (any key closes it) |
+| `q` | quit |
+| `d`, `ctrl+c` | detach the TUI; music keeps playing (`spot` brings it back) |
 
 Media keys and the macOS Now Playing widget work too.
 
-## ⌥Space
-
-Searches and plays from any app: `⌥Space` opens a Liquid Glass bar near the top of the screen
-you're on, with what's playing under the results. Empty, it lists what you played lately. Typed
-in, your playlists that match come first, at once, then Spotify's top result, songs, albums and
-artists. `↑`/`↓` move, `tab` jumps to the next section, `→` opens the selected album, playlist
-or artist's songs right there (`←` or `esc` goes back), `enter` plays (pressed before the
-results are in, it plays the top one; a song opened from an album or playlist plays on through
-it), `⌘enter` adds to the queue, `⌘c` copies the selected result's open.spotify.com link (with
-no results, the playing song's), `ctrl+s` / `ctrl+r` toggle shuffle / cycle repeat (or click the
-icons beside what's playing; the play icon pauses), `⌘o` opens spot's window, `esc` closes.
-Settings (`⌘,`) changes `⌥Space`.
-
 ## Command line
 
-Only one spot plays at a time. Running `spot` starts spot if needed and opens its window; when
-it's already running, `spot` brings that window up. Control the running one from any terminal,
-script or agent (an LLM can drive it from `spot help` alone):
+Only one spot plays at a time. Running `spot` starts the background player if needed and opens
+its TUI; when it's already playing, `spot` attaches to that same player (taking the TUI from any
+other terminal). The other commands control the running spot. They're made for scripts
+and agents (an LLM can drive it from `spot help` alone), so everything is named by its uri:
 
-    spot search daft punk            # songs (--albums, --artists, --playlists; -n 20), numbered, with uris
-    spot play 1                      # the first result of the last search
+    spot status                      # what's playing, the list, modes, volume, the queue, what's next
+    spot library                     # Liked Songs, your playlists, the podcasts you follow
+    spot search daft punk            # songs; --type album|artist|playlist|show|episode, -n 20
     spot play spotify:track:…        # plays now, then the queue and the list carry on
-    spot play spotify:album:…        # album / artist / playlist: replaces the list (--from <song uri>, --show)
-    spot play liked                  # or one of your playlists by name
-    spot play black beatles          # not a playlist of yours: the top song on Spotify
-    spot play album abbey road       # or artist / song / playlist: the top one of those
-    spot pause | play | toggle | next | prev
-    spot seek 1:30 | +10 | -10
-    spot vol 60 | +10 | -10
-    spot shuffle [on|off] · spot repeat [off|all|one]
-    spot queue                       # the queue, then the list's next songs
-    spot queue 2 5                   # add results, uris, or a whole album / playlist to the queue (= `queue add`)
-    spot queue add --at 1 <what>     # the same, in at a position of the queue (1 plays next)
-    spot queue rm 1 5-8              # remove by number, range or uri
-    spot queue mv 3-5 1              # move songs to a position, in order (numbers, ranges or uris)
-    spot queue clear
-    spot status · spot playlists · spot podcasts
-    spot search hard fork --podcasts # or --episodes
-    spot play podcast hard fork      # or episode, or a spotify:show: / spotify:episode: uri
+    spot play spotify:album:…        # album / artist / playlist / show: replaces the list (--from <song uri>)
+    spot queue <uri>…                # sets the whole queue, in order; `spot queue clear` empties it
+    spot set paused=yes volume=40 shuffle=on repeat=all seek=1:30
+    spot next | prev
+    spot watch                       # a line per event, as it happens
 
-Spotify's field filters work in searches: `spot search 'track:one more time artist:daft punk'`,
-`spot search 'artist:radiohead year:1997' --albums`.
-`spot play <words>` plays the top hit and says what it picked; to choose yourself, `spot search`
-first, then play a result by its number (`spot play 3`, `spot queue add 2 5`) or uri. When several
-of your playlists match, it lists them numbered, for `spot play N`.
+Spotify's field filters work in searches: `spot search 'artist:radiohead year:1997' --type album`.
+Spotify links work anywhere a uri does. Exit code 3 means spot isn't running; `spot start`
+starts it without a TUI. `spot clean` clears the caches (songs, lists and covers) with the player
+stopped; the login, settings, the resume point and unsent scrobbles stay.
 
-The queue is spot's own, like Spotify's: songs you add play in order before the list you're
-playing carries on, and it's kept across restarts. `spot play <song>` plays a song right away
-and then goes on with the queue. Spotify links work
-anywhere a uri does. Exit code 3 means spot isn't running.
+The queue is spot's own, like Spotify's: songs in it play in order before the list you're
+playing carries on, and it's kept across restarts.
 
-`spot watch` prints a line per event as it happens: `track` (a new song), `playing`, `paused`,
-`modes` (shuffle or repeat changed), `skip` (a media key skipped or seeked), `end` (nothing left to play) and `ending`, sent 30 seconds (`--before`) before a song ends with
-what's next, so there's time to `spot queue add` something. It works as a monitor target
-for agents. `spot wait ending` blocks until the next one and exits.
+`spot watch` prints a line per event: `track` (a new song), `playing`, `paused`, `modes`
+(shuffle or repeat changed), `skip` (a media key skipped or seeked), `end` (nothing left to
+play) and `ending`, sent 30 seconds (`--before`) before a song ends with what's next, so
+there's time to change the queue. It works as a monitor target for agents.
 
 ### Claude Code
 
@@ -166,17 +136,17 @@ in every project, copy it from your clone:
 
     mkdir -p ~/.claude/skills && cp -r docs/skills/spot ~/.claude/skills/
 
-### Without a window
+### In the background
 
-`spot start` starts spot in the background with no window and returns once it's ready, so a
-script or an agent (Claude Code's Bash tool, say) can start it and carry on; `⌥Space` works, and
-`spot` opens the window. `spot quit` stops it, keeping the resume point. Log in once by running
-`spot` in a terminal first. (The login item runs `spot --app`, the same in the foreground.) Media keys and Now Playing work without the
-window too, and with it closed spot draws nothing: it uses about as little as before it had one.
+`spot start` starts the player in the background with no TUI and returns once it's ready, so a
+script or an agent (Claude Code's Bash tool, say) can start it and carry on; `spot` attaches the
+TUI later. `spot quit` stops it, keeping the resume point. Log in once by running `spot` in a
+terminal first. `spot --headless` is the same in the foreground, for a launchd service. Media keys
+and Now Playing work with no TUI attached, and then spot draws nothing.
 
-The CLI and the window drive the same player, so they work at the same time: the window shows
-what the CLI changed, and `--show` also opens the list it played. It talks to spot over a Unix
-socket at `~/.cache/spot/sock`.
+The CLI and the TUI drive the same player, so they work at the same time: the TUI shows what the
+CLI changed. It talks to spot over a Unix socket at `~/.cache/spot/sock`, and the TUI is a client
+on that socket too: closing the terminal never stops the music.
 
 ## Podcasts
 
@@ -186,28 +156,27 @@ first), then the shows you follow, which you follow in Spotify itself. Opening a
 episodes, newest first, with their dates and what's left of them.
 
 Episodes pick up where you left off, and count as played in their last minute. That's kept in
-`~/.cache/spot/episodes` and isn't shared with Spotify's apps, and Settings' Clear cache leaves it alone.
+`~/.cache/spot/episodes` and isn't shared with Spotify's apps, and `spot clean` leaves it alone.
 They play in list order, so the next one is older, whatever shuffle says. They don't scrobble.
 `a` or `A` on one opens its show. Audio is what Spotify streams for podcasts, usually 96 kbps.
 Video podcasts play as audio if Spotify has an audio version.
 
 ## Config
 
-Settings (`⌘,`) covers audio quality, the song cache's size, the
-`⌥Space` key, and the Spotify and Last.fm logins. They're saved in
-`~/.config/spot/config.toml`. See
-[docs/config.md](docs/config.md) for every key.
-
-Right-click a playlist in the sidebar to pin it to the top.
+Audio quality, the song cache's size, loudness normalization and your own colors are set in
+`~/.config/spot/config.toml`. See [docs/config.md](docs/config.md) for every key.
 
 ## Notes
 
 - **Shuffle** is a uniform Fisher–Yates shuffle of the whole list (OS-seeded ChaCha RNG):
   every order is equally likely, no artist/popularity weighting. The playing song stays first.
   With repeat on, each pass through the list gets a fresh shuffle.
-- **Artists** open on an overview: their portrait, popular songs, discography, what they appear on and related artists. Its play
-  button (or `P`) shuffles every song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate single/album versions
-  removed: find, sort and play from here) and to the discography as a grid of covers. `⌘F` on the overview finds in every song.
+- **Artists** open on an overview: popular songs, then their discography, what they appear on
+  and related artists as cards, as many to a line as the terminal fits. `P` there shuffles every
+  song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate
+  single/album versions removed: find, sort and play from here) and to the discography.
+- **Search** (`/`) of everything shows the top result, songs, artists and albums on one page;
+  `tab` narrows it to one kind, listed in full.
 - **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
   isn't exposed to third-party/Connect players, so librespot can't select it.
 - Audio: librespot (no Spotify app needed).
@@ -225,14 +194,14 @@ Right-click a playlist in the sidebar to pin it to the top.
 - **Audio cache**: played songs are kept in `~/.cache/spot/audio` (as streamed, encrypted), so
   replaying them starts instantly without the network. Capped at 1 GB, least recently played
   dropped first; set `audio_cache_gb` in [config.toml](docs/config.md) to change the cap (`0` turns it off).
-- **Clear cache** (in Settings) clears the caches (songs, playlist / album / artist lists) and
-  restarts spot. Login, settings, the resume point, the recently played and unsent scrobbles are
-  kept.
+- **`spot clean`** clears the caches (songs, playlist / album / artist lists, covers). Login,
+  settings, the resume point and unsent scrobbles are kept.
 - **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song
   paused and preloads it once connected, so `space` starts it right away.
-- **Colors**: light or dark follows macOS. The one accent comes from the playing cover, quietened,
-  and falls back to grey with nothing playing.
-- **Battery**: with the window closed spot draws nothing. Open, it draws only when something
+- **Colors**: light or dark follows the terminal (`SPOT_THEME=light|dark` forces it), and
+  switches live in terminals that report it. The sidebar and status line get a faint tint of the
+  terminal's background when it supports truecolor.
+- **Battery**: with no TUI attached spot draws nothing. Attached, it draws only when something
   changes: once a second while playing (the clock and the progress bar), never while paused.
 
 ## Releasing
@@ -245,8 +214,8 @@ write the release notes (markdown) and tag with them, and push:
 (`--cleanup=verbatim` keeps the `## ` headings, which git would otherwise strip as comments.)
 
 The release workflow is turned off for now (`gh workflow enable release` turns it back on). When
-it's on, it builds `Spot.app` for Apple Silicon on each tag (with `cargo build --profile dist`:
-the fully optimized build, which `bundle.sh` skips to rebuild in seconds) and publishes it as
-`Spot.zip` on the release, with the tag's message as its notes (a tag without one fails the
+it's on, it builds spot for Apple Silicon on each tag (with `cargo build --profile dist`:
+the fully optimized build, which `install.sh` skips to rebuild in seconds) and publishes it as
+`spot-aarch64-apple-darwin.tar.gz` on the release, with the tag's message as its notes (a tag without one fails the
 release). Pushes to master also build (no release) to keep the Rust cache warm; changes to only
 `.md` files skip CI.

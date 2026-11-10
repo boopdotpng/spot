@@ -1,27 +1,76 @@
-// Album art: the playing song's cover (and its color, which tints the window), and the small
-// covers on the rows of a list. The player fetches them; the window turns them into images.
+// The playing song's album art, in the player strip. Covers are kept on disk once fetched. The player has no terminal of its own, so
+// the client asks the terminal what it can draw and passes that along when it attaches; the art
+// lives only as long as that terminal does (a new terminal needs its own copy anyway).
+
+use ratatui_image::{FilterType, Resize, picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions}, protocol::Protocol};
 
 use crate::*;
 
-/// A cover as fetched: where from, the file, and the color it's mostly made of (sRGB, 0 to 1).
-#[derive(Clone)]
-pub struct Cover {
-    pub url: String,
-    pub bytes: Arc<Vec<u8>>,
-    pub tint: [f32; 3],
-}
+const ROWS: u16 = 3; // the player strip's height
 
-/// The playing song's cover.
 #[derive(Default)]
 pub struct Art {
-    pub url: Option<String>,    // the cover wanted
-    pub cover: Option<Cover>,   // the one on show; the last song's until the new one arrives
+    pub url: Option<String>, // the cover wanted
+    pub image: Option<Protocol>, // the one on show; the last song's until the new one arrives
 }
 
-/// Spotify's 64 px copy of a 640 px album cover (they differ only in a size code), for rows; an
-/// artist's portrait comes no smaller than 160 px.
-pub fn small(url: &str) -> String {
-    url.replacen("ab67616d0000b273", "ab67616d00004851", 1).replacen("ab6761610000e5eb", "ab6761610000f178", 1)
+/// Client side: what the terminal draws, and its cell size in pixels, as the `attach` arguments.
+/// Call it on the alternate screen. Inside tmux, kitty graphics would need passthrough the player
+/// can't see from here, so that's half blocks.
+pub fn query_terminal() -> [String; 2] {
+    // tmux doesn't answer the query, and a query left waiting would go on to eat the first key
+    // and take the terminal out of raw mode: don't ask
+    if std::env::var_os("TMUX").is_some() {
+        return ["halfblocks".into(), "10x20".into()];
+    }
+    let picker = Picker::from_query_stdio_with_options(QueryStdioOptions { timeout: Duration::from_millis(500), ..Default::default() });
+    let Ok(picker) = picker else { return ["halfblocks".into(), "10x20".into()] };
+    let name = match picker.protocol_type() {
+        _ if picker.tmux_detected() => "halfblocks",
+        ProtocolType::Kitty => "kitty",
+        ProtocolType::Sixel => "sixel",
+        ProtocolType::Iterm2 => "iterm2",
+        ProtocolType::Halfblocks => "halfblocks",
+    };
+    let size = picker.font_size();
+    [name.into(), format!("{}x{}", size.width, size.height)]
+}
+
+/// Player side: a picker for what the client said.
+pub fn picker(protocol: &str, cell: &str) -> Picker {
+    let cell = cell.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
+    let (w, h) = cell.filter(|&(w, h): &(u16, u16)| w > 0 && h > 0).unwrap_or((10, 20));
+    // deprecated for apps that have a terminal to ask; ours answered in the client
+    #[allow(deprecated)]
+    let mut p = Picker::from_fontsize(ratatui_image::FontSize::new(w, h));
+    p.set_protocol_type(match protocol {
+        "kitty" => ProtocolType::Kitty,
+        "sixel" => ProtocolType::Sixel,
+        "iterm2" => ProtocolType::Iterm2,
+        _ => ProtocolType::Halfblocks,
+    });
+    p
+}
+
+/// How wide the art is: square, in cells that usually aren't.
+fn columns(p: &Picker) -> u16 {
+    let cell = p.font_size();
+    (ROWS as f32 * cell.height as f32 / cell.width as f32).round() as u16
+}
+
+/// Kitty draws to the pixel, so the art can fall short of its cells: the player strip's top is
+/// set off by the rule above it, and this keeps the bottom off the status line. Half blocks and
+/// sixels get it as it is, with no transparency to count on.
+fn inset(image: image::DynamicImage, picker: &Picker, size: ratatui::layout::Size) -> image::DynamicImage {
+    if picker.protocol_type() != ProtocolType::Kitty {
+        return image;
+    }
+    let cell = picker.font_size();
+    let (w, h) = ((size.width * cell.width) as u32, (size.height * cell.height) as u32);
+    let side = (h - h / 10).min(w);
+    let mut canvas = image::RgbaImage::new(w, h);
+    image::imageops::overlay(&mut canvas, &image.resize_to_fill(side, side, FilterType::Lanczos3).to_rgba8(), 0, 0);
+    canvas.into()
 }
 
 /// The 300 px copy, for the header over a list (320 px for a portrait, and a playlist's
@@ -38,13 +87,13 @@ fn disk_path(url: &str) -> PathBuf {
     cache_dir().join("art").join(name)
 }
 
-/// An image fetched before, from disk: a few KB, quick enough to read while drawing.
-pub fn cached(url: &str) -> Option<Vec<u8>> {
+/// An image fetched before, from disk.
+fn cached(url: &str) -> Option<Vec<u8>> {
     fs::read(disk_path(url)).ok().filter(|b| !b.is_empty())
 }
 
 /// From disk if it's been fetched before, else from Spotify, kept on disk for next time.
-pub async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
+async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
     if let Some(bytes) = cached(url) {
         return Some(bytes);
     }
@@ -59,96 +108,43 @@ pub async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Whether this is a headless render (`SPOT_RUNE="--snap …"`): it runs on a virtual clock that
-/// won't wait for the network, so art is fetched before the frame instead.
-pub fn headless() -> bool {
-    rune::tooling::headless_run().is_some()
-}
-
-/// Fetch now, blocking: for headless renders only.
-pub fn fetch_blocking(rt: &tokio::runtime::Handle, url: &str) -> Option<Vec<u8>> {
-    let (rt, url) = (rt.clone(), url.to_string());
-    std::thread::spawn(move || rt.block_on(fetch_bytes(&url))).join().ok().flatten()
-}
-
-async fn fetch(url: &str) -> Option<Cover> {
-    let bytes = fetch_bytes(url).await?;
-    let url = url.to_string();
-    tokio::task::spawn_blocking(move || {
-        let tint = tint(&image::load_from_memory(&bytes).ok()?);
-        Some(Cover { url, bytes: Arc::new(bytes), tint })
-    })
-    .await
-    .ok()?
-}
-
-/// The color a cover is mostly made of: the heaviest of 12 hue buckets, weighting each pixel by
-/// how colorful it is, so a red sleeve on a black cover gives red, not dark grey. Covers with no
-/// real color (black and white photos) give their plain average.
-pub fn tint(image: &image::DynamicImage) -> [f32; 3] {
-    let small = image.thumbnail(32, 32).to_rgb8();
-    let mut buckets = [([0f32; 3], 0f32); 12];
-    let mut all = [0f32; 3];
-    let n = (small.width() * small.height()).max(1) as f32;
-    for p in small.pixels() {
-        let [r, g, b] = p.0.map(|c| c as f32 / 255.0);
-        all = [all[0] + r, all[1] + g, all[2] + b];
-        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
-        let chroma = max - min;
-        if chroma < 0.08 || max < 0.12 {
-            continue;
-        }
-        let hue = if max == r {
-            ((g - b) / chroma).rem_euclid(6.0)
-        } else if max == g {
-            (b - r) / chroma + 2.0
-        } else {
-            (r - g) / chroma + 4.0
-        };
-        let w = chroma * max;
-        let bucket = &mut buckets[((hue * 2.0) as usize).min(11)];
-        bucket.0 = [bucket.0[0] + r * w, bucket.0[1] + g * w, bucket.0[2] + b * w];
-        bucket.1 += w;
-    }
-    let (sum, w) = buckets.iter().copied().fold(([0.0; 3], 0.0), |a, b| if b.1 > a.1 { b } else { a });
-    // under a few percent of the cover's area worth of color: call it colorless
-    if w < n * 0.02 {
-        return all.map(|c| c / n);
-    }
-    sum.map(|c| c / w)
+async fn fetch(url: &str, picker: Picker) -> Option<Protocol> {
+    let bytes = fetch_bytes(&medium(url)).await?;
+    let size = ratatui::layout::Size::new(columns(&picker), ROWS);
+    let encode = move || {
+        let image = inset(image::load_from_memory(&bytes).ok()?, &picker, size);
+        picker.new_protocol(image, size, Resize::Fit(Some(FilterType::Lanczos3))).ok()
+    };
+    tokio::task::spawn_blocking(encode).await.ok()?
 }
 
 impl App {
-    /// Start fetching the playing song's cover, if that's changed.
+    /// Start fetching the playing song's cover, if that's changed and there's a terminal to show it.
     pub fn sync_art(&mut self) {
+        let Some(picker) = self.terminal.as_ref().map(terminal::Display::picker) else { return };
         let url = self.now().and_then(|t| t.cover.clone());
         if url == self.art.url {
             return;
         }
         self.art.url = url.clone();
         let Some(url) = url else {
-            self.art.cover = None;
+            self.art.image = None;
             return;
         };
-        if headless() {
-            let rt = self.rt.handle().clone();
-            self.art.cover = std::thread::spawn(move || rt.block_on(fetch(&url))).join().ok().flatten();
-            return;
-        }
         let tx = self.tx.clone();
         self.rt.spawn(async move {
-            let cover = fetch(&url).await;
-            if cover.is_none() {
+            let image = fetch(&url, picker).await;
+            if image.is_none() {
                 log::debug!("no album art from {url}");
             }
-            let _ = tx.send(Msg::Art(url, cover));
+            let _ = tx.send(Msg::Art(url, image));
         });
     }
 
-    /// A cover arrived. It's dropped if the song has moved on.
-    pub fn on_art(&mut self, url: String, cover: Option<Cover>) {
-        if self.art.url.as_ref() == Some(&url) && cover.is_some() {
-            self.art.cover = cover;
+    /// A cover arrived. It's dropped if the song has moved on, or the terminal it was made for has.
+    pub fn on_art(&mut self, url: String, image: Option<Protocol>) {
+        if self.art.url.as_ref() == Some(&url) {
+            self.art.image = image;
         }
     }
 }
@@ -158,33 +154,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_red_sleeve_on_black_is_red() {
-        let mut img = image::RgbImage::from_pixel(64, 64, image::Rgb([5, 5, 5]));
-        for y in 20..40 {
-            for x in 20..40 {
-                img.put_pixel(x, y, image::Rgb([200, 30, 40]));
-            }
-        }
-        let [r, g, b] = tint(&image::DynamicImage::ImageRgb8(img));
-        assert!(r > 0.6 && g < 0.2 && b < 0.25, "{r} {g} {b}");
-    }
-
-    #[test]
-    fn grey_covers_give_their_average() {
-        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([128, 128, 128]));
-        let [r, g, b] = tint(&image::DynamicImage::ImageRgb8(img));
-        assert!((r - 0.5).abs() < 0.01 && r == g && g == b);
-    }
-
-    #[test]
     fn medium_mosaics_are_300() {
         assert_eq!(medium("https://mosaic.scdn.co/60/ab67616d00001e02aab67616d00001e02b"), "https://mosaic.scdn.co/300/ab67616d00001e02aab67616d00001e02b");
     }
 
     #[test]
-    fn small_covers_swap_the_size_code() {
-        assert_eq!(small("https://i.scdn.co/image/ab67616d0000b273abc"), "https://i.scdn.co/image/ab67616d00004851abc");
-        assert_eq!(small("https://i.scdn.co/image/ab6765630000ba8aabc"), "https://i.scdn.co/image/ab6765630000ba8aabc");
-        assert_eq!(small("https://i.scdn.co/image/ab6761610000e5ebabc"), "https://i.scdn.co/image/ab6761610000f178abc");
+    fn the_player_gets_what_the_client_saw() {
+        let p = picker("kitty", "16x34");
+        assert_eq!(p.protocol_type(), ProtocolType::Kitty);
+        assert_eq!(columns(&p), 6);
+    }
+
+    #[test]
+    fn anything_else_is_half_blocks() {
+        for (protocol, cell) in [("nonsense", "0x0"), ("halfblocks", "x")] {
+            let p = picker(protocol, cell);
+            assert_eq!(p.protocol_type(), ProtocolType::Halfblocks);
+            assert_eq!(columns(&p), 6);
+        }
+    }
+
+    #[test]
+    fn kitty_art_stops_short_of_its_last_row() {
+        let opaque = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, image::Rgba([9, 9, 9, 255])));
+        let size = ratatui::layout::Size::new(6, 3);
+        let art = inset(opaque.clone(), &picker("kitty", "16x31"), size).to_rgba8();
+        assert_eq!(art.dimensions(), (96, 93));
+        assert_eq!(art.get_pixel(0, 0)[3], 255);
+        assert_eq!(art.get_pixel(0, 83)[3], 255);
+        assert_eq!(art.get_pixel(0, 84)[3], 0);
+        assert_eq!(inset(opaque, &picker("halfblocks", "16x31"), size).width(), 64);
+    }
+
+    #[test]
+    fn kitty_art_is_sent_once_and_only_placed_after_that() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let image = image::DynamicImage::new_rgb8(64, 64);
+        let p = picker("kitty", "16x34");
+        let proto = p.new_protocol(image, ratatui::layout::Size::new(6, 3), Resize::Fit(None)).unwrap();
+        let area = Rect::new(0, 0, 6, 3);
+        let frame = || {
+            let mut buf = Buffer::empty(area);
+            ratatui_image::Image::new(&proto).render(area, &mut buf);
+            buf.content().iter().map(|c| c.symbol().to_string()).collect::<String>()
+        };
+        assert!(frame().contains("\x1b_G"));
+        let second = frame();
+        assert!(!second.contains("\x1b_G"));
+        assert!(second.contains('\u{10EEEE}'));
     }
 }

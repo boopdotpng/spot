@@ -6,13 +6,11 @@ allowed-tools: Bash Monitor
 
 # spot
 
-Full reference: `spot help`.
+Full reference: `spot help`. Everything is named by uri; `status`, `search` and `library` print them.
 
-- `spot status`: if it exits 3, nothing is running, so `spot start` (headless, returns once ready). Never start a second player, and don't `spot quit` unless asked. "not set up yet" means the user has to run `spot` once in a terminal to log in.
-- `spot play <words>` plays one of their playlists by name, else Spotify's top song for the words; `spot play album|artist|song|playlist <words>` picks the kind. The first output line says what it searched (`the top song for '…':`), so check the result is what they meant. If several of their playlists match, it lists them numbered: `spot play N`.
-- For anything the top hit might get wrong (a specific version, a cover vs the original), `spot search <words>` (`--albums`, `--artists`, `--playlists`, `-n 20`, field filters like `artist:x year:1997`), then `spot play N` for result N. Prefer the original over covers and live versions.
-- A song plays now, then the queue and the list carry on. An album, artist or playlist replaces the list (the queue stays). `spot play liked` plays Liked Songs.
-- Podcasts: `spot podcasts` lists followed shows; `spot search <words> --podcasts` or `--episodes`; `spot play podcast <words>` or `spot play episode <words>`. Episodes resume where they were left.
-- `spot queue N…` (or `queue add`) appends results to the queue (`spot queue <words>` works like play), which plays before the list carries on. `spot queue add --at 1 <what>` inserts at a position (1 plays next). `spot queue` shows the queue, and `-n 20` shows more of the list after it. Controls: `pause`, `play`, `next`, `prev`, `seek +10`, `vol 40`, `shuffle on`, `repeat all`, `queue`.
-- Edit the queue with `spot queue rm <which>…` and `spot queue mv <which>… <to>`, where `<which>` is a queue number, a range (`3-5`) or a song uri. Numbers shift when a song ends, so prefer the uris `spot queue` prints, unless you're acting right after reading it. A uri matches every copy of a song queued twice. `mv` keeps the songs in order and puts the first at position `<to>`. Each command prints the new queue, so check it. Only numbered songs can be edited: the list's songs under `then …:` can't, so `add --at 1` to play something before them.
-- DJ: Monitor `spot watch --before 30`. On each `ending` line (it shows what's next), `spot queue add` the next pick if the queue is empty or `next` isn't right. A `skip` line means a media key skipped or seeked (the user acting, e.g. passing on a song; `spot next` doesn't send one); `spot wait skip` blocks until the next one.
+- `spot status` first. Exit code 3 means it isn't running: `spot start` (headless, returns once ready; it comes back paused where it was, so `spot set paused=no` if they want music). Never start a second player, and don't `spot quit` unless asked. "not set up yet" means the user has to run `spot` once in a terminal to log in.
+- Finding music: `spot search <words>` (songs; `--type album|artist|playlist|show|episode`, `-n 20`, filters like `artist:x year:1997`), or `spot library` for their Liked Songs, playlists and podcasts. Prefer the original over covers and live versions.
+- `spot play <uri>`: a song plays now, then the queue and the list carry on; an album, artist, playlist or show replaces the list (`--from <song uri>` starts it there).
+- `spot queue <uri>...` sets the whole queue in order, so include what's already queued that should stay (from `status`). It plays before the list carries on. `spot queue clear` empties it.
+- `spot set paused=yes|no volume=40|+10 shuffle=on repeat=off|all|one seek=1:30|+10`, `spot next`, `spot prev`. Commands that change something print the status after; check it.
+- DJ: Monitor `spot watch`. On each `ending` line (30s before a song ends, with what's next), set the queue if it's empty or the next song isn't right. A `skip` line means the user skipped or seeked with a media key, e.g. passing on a song.

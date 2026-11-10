@@ -2,13 +2,15 @@
 name = "spot"
 version = "2.0.0"
 edition = "2024"
-description = "Tiny Spotify player for macOS, with a command line"
+description = "Tiny Spotify TUI, with a command line"
 repository = "https://github.com/boopdotpng/spot"
 
 [dependencies]
 librespot-core = "0.8"
 librespot-playback = "0.8"
 librespot-oauth = "0.8"
+ratatui = "0.30"
+unicode-width = "0.2"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
@@ -21,22 +23,16 @@ souvlaki = "0.8.3"
 rand = "0.9"
 md-5 = "0.10"
 open = "5"
+terminal-colorsaurus = "1"
 toml = "1.1.8"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-# Rune is pre-release. spot builds its own fork: upstream's dev branch plus spot's fixes, on the
-# fork's `spot` branch (boopdotpng/rune), pinned to a rev. To change Rune, commit to that branch
-# and bump the rev; to try a change first, point a local `[patch]` at a checkout.
-rune = { git = "https://github.com/boopdotpng/rune", rev = "e4e97b1d44c3ad6f85e3612a10fff44a5aac8dbb", default-features = false, features = ["metal-backend", "accessibility", "embedded-fonts"] }
 
-# AppKit for what Rune doesn't cover: the menu bar's order (src/gui/menus.rs), the quick search
-# panel's Space and position (src/gui/launcher.rs). The versions Rune uses.
+# macOS takes media key / Control Center commands on the main thread
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5.2"
-block2 = "0.5"
-objc2-foundation = { version = "0.2.2", features = ["block2", "NSGeometry", "NSNotification", "NSOperation", "NSString", "NSThread"] }
-objc2-app-kit = { version = "0.2.2", features = ["block2", "NSAppearance", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSWindow", "NSWorkspace"] }
+dispatch = "0.2"
 
-# Local release builds (bundle.sh, `cargo build --release`) are incremental: an edit rebuilds in
+# Local release builds (install.sh, `cargo build --release`) are incremental: an edit rebuilds in
 # seconds rather than minutes. Published builds use the dist profile below.
 [profile.release]
 opt-level = 3
