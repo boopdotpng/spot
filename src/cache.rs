@@ -94,6 +94,21 @@ pub fn shows_path() -> PathBuf {
     cache_dir().join("shows")
 }
 
+/// How long a song plays before it's recently played, and how many of each are kept.
+pub const HEARD_MS: u64 = 30_000;
+pub const RECENT_LISTS: usize = 12;
+pub const RECENT_SONGS: usize = 30;
+
+/// A recently played song or episode (the rest are lists).
+pub fn is_song(uri: &str) -> bool {
+    uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")
+}
+
+/// What was played lately, for the launcher (`spot launcher lists`).
+pub fn recent_path() -> PathBuf {
+    cache_dir().join("recent")
+}
+
 /// Where each episode was left (ms, or HEARD), one `uri, ms` per line. Not a cache: `spot clean` keeps it.
 fn episodes_path() -> PathBuf {
     cache_dir().join("episodes")
@@ -232,6 +247,21 @@ pub fn read_about(uri: &str) -> Vec<String> {
 
 pub fn save_about(uri: &str, about: &[String]) {
     write_atomic(&about_path(uri), &about.iter().map(|l| format!("{}\n", clean(l))).collect::<String>());
+}
+
+/// An album's own artists (uri, name), as its metadata credits them, kept next to its songs:
+/// a song on it can credit more (a feature) or fewer.
+fn album_by_path(uri: &str) -> PathBuf {
+    tracks_path(&format!("{}.by", uri_key(uri)))
+}
+
+pub fn read_album_by(uri: &str) -> Vec<(String, String)> {
+    let s = fs::read_to_string(album_by_path(uri)).unwrap_or_default();
+    s.lines().filter_map(|l| l.split_once('\t')).map(|(u, n)| (u.to_string(), n.to_string())).collect()
+}
+
+pub fn save_album_by(uri: &str, artists: &[(String, String)]) {
+    write_atomic(&album_by_path(uri), &artists.iter().map(|(u, n)| format!("{u}\t{}\n", clean(n))).collect::<String>());
 }
 
 pub fn save_tracks(path: &std::path::Path, tracks: &[Track]) {

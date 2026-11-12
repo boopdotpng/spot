@@ -1,20 +1,23 @@
+// spot patch: fixed values in place of build.rs's. It ran git in spot's repo (so the sha was
+// spot's, not librespot's) and drew a random build id, so every commit rebuilt librespot.
+
 /// Version string of the form "librespot-\<sha\>"
-pub const VERSION_STRING: &str = concat!("librespot-", env!("VERGEN_GIT_SHA"));
+pub const VERSION_STRING: &str = concat!("librespot-v", env!("CARGO_PKG_VERSION"));
 
 /// Generate a timestamp string representing the build date (UTC).
-pub const BUILD_DATE: &str = env!("VERGEN_BUILD_DATE");
+pub const BUILD_DATE: &str = "unknown";
 
 /// Short sha of the latest git commit.
-pub const SHA_SHORT: &str = env!("VERGEN_GIT_SHA");
+pub const SHA_SHORT: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Date of the latest git commit.
-pub const COMMIT_DATE: &str = env!("VERGEN_GIT_COMMIT_DATE");
+pub const COMMIT_DATE: &str = "unknown";
 
 /// Librespot crate version.
 pub const SEMVER: &str = env!("CARGO_PKG_VERSION");
 
-/// A random build id.
-pub const BUILD_ID: &str = env!("LIBRESPOT_BUILD_ID");
+/// A build id (random per build upstream).
+pub const BUILD_ID: &str = "spot";
 
 /// The protocol version of the Spotify desktop client.
 pub const SPOTIFY_VERSION: u64 = 124200290;

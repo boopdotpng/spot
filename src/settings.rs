@@ -94,8 +94,6 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
                     }
                 }
             }
-            // settings of spot's window, and of the old ⌥Space launcher: let be
-            ("hotkey" | "appearance" | "popup" | "popup_seconds", _) => {}
             _ => bad.push(format!("unknown setting {key}")),
         }
     }
@@ -199,12 +197,6 @@ mod tests {
         assert!(Settings::default().normalize);
         assert!(!parse("normalize = false").0.normalize);
         assert_eq!(parse("normalize = 1").1.len(), 1);
-    }
-
-    #[test]
-    fn window_and_launcher_settings_are_let_be() {
-        let (_, bad) = parse("hotkey = \"option+space\"\nappearance = \"dark\"\npopup = \"off\"\npopup_seconds = 5\n");
-        assert!(bad.is_empty(), "{bad:?}");
     }
 
     #[test]

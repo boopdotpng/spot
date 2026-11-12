@@ -149,7 +149,7 @@ pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
 }
 
 pub fn liked() -> Playlist {
-    Playlist { id: None, name: "♥  Liked Songs".into(), image: None, rank: 0 } // the heart overhangs its cell in many fonts
+    Playlist { id: None, name: "Liked Songs".into(), image: None, rank: 0 } // the sidebar puts a heart in its gutter
 }
 
 /// The smallest of a list of images that's still sharp in the sidebar (Spotify lists them
@@ -215,16 +215,16 @@ pub fn parse_link(ty: &str, v: &Value) -> Option<Link> {
             format!("by {by} · {}", plural(v["tracks"]["total"].as_u64().unwrap_or(0) as usize, "song"))
         }
         "show" => plural(v["total_episodes"].as_u64().unwrap_or(0) as usize, "episode"),
-        _ => v["genres"].as_array().map(|g| g.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
+        _ => String::new(), // an artist: only the name (Spotify's genres for them are noise)
     };
     let single = v["album_type"] == "single";
     let image = v["images"].as_array().and_then(|i| i.first()?["url"].as_str()).map(String::from);
     Some(Link { uri: v["uri"].as_str()?.into(), name: v["name"].as_str().unwrap_or("?").into(), sub, single, image })
 }
 
-/// One search for songs, albums and artists together, up to `n` of each.
+/// One search for songs, albums, artists, playlists and podcasts together, up to `n` of each.
 pub async fn search_all(api: &Api, q: &str, n: usize) -> Result<Value, String> {
-    let url = reqwest::Url::parse_with_params(&format!("{API}/search"), &[("q", q), ("type", "track,album,artist"), ("limit", &n.to_string())]).map_err(|e| e.to_string())?;
+    let url = reqwest::Url::parse_with_params(&format!("{API}/search"), &[("q", q), ("type", "track,album,artist,playlist,show"), ("limit", &n.to_string())]).map_err(|e| e.to_string())?;
     api.get(url.as_str()).await.map_err(|e| format!("search: {e}"))
 }
 
@@ -251,6 +251,8 @@ pub struct Mixed<'a> {
     pub tracks: Vec<&'a Value>,
     pub albums: Vec<&'a Value>,
     pub artists: Vec<&'a Value>,
+    pub playlists: Vec<&'a Value>, // as Spotify ranks them (it leaves holes where its own would be)
+    pub shows: Vec<&'a Value>,
 }
 
 pub fn mixed<'a>(q: &str, v: &'a Value) -> Mixed<'a> {
@@ -284,7 +286,8 @@ pub fn mixed<'a>(q: &str, v: &'a Value) -> Mixed<'a> {
     let tracks = tracks.into_iter().filter(|i| fresh("track", i)).collect();
     let albums = albums.into_iter().filter(|i| fresh("album", i)).collect();
     let artists = artists.into_iter().filter(|i| fresh("artist", i)).collect();
-    Mixed { top, tracks, albums, artists }
+    let whole = |k: &str| items(v, k).into_iter().filter(|i| i["uri"].is_string()).collect();
+    Mixed { top, tracks, albums, artists, playlists: whole("playlists"), shows: whole("shows") }
 }
 
 /// Search Spotify for `n` results of a type (track, album, artist, playlist, show or episode), each page handed

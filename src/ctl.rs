@@ -165,7 +165,7 @@ fn key_uri(key: &str) -> Option<String> {
 }
 
 fn playlist_name(p: &Playlist) -> &str {
-    if p.id.is_none() { "Liked Songs" } else { &p.name } // not the sidebar's heart
+    &p.name
 }
 
 fn list_name(q: &Queue) -> &str {
@@ -249,6 +249,7 @@ impl App {
             }
             "library" => return Ok(Some(self.library_text())),
             "search" => return self.search_cmd(args, reply),
+            "launcher" => return self.launcher_cmd(args, reply),
             "play" => {
                 let from = opt(&mut args, "--from")?.map(|f| link_uri(&f));
                 let [uri] = &args[..] else { return Err(usage("play: one uri (--from <song uri> starts a list at that song)")) };
@@ -311,7 +312,7 @@ impl App {
     }
 
     /// `queue <uri>…` sets the whole queue; `queue clear` empties it.
-    fn queue_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
+    pub(crate) fn queue_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
         if args.is_empty() {
             return Err(usage("queue: the uris it should hold, in order (`spot queue clear` empties it)"));
         }

@@ -67,5 +67,3 @@ accent = "#7aa2f7"
 text = "#c0caf5"
 sub = "#7982a9"
 ```
-
-`hotkey` and `appearance`, settings of the 2.0 window version, are ignored.

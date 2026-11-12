@@ -15,7 +15,8 @@ rust-version = "1.85"
 name = "librespot-core"
 version = "0.8.0"
 authors = ["Paul Lietar <paul@lietar.net>"]
-build = "build.rs"
+# spot patch: no build script (it stamped spot's git sha and a random id, rebuilding librespot
+# on every commit); src/version.rs has fixed values instead
 autolib = false
 autobins = false
 autoexamples = false
@@ -260,16 +261,3 @@ default-features = false
 [dev-dependencies.tokio]
 version = "1"
 features = ["macros"]
-
-[build-dependencies.rand]
-version = "0.9"
-features = ["thread_rng"]
-default-features = false
-
-[build-dependencies.rand_distr]
-version = "0.5"
-
-[build-dependencies.vergen-gitcl]
-version = "1.0"
-features = ["build"]
-default-features = false

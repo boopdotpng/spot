@@ -43,6 +43,7 @@ mod cli;
 mod ctl;
 mod keys;
 mod lastfm;
+mod launch;
 mod lists;
 mod metadata;
 mod model;
@@ -108,10 +109,59 @@ pub fn trim_heap() {
     }
 }
 
+/// Log levels by module path prefix; the longest matching prefix wins, else the first entry.
+const LOG_LEVELS: &[(&str, log::LevelFilter)] = {
+    use log::LevelFilter::*;
+    &[("", Info), ("spot", Debug), ("librespot", Debug), ("symphonia_bundle_mp3", Error)]
+};
+
+/// Lines like `[2026-11-10T12:34:56.789Z INFO  spot::app] text`, to a file.
+struct FileLog(std::sync::Mutex<std::io::LineWriter<fs::File>>);
+
+impl log::Log for FileLog {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        let level = LOG_LEVELS.iter().filter(|(p, _)| m.target().starts_with(p)).max_by_key(|(p, _)| p.len());
+        level.is_some_and(|&(_, l)| m.level() <= l)
+    }
+
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let line = format!("[{} {:<5} {}] {}\n", utc_time(now), r.level(), r.target(), r.args());
+        if let Ok(mut f) = self.0.lock() {
+            let _ = std::io::Write::write_all(&mut *f, line.as_bytes());
+        }
+    }
+
+    fn flush(&self) {
+        if let Ok(mut f) = self.0.lock() {
+            let _ = std::io::Write::flush(&mut *f);
+        }
+    }
+}
+
+/// `2026-11-10T12:34:56.789Z` for a time since the Unix epoch.
+fn utc_time(since_epoch: Duration) -> String {
+    let secs = since_epoch.as_secs() as i64;
+    // days since 1970 to a civil date: Howard Hinnant's civil_from_days
+    let z = secs.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    let y = yoe + era * 400 + (m <= 2) as i64;
+    let t = secs.rem_euclid(86400);
+    let ms = since_epoch.subsec_millis();
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{ms:03}Z", t / 3600, t / 60 % 60, t % 60)
+}
+
 /// Always writes a detailed log (spot + librespot at debug) to ~/.cache/spot/log: the player
 /// runs without a terminal of its own. The previous run's log is kept as log.1.
 fn init_log() {
-    let spec = "info,spot=debug,librespot=debug,symphonia_bundle_mp3=error";
     let path = cache_dir().join("log");
     let _ = fs::create_dir_all(cache_dir());
     let _ = fs::rename(&path, path.with_extension("1"));
@@ -119,18 +169,17 @@ fn init_log() {
         Ok(f) => f,
         Err(e) => return eprintln!("spot: can't open {}: {e}", path.display()),
     };
-    env_logger::Builder::new()
-        .parse_filters(spec)
-        .target(env_logger::Target::Pipe(Box::new(file)))
-        .write_style(env_logger::WriteStyle::Never)
-        .format_timestamp_millis()
-        .init();
+    let max = LOG_LEVELS.iter().map(|&(_, l)| l).max().unwrap_or(log::LevelFilter::Info);
+    let logger = Box::leak(Box::new(FileLog(std::sync::Mutex::new(std::io::LineWriter::new(file)))));
+    if log::set_logger(logger).is_ok() {
+        log::set_max_level(max);
+    }
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("panic: {info}");
         hook(info);
     }));
-    log::info!("spot {} starting, log filter {spec:?}", env!("CARGO_PKG_VERSION"));
+    log::info!("spot {} starting", env!("CARGO_PKG_VERSION"));
 }
 
 fn main() {
@@ -381,6 +430,7 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         pinned: read_pinned(),
         pl_state: Sel::with(Some(0)),
         shows: podcast_home().into_iter().chain(read_links(&shows_path())).collect(),
+        recent: read_links(&recent_path()),
         sh_state: Sel::with(Some(0)),
         podcasts: false,
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },
@@ -428,11 +478,13 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         lastfm,
         listen: None,
         plays: 0,
+        heard: false,
         finished: false,
         ctl: ctl::State::default(),
         quit: false,
         terminal: None,
         art: Default::default(),
+        act_on_load: None,
         shuffle_on_load: None,
     };
 
@@ -468,6 +520,7 @@ impl App {
             self.run_search();
             changed = true;
         }
+        changed |= self.note_heard();
         self.tick_watchers();
         changed
     }
@@ -476,6 +529,11 @@ impl App {
     /// `every_second` (a clock on show, or `spot watch`ers waiting for a song to be ending).
     pub fn next_wake(&self, every_second: bool) -> Option<Instant> {
         let mut next = [self.note.as_ref().map(|n| n.1), self.vol_until, self.load_at, self.search_at].into_iter().flatten().min();
+        // the moment the song playing has been heard long enough to be recently played
+        if self.playing && !self.heard {
+            let at = Instant::now() + Duration::from_millis(HEARD_MS.saturating_sub(self.position()) + 5);
+            next = Some(next.map_or(at, |n| n.min(at)));
+        }
         if self.playing && (every_second || !self.ctl.watchers().is_empty()) {
             // on the clock's next whole second
             let into = self.position() % 1000;
@@ -497,5 +555,20 @@ impl App {
             let _ = self.rt.block_on(tokio::time::timeout(Duration::from_secs(3), async move { fm.drain().await }));
         }
         std::process::exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_times() {
+        let at = |s: u64, ms: u64| utc_time(Duration::from_millis(s * 1000 + ms));
+        assert_eq!(at(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(at(951_782_400, 5), "2000-02-29T00:00:00.005Z");
+        assert_eq!(at(1_000_000_000, 0), "2001-09-09T01:46:40.000Z");
+        assert_eq!(at(1_793_836_799, 999), "2026-11-04T23:59:59.999Z");
+        assert_eq!(at(4_107_542_400, 0), "2100-03-01T00:00:00.000Z");
     }
 }

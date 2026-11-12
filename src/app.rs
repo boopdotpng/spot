@@ -22,6 +22,21 @@ impl By {
         By { names: t.artists.clone(), artists: artist_links(t) }
     }
 
+    /// An album's own artists (see `read_album_by`); None when they aren't known.
+    pub fn album(artists: Vec<(String, String)>) -> Option<By> {
+        let names = artists.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ");
+        (!artists.is_empty()).then_some(By { names, artists })
+    }
+
+    /// Whose `t`'s album likely is before its own artists are known: the song's first artist,
+    /// not the features.
+    pub fn lead(t: &Track) -> By {
+        match id_uri("artist", t.artist_id).filter(|_| t.lead > 0) {
+            Some(uri) => By::one(uri, t.artists[..t.lead].to_string()),
+            None => By::of(t),
+        }
+    }
+
     /// One artist's.
     pub fn one(uri: String, name: String) -> By {
         By { names: name.clone(), artists: vec![(uri, name)] }
@@ -69,11 +84,12 @@ pub struct View {
     pub by: Option<By>,         // an album: whose it is
     pub about: Vec<String>,     // an album: its footer (see Msg::About)
     pub hit: Option<Hit>,       // a search of everything: its top result
+    pub failed: Option<String>, // why it's empty: what loading it ran into
 }
 
 impl View {
     pub fn new(id: u64, key: String, title: String, kind: Kind) -> Self {
-        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None, about: vec![], hit: None }
+        View { id, key, title, kind, tracks: Arc::default(), links: vec![], loading: true, artist: None, releases: vec![], filter: Releases::All, want: None, order: vec![], info: None, portrait: None, by: None, about: vec![], hit: None, failed: None }
     }
     pub fn len(&self) -> usize {
         if self.kind == Kind::Tracks { self.tracks.len() } else { self.links.len() }
@@ -142,6 +158,7 @@ pub struct App {
     pub pl_state: Sel,
     pub pinned: Vec<String>, // playlist ids kept at the top of the sidebar
     pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
+    pub recent: Vec<Link>,   // what was played lately, newest first: the ⌥Space launcher's empty bar
     pub sh_state: Sel,
     pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
     pub view: View,
@@ -189,11 +206,13 @@ pub struct App {
     pub lastfm: Option<Arc<LastFm>>,
     pub listen: Option<Listen>, // current play, for scrobbling (only with lastfm)
     pub plays: u64,             // bumped per song started, so `spot watch` can tell plays apart
+    pub heard: bool,            // the song playing has gone into the recently played (HEARD_MS in)
     pub finished: bool,         // the queue ran out
     pub ctl: ctl::State,
     pub quit: bool,
     pub terminal: Option<terminal::Display>, // the attached TUI, if one is
     pub art: art::Art,
+    pub act_on_load: Option<u64>, // a search enter was pressed on before its results came: play its top result once they do
     pub shuffle_on_load: Option<u64>, // a view to shuffle and play once it's all loaded
 }
 
@@ -272,6 +291,9 @@ impl App {
                 if self.tr_state.selected().is_none() && !self.view.tracks.is_empty() {
                     self.tr_state.select(Some(0));
                 }
+                if self.act_on_load == Some(view) && (done || !self.view.tracks.is_empty()) {
+                    self.act_on_found();
+                }
                 // goto show: land on the episode we came from
                 if self.find.is_none()
                     && let Some(w) = &self.view.want
@@ -281,9 +303,12 @@ impl App {
                     self.view.want = None;
                 }
             }
-            Msg::About { view, about } => {
+            Msg::About { view, about, artists } => {
                 if let Some(v) = self.view_mut(view) {
                     v.about = about;
+                    if let Some(by) = By::album(artists) {
+                        v.by = Some(by);
+                    }
                 }
             }
             Msg::Links { view, links, done } => {
@@ -338,15 +363,42 @@ impl App {
             Msg::Found { view, found } => {
                 let Some(v) = self.view_mut(view) else { return };
                 let (hit, info) = *found;
+                let by = hit.as_ref().and_then(|h| h.by.clone());
                 v.hit = hit;
                 v.info = Some(Arc::new(info));
                 v.set_top();
                 v.loading = false;
+                // more by the top result's artist: from their releases as last seen, looked up
+                // when that's never or a day ago
+                let mut stale = None;
+                if let Some((uri, _)) = by {
+                    let path = releases_path(&uri);
+                    v.set_more(read_links(&path));
+                    let fresh = fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|e| e < Duration::from_secs(86400)));
+                    stale = (!fresh).then_some(uri);
+                }
                 if view == self.view.id {
                     // the cursor starts on the top result
                     let first = self.blocks().first().map_or(0, |b| b.start);
                     self.tr_state.select(Some(first));
+                    if self.act_on_load == Some(view) {
+                        self.act_on_found();
+                    }
                 }
+                if let Some(uri) = stale {
+                    self.rt.spawn(more_by(self.sess.subscribe(), self.tx.clone(), view, uri));
+                }
+            }
+            Msg::More { view, links } => {
+                if let Some(v) = self.view_mut(view).filter(|v| v.is_search_all()) {
+                    v.set_more(links);
+                }
+            }
+            Msg::Failed { view, error } => {
+                log::error!("{error}");
+                let Some(v) = self.view_mut(view) else { return };
+                v.loading = false;
+                v.failed = Some(error);
             }
             Msg::Error(e) => {
                 log::error!("{e}");

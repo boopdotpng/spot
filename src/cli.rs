@@ -120,7 +120,7 @@ pub fn launch(say: bool) -> i32 {
         }
         return 0;
     }
-    let id = std::env::var_os("SPOT_CLIENT_ID").is_some() || settings::load().0.client_id.is_some() || old_client_id().is_some();
+    let id = std::env::var_os("SPOT_CLIENT_ID").is_some() || settings::load().0.client_id.is_some();
     if !id || !cache_dir().join("refresh_token").exists() || !cache_dir().join("credentials.json").exists() {
         eprintln!("spot: {NOT_SET_UP}");
         return 1;

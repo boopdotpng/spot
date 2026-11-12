@@ -31,7 +31,11 @@ pub async fn fetch_list(api: Arc<Api>, sess: Sess, uri: &str, cached: &[Track], 
             if about != read_about(uri) {
                 save_about(uri, &about);
             }
-            let _ = tx.send(Msg::About { view, about });
+            let artists: Vec<(String, String)> = a.artist.iter().filter_map(|x| Some((gid_uri("artist", x.gid())?, x.name().to_string()))).collect();
+            if !artists.is_empty() && artists != read_album_by(uri) {
+                save_album_by(uri, &artists);
+            }
+            let _ = tx.send(Msg::About { view, about, artists });
             a.disc.iter().flat_map(|d| d.track.iter()).filter_map(|t| gid_uri("track", t.gid())).collect()
         };
         let tracks = send_tracks(&session, &uris, artist, cached.is_empty(), tx, view).await?;
@@ -62,6 +66,17 @@ pub async fn load_list(api: Arc<Api>, sess: Sess, tx: mpsc::Sender<Msg>, view: u
 
 /// Albums as openable links, newest first: their covers, and "2024 album · 12 songs" (or, `by`,
 /// whose they are, for releases an artist only appears on).
+/// "album", "single", "EP" or "compilation".
+fn album_kind(a: &PbAlbum) -> &'static str {
+    use librespot_protocol::metadata::album::Type;
+    match a.type_() {
+        Type::SINGLE => "single",
+        Type::EP => "EP",
+        Type::COMPILATION => "compilation",
+        _ => "album",
+    }
+}
+
 async fn release_links(session: &Session, albums: &[String], by: bool) -> Result<Vec<Link>, String> {
     use librespot_protocol::metadata::album::Type;
     let found = batch_meta::<PbAlbum>(session, albums, ExtensionKind::ALBUM_V4).await?;
@@ -69,12 +84,7 @@ async fn release_links(session: &Session, albums: &[String], by: bool) -> Result
         .iter()
         .filter_map(|u| {
             let a = found.get(u)?;
-            let kind = match a.type_() {
-                Type::SINGLE => "single",
-                Type::EP => "EP",
-                Type::COMPILATION => "compilation",
-                _ => "album",
-            };
+            let kind = album_kind(a);
             let year = if a.date.year() > 0 { format!("{} ", a.date.year()) } else { String::new() };
             let sub = if by {
                 let names: Vec<&str> = a.artist.iter().map(|x| x.name()).collect();
@@ -118,6 +128,23 @@ pub async fn artist_releases(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: 
     }
 }
 
+/// A search's top result's artist: their releases for its "more by" line (and the cache their
+/// page reads). Quiet when it fails: the line just isn't there.
+pub async fn more_by(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String) {
+    let res = async {
+        let session = ready(sess).await?;
+        let albums = artist_albums(&session, &uri).await?;
+        let links = release_links(&session, &albums, false).await?;
+        save_links(&releases_path(&uri), &links);
+        let _ = tx.send(Msg::More { view, links });
+        Ok::<_, String>(())
+    }
+    .await;
+    if let Err(e) = res {
+        log::warn!("more by {uri}: {e}");
+    }
+}
+
 fn changed(a: &[Link], b: &[Link]) -> bool {
     !same_uris(a.iter().map(|l| &l.uri), b.iter().map(|l| &l.uri)) || a.iter().zip(b).any(|(a, b)| a.name != b.name || a.sub != b.sub || a.image != b.image)
 }
@@ -151,7 +178,7 @@ const APPEARS: usize = 12;
 pub async fn artist_overview(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: String, cached: Option<Arc<ArtistInfo>>) {
     let res = async {
         let session = ready(sess).await?;
-        let a = batch_meta::<PbArtist>(&session, &[uri.clone()], ExtensionKind::ARTIST_V4)
+        let a = batch_meta::<PbArtist>(&session, std::slice::from_ref(&uri), ExtensionKind::ARTIST_V4)
             .await?
             .remove(&uri)
             .ok_or("artist not found")?;
@@ -175,7 +202,7 @@ pub async fn artist_overview(sess: Sess, tx: mpsc::Sender<Msg>, view: u64, uri: 
             .collect();
         let portrait = image_url(&a.portrait_group.image).or_else(|| image_url(&a.portrait));
         let bio = a.biography.first().map(|b| plain_bio(b.text())).unwrap_or_default();
-        let info = ArtistInfo { portrait, top, releases, appears, related, bio };
+        let info = ArtistInfo { portrait, top, releases, appears, related, bio, ..Default::default() };
         // the discography page reads the same releases
         save_links(&releases_path(&uri), &info.releases);
         save_artist(&uri, &info);
@@ -412,7 +439,8 @@ pub async fn playlist_tracks(sess: Sess, id: &str, cached: &[Track], tx: &mpsc::
     ))
 }
 
-/// An album's footer: when it came out and on what label, then its copyrights ("© 2021 …").
+/// An album's year and kind ("2022 album") for its header, when it came out and on what label,
+/// then its copyrights ("© 2021 …").
 fn about(a: &PbAlbum) -> Vec<String> {
     use librespot_protocol::metadata::copyright::Type;
     const MONTHS: [&str; 12] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -440,7 +468,9 @@ fn about(a: &PbAlbum) -> Vec<String> {
             None => rights.push((mark.to_string(), text.to_string())),
         }
     }
-    std::iter::once(first.join(" · ")).chain(rights.into_iter().map(|(m, t)| format!("{m} {t}"))).filter(|l| !l.is_empty()).collect()
+    // first what it is, for the header: "2022 album"
+    let what = if d.year() > 0 { format!("{} {}", d.year(), album_kind(a)) } else { album_kind(a).to_string() };
+    [what, first.join(" · ")].into_iter().chain(rights.into_iter().map(|(m, t)| format!("{m} {t}"))).filter(|l| !l.is_empty()).collect()
 }
 
 pub async fn album_track_uris(session: &Session, albums: &[String]) -> Result<Vec<String>, String> {

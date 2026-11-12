@@ -66,7 +66,7 @@ impl Credentials {
         }
     }
 
-    #[expect(deprecated)]
+    #[allow(deprecated)] // spot patch: was `expect`, unfulfilled (a warning on every build)
     pub fn with_blob(
         username: impl Into<String>,
         encrypted_blob: impl AsRef<[u8]>,

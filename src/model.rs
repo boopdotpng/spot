@@ -100,15 +100,20 @@ pub struct ArtistInfo {
     pub appears: Vec<Link>,  // others' releases they're on; `sub` names whose
     pub related: Vec<Link>,  // fans also like (Spotify often leaves this empty)
     pub bio: String,
+    pub playlists: Vec<Link>, // a search's playlists
+    pub shows: Vec<Link>,     // a search's podcasts
 }
 
 /// The overview's sections of cards.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Section {
     Top, // a search's top result
-    Releases,
-    Appears,
+    Releases, // an artist's albums (their whole discography, with Singles), or a search's
+    Singles,
+    Appears, // on a search: more by the top result's artist
     Related,
+    Playlists, // a search's
+    Shows,
 }
 
 /// Which of an artist's releases their page lists, cycled with `f`.
@@ -228,12 +233,13 @@ impl Playlist {
     }
 }
 
-/// A search's top result: a song, an album or an artist, as a card; a song keeps its track to
-/// play.
+/// A search's top result: a song, an album or an artist, as a card (its line starts with which
+/// it is); a song keeps its track to play.
 #[derive(Clone)]
 pub struct Hit {
     pub link: Link,
     pub song: Option<Track>,
+    pub by: Option<(String, String)>, // the artist it is, or its first artist: uri and name
 }
 
 /// A song (or an episode) as a card: a search's top result.
@@ -243,6 +249,7 @@ pub fn song_link(t: &Track) -> Link {
 }
 
 pub enum Msg {
+    Failed { view: u64, error: String }, // a view's contents couldn't load: shown in its place
     Key(Press),
     Attach(terminal::Attachment),
     Terminal { id: u64, event: terminal::Event },
@@ -256,8 +263,9 @@ pub enum Msg {
     Links { view: u64, links: Vec<Link>, done: bool },
     ReplaceLinks { view: u64, links: Vec<Link> }, // fresh copy of an artist's releases shown from cache
     Artist { view: u64, info: Arc<ArtistInfo> },
+    More { view: u64, links: Vec<Link> }, // a search's top result's artist: their releases, newest first
     Found { view: u64, found: Box<(Option<Hit>, ArtistInfo)> }, // a search of everything: songs, albums (releases) and artists (related)
-    About { view: u64, about: Vec<String> }, // an album's release date and label, then its copyrights  // an artist's overview, fresh (or None came: see lists)
+    About { view: u64, about: Vec<String>, artists: Vec<(String, String)> }, // an album's year and kind ("2022 album"), its release date and label, then its copyrights; and its artists (uri, name)  // an artist's overview, fresh (or None came: see lists)
     Error(String),
     Media(MediaControlEvent),
     Relogin(bool), // true: waiting on browser login; false: it finished

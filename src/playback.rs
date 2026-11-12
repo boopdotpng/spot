@@ -92,6 +92,7 @@ impl App {
         self.pos_ms = pos_ms;
         self.pos_at = None;
         self.plays += 1;
+        self.heard = false;
         self.finished = false;
     }
 
@@ -153,6 +154,10 @@ impl App {
         self.shuffle = last.shuffle;
         self.repeat = last.repeat;
         let t = last.queue.tracks[last.queue.idx()].clone();
+        // the list it carries on with is recently played too (new installs start with it)
+        if let Some(l) = self.recent_link(&last.queue).filter(|l| !self.recent.iter().any(|r| r.uri == l.uri)) {
+            self.remember(l);
+        }
         self.queue = Some(last.queue);
         self.set_cur(&t, last.pos_ms);
         self.sync_media();
@@ -341,10 +346,71 @@ impl App {
 
     /// Make `q` the queue and play it from `start` (None: the top, or a random song if shuffling).
     pub fn play_queue(&mut self, mut q: Queue, start: Option<usize>) {
+        if let Some(l) = self.recent_link(&q) {
+            self.remember(l);
+        }
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
         self.queued = None;
         self.play_fresh();
+    }
+
+    /// What playing `q` adds to the recently played: the list it is, or the song when it's one
+    /// song. Searches, the queue and the podcast lists aren't kept.
+    fn recent_link(&self, q: &Queue) -> Option<Link> {
+        let first = q.tracks.first();
+        let link = |uri: String, name: String, sub: String, image: Option<String>| Some(Link { uri, name, sub, single: false, image });
+        let key = q.key.as_str();
+        if key == "liked" {
+            return link("liked".into(), "Liked Songs".into(), "Playlist".into(), None);
+        }
+        let artist = key.strip_prefix("top:").unwrap_or(key);
+        if artist.starts_with("spotify:artist:") {
+            let name = first.map(|t| t.artists[..t.lead].to_string()).filter(|n| !n.is_empty() && q.tracks.iter().all(|t| t.artists.starts_with(n.as_str())));
+            let name = name.unwrap_or_else(|| q.name.split(" · ").next().unwrap_or(&q.name).to_string());
+            return link(artist.into(), name, "Artist".into(), read_artist(artist).and_then(|a| a.portrait));
+        }
+        if key.starts_with("spotify:track:") || key.starts_with("spotify:episode:") {
+            return first.map(song_link);
+        }
+        if key.starts_with("spotify:album:") {
+            return link(key.into(), q.name.clone(), format!("Album · {}", first.map_or("", |t| t.artists.as_str())), first.and_then(|t| t.cover.clone()));
+        }
+        if key.starts_with("spotify:show:") {
+            return link(key.into(), q.name.clone(), "Podcast".into(), first.and_then(|t| t.cover.clone()));
+        }
+        if key.contains(':') {
+            return None; // a search, the queue, the podcast lists
+        }
+        let image = self.playlists.iter().find(|p| p.id.as_deref() == Some(key)).and_then(|p| p.image.clone());
+        link(format!("spotify:playlist:{key}"), q.name.clone(), "Playlist".into(), image)
+    }
+
+    /// Put `l` first among the recently played (once), and keep the list on disk.
+    /// Lists and songs are kept apart (up to RECENT_LISTS and RECENT_SONGS), so a run of songs
+    /// doesn't push out the lists you started.
+    pub fn remember(&mut self, l: Link) {
+        self.recent.retain(|r| r.uri != l.uri);
+        self.recent.insert(0, l);
+        let mut lists = 0;
+        let mut songs = 0;
+        self.recent.retain(|r| {
+            let n = if is_song(&r.uri) { &mut songs } else { &mut lists };
+            *n += 1;
+            *n <= if is_song(&r.uri) { RECENT_SONGS } else { RECENT_LISTS }
+        });
+        save_links(&recent_path(), &self.recent);
+    }
+
+    /// A song heard for HEARD_MS goes into the recently played. Run from `tick`.
+    pub fn note_heard(&mut self) -> bool {
+        if self.heard || !self.playing || self.position() < HEARD_MS {
+            return false;
+        }
+        self.heard = true;
+        let Some(l) = self.now().map(song_link) else { return false };
+        self.remember(l);
+        true
     }
 
     /// Play what's now current, as a new choice: no retry spent on it, no skip still settling.
@@ -473,7 +539,7 @@ impl App {
         self.show_ready(key, name, tracks, true);
         // an album opened from the player says whose it is, as one opened any other way does
         if album {
-            self.view.by = self.view.tracks.first().map(By::of);
+            self.view.by = By::album(read_album_by(&self.view.key)).or_else(|| self.view.tracks.first().map(By::lead));
             self.view.about = read_about(&self.view.key);
         }
         self.tr_state = Sel::with(self.row_of(idx).unwrap_or(0));

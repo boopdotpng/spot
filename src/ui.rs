@@ -5,24 +5,28 @@ use crate::*;
 
 /// Truncate to at most `max` terminal columns, ending in "…" when cut.
 pub fn fit(s: &str, max: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_width::UnicodeWidthStr;
     if s.width() <= max {
         return s.to_string();
     }
     if max == 0 {
         return String::new();
     }
+    // by grapheme, so an emoji and its variation selector (🗑️ is two chars) are kept or cut together
     let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = c.width().unwrap_or(0);
-        if w + cw > max - 1 {
+    for g in unicode_segmentation::UnicodeSegmentation::graphemes(s, true) {
+        if (out.clone() + g).width() > max - 1 {
             break;
         }
-        out.push(c);
-        w += cw;
+        out.push_str(g);
     }
     out.trim_end().to_string() + "…"
+}
+
+/// The explicit mark: an E chip, one cell of reversed color (like Spotify's label). Plain ASCII,
+/// so every terminal draws it one cell wide, which 🄴 isn't.
+pub fn explicit_chip(color: Color) -> Span<'static> {
+    Span::styled("E", Style::new().fg(color).add_modifier(ratatui::style::Modifier::REVERSED))
 }
 
 /// `w` cells of a thick filled rule followed by a thin empty one, optionally with a knob.
@@ -48,7 +52,7 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("+  -", "volume"),
         ("s", "shuffle"),
         ("r", "repeat"),
-        ("P", "play whole list"),
+        ("P", "play all; artist: shuffle all"),
         ("o", "go to playing"),
         ("e", "add to queue"),
         ("Q", "up next"),
@@ -56,19 +60,18 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("a  A", "album / artist"),
         ("v", "artist: overview/songs/albums"),
         ("f", "releases: all/albums/singles"),
-        ("P", "artist: shuffle all songs"),
         ("S", "playlist: sort by date added"),
         ("m", "playlists / podcasts"),
         ("*", "pin playlist to the top"),
         ("esc  [", "back"),
         ("]", "forward"),
-        ("tab", "switch pane"),
+        ("tab", "switch pane / next section"),
         ("ctrl+t", "theme"),
         ("g  M  G", "top / middle / bottom"),
         ("q", "quit"),
         ("d  ctrl+c", "detach (keep playing)"),
     ];
-    const COL: usize = 40;
+    const COL: usize = 42;
     let cols = (width.saturating_sub(1) / COL).clamp(1, 4);
     let rows = KEYS.len().div_ceil(cols);
     let mut out = vec![Line::from(vec![
@@ -79,8 +82,8 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         let mut spans = vec![Span::raw(" ")];
         for c in 0..cols {
             if let Some((k, d)) = KEYS.get(c * rows + r) {
-                spans.push(Span::styled(format!("{k:>7}  "), Style::new().fg(th.accent).bold()));
-                spans.push(Span::styled(format!("{d:<COL$}", COL = COL - 9), Style::new().fg(th.sub)));
+                spans.push(Span::styled(format!("{k:>9}  "), Style::new().fg(th.accent).bold()));
+                spans.push(Span::styled(format!("{d:<COL$}", COL = COL - 11), Style::new().fg(th.sub)));
             }
         }
         out.push(Line::from(spans));
@@ -110,6 +113,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let width = |spans: &[Span]| spans.iter().map(|s| s.width()).sum::<usize>();
     let dim = Style::new().fg(th.dim);
     let body = f.area();
+    if body.width < MINI_W || body.height < MINI_H {
+        return draw_mini(f, app);
+    }
 
     // A terminal-app frame: two panes split by a thin rule, the player under a rule across the
     // whole width, and a vim-style status line at the bottom carrying the search / find prompts
@@ -159,7 +165,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         } else {
             Style::new().fg(th.text)
         };
-        let m = if playing { mark(app.playing) } else { " " };
+        // the gutter: the play mark, or Liked Songs' heart, so every name starts in one column
+        let m = if playing { mark(app.playing) } else if special && !app.podcasts { "♥" } else { " " };
         ListItem::new(format!(" {m} {}", fit(name, name_w))).style(style)
     };
     let (items, sel): (Vec<ListItem>, _) = if app.podcasts {
@@ -192,7 +199,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         String::new()
     } else if tracks {
         let ms = app.view.tracks.iter().map(|t| t.ms).sum();
-        let mut m = format!("{} · {}", plural(app.view.len(), "song"), hours(ms));
+        let album = app.view.key.starts_with("spotify:album:");
+        // where the cursor is, on lists without numbers: "123/10,447 songs"
+        let count = match app.tr_state.selected().filter(|_| !album && total > 0) {
+            Some(s) => format!("{}/{}", num(s.min(total - 1) + 1), plural(total, "song")),
+            None => plural(app.view.len(), "song"),
+        };
+        let mut m = format!("{count} · {}", hours(ms));
+        // an album: whose, and what ("2022 album")
+        if let Some(what) = app.view.about.first().filter(|_| album).filter(|l| ["album", "single", "EP", "compilation"].iter().any(|k| l.ends_with(k))) {
+            m = format!("{what} · {m}");
+        }
         if let Some(by) = &app.view.by {
             m = format!("{} · {m}", by.names);
         }
@@ -222,7 +239,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let sel = app.tr_state.selected().map(|s| s.min(total.saturating_sub(1)));
     'list: {
         if overview {
-            draw_overview(f, app, table_area, !pl_focus, playing_uri.map(String::from));
+            draw_overview(f, app, table_area, !pl_focus, playing_uri.map(String::from), false);
+            break 'list;
+        }
+        if total == 0 && !app.view.loading && !app.view.key.is_empty() {
+            f.render_widget(Paragraph::new(empty_line(app, th)), line_at(table_area, 1));
             break 'list;
         }
         // Build only the rows that fit: ratatui would otherwise lay out every row of a 10k-song list each frame.
@@ -250,7 +271,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         // only albums are numbered; elsewhere the column holds just the playing mark
         let numbered = tracks && app.view.key.starts_with("spotify:album:");
         let num_w = if numbered { num(app.view.len().max(1)).len() as u16 } else { 1 };
-        let wide = table_area.width >= 90; // room for an album column
+        // room for an album column, which an album's own songs don't need
+        let wide = table_area.width >= 90 && !numbered;
         // episodes: the show, its date, and what's left of it
         let episodes = app.view.tracks.first().is_some_and(Track::is_episode);
         let time_w = if episodes { 11 } else { 5 };
@@ -297,10 +319,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             } else {
                 [th.dim, th.text, th.sub, th.dim, th.dim].map(|c| Style::new().fg(c))
             };
-            // explicit songs get an outlined E (U+1F134) after the title, like Spotify's label
             let title = if t.explicit {
-                let badge = Style::new().fg(if playing { th.accent } else { th.dim });
-                let line = Line::from(vec![Span::raw(fit(&t.name, w[1].saturating_sub(2))), Span::raw(" "), Span::styled("\u{1F134}", badge)]);
+                let line = Line::from(vec![Span::raw(fit(&t.name, w[1].saturating_sub(2))), Span::raw(" "), explicit_chip(if playing { th.accent } else { th.dim })]);
                 Cell::from(line).style(name)
             } else {
                 cell(&t.name, 1, name)
@@ -385,14 +405,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         top_right.push(span);
     };
-    if app.shuffle {
-        add(&mut top_right, Span::styled("shuffle", gold));
-    }
-    match app.repeat {
-        Repeat::Off => {}
-        Repeat::All => add(&mut top_right, Span::styled("repeat", gold)),
-        Repeat::One => add(&mut top_right, Span::styled("repeat 1", gold)),
-    }
+    // the modes are always shown, lit when on, so where they are and what they are is plain
+    let lit = |on: bool| if on { Style::new().fg(th.accent).bold() } else { dim };
+    top_right.push(Span::styled("⇄ shuffle", lit(app.shuffle)));
+    top_right.push(Span::raw("   "));
+    top_right.push(Span::styled(if app.repeat == Repeat::One { "↻ repeat one" } else { "↻ repeat" }, lit(app.repeat != Repeat::Off)));
     if let Some(name) = ctx.filter(|_| cur.is_some()) {
         let ctx_w = Span::raw(name).width();
         if (now.width as usize) >= ctx_w + width(&top_right) + 32 {
@@ -448,7 +465,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             }
             right.push(Span::styled(search_label(k), if k == app.search_kind { gold } else { dim }));
         }
-        right.push(Span::styled("   tab ", dim));
+        right.push(Span::styled(if bw >= 100 { " ⇧tab   ⏎ play · tab browse " } else { " ⇧tab " }, dim));
         (prompt(" /", th.accent, buf, bw.saturating_sub(width(&right) + 2), th), right)
     } else if let Some(buf) = &app.find {
         let right = vec![Span::styled(format!("{} of {} ", num(total), num(app.view.len())), dim)];
@@ -458,9 +475,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         if app.sess.borrow().is_none() {
             right.push(Span::styled("connecting…   ", dim));
         }
-        if app.focus == Focus::Tracks && total > 0 {
-            right.push(Span::styled(format!("{}/{}   ", num(sel.map_or(0, |s| s + 1)), num(total)), dim));
-        }
+        right.push(Span::styled("? keys   ", dim));
         let pct = app.vol_pct();
         if app.vol_until.is_some_and(|u| Instant::now() < u) {
             right.push(Span::styled("vol ", dim));
@@ -494,13 +509,170 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(right_side).right_aligned()), bottom);
 }
 
+/// Below either of these the full layout gives way to the mini player: what's playing, and search.
+const MINI_W: u16 = 60;
+const MINI_H: u16 = 12;
+
+/// The mini player, for a terminal tucked in a corner: the song, its artist and progress, and a
+/// line for search (or what's next). With room, a search's results show between them, a line each.
+fn draw_mini(f: &mut Frame, app: &mut App) {
+    use ratatui::layout::Rect;
+    let th = theme();
+    let dim = Style::new().fg(th.dim);
+    let area = f.area();
+    let w = area.width as usize;
+    let mark = if app.playing { "▶" } else { "‖" };
+    let cur = app.now();
+    let searching = app.input.is_some() || app.view.search_query().is_some();
+    // rows above the prompt line: the player takes three, or one while results want the room
+    let rows = area.height.saturating_sub(1);
+    let results_h = if searching && rows >= 4 { rows - 1 } else { 0 };
+    let np_h = (rows - results_h).min(3);
+    // with nothing between, the song sits in the middle of the spare lines
+    let top = if results_h == 0 { (rows - np_h) / 2 } else { 0 };
+    let line = |y: u16| Rect { x: area.x, y: area.y + y, width: area.width, height: 1 };
+    let np_line = |y: u16| line(top + y);
+
+    // the song: one line (title · artist) when squeezed, else title / artist / bar
+    match cur {
+        Some(t) if np_h == 1 => {
+            let room = w.saturating_sub(3);
+            let name = fit(&t.name, room);
+            let mut spans = vec![Span::styled(format!("{mark} "), Style::new().fg(th.accent).bold()), Span::styled(name.clone(), Style::new().fg(th.text).bold())];
+            let rest = room.saturating_sub(Span::raw(&name).width() + 3);
+            if rest >= 4 {
+                spans.push(Span::styled(" · ", dim));
+                spans.push(Span::styled(fit(&t.artists, rest), Style::new().fg(th.sub)));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), np_line(0));
+        }
+        Some(t) if np_h > 0 => {
+            let title = vec![
+                Span::styled(format!("{mark} "), Style::new().fg(th.accent).bold()),
+                Span::styled(fit(&t.name, w.saturating_sub(2)), Style::new().fg(th.text).bold()),
+            ];
+            f.render_widget(Paragraph::new(Line::from(title)), np_line(0));
+            if np_h >= 2 {
+                f.render_widget(Paragraph::new(Span::styled(format!("  {}", fit(&t.artists, w.saturating_sub(2))), Style::new().fg(th.sub))), np_line(1));
+            }
+            if np_h >= 3 {
+                let (pos, len) = (app.position().min(t.ms), t.ms);
+                let rt = Span::styled(format!(" {}", mmss(len)), dim);
+                let lt = Span::styled(format!("{} ", mmss(pos)), dim);
+                let ratio = if len > 0 { pos as f64 / len as f64 } else { 0.0 };
+                let mut spans = vec![Span::raw("  "), lt];
+                let used = 2 + spans[1].width() + rt.width();
+                spans.extend(meter(w.saturating_sub(used), ratio, true, th));
+                spans.push(rt);
+                f.render_widget(Paragraph::new(Line::from(spans)), np_line(2));
+            }
+        }
+        _ if np_h > 0 => f.render_widget(Paragraph::new(Span::styled("  nothing playing", dim)), np_line(0)),
+        _ => {}
+    }
+
+    // a search's results, a line each
+    if results_h > 0 {
+        let area = Rect { x: area.x, y: area.y + np_h, width: area.width, height: results_h };
+        if app.view.info.is_some() {
+            app.grid_cols.set(1);
+            let playing = app.now().map(|t| t.uri.clone());
+            draw_overview(f, app, area, true, playing, true);
+        } else {
+            draw_mini_list(f, app, area);
+        }
+    }
+
+    // the bottom line: the search prompt, an error or notice, or what's next
+    let bottom = line(area.height.saturating_sub(1));
+    let spans = if let Some(buf) = &app.input {
+        let kind = Span::styled(format!(" {}", search_label(app.search_kind)), dim);
+        let mut v = prompt("/", th.accent, buf, w.saturating_sub(kind.width()), th);
+        let used: usize = v.iter().map(|s| s.width()).sum();
+        if used + kind.width() <= w {
+            v.push(Span::raw(" ".repeat(w - used - kind.width())));
+            v.push(kind);
+        }
+        v
+    } else if let Some(buf) = &app.find {
+        prompt("find", th.gold, buf, w, th)
+    } else if !app.status.is_empty() {
+        vec![Span::styled(fit(&app.status, w), Style::new().fg(th.err).bold())]
+    } else if let Some((n, _)) = &app.note {
+        vec![Span::styled(fit(n, w), Style::new().fg(th.accent))]
+    } else if let Some(n) = app.now().filter(|_| app.repeat != Repeat::One).and_then(|_| app.up_next()) {
+        vec![Span::styled("next ", dim), Span::styled(fit(&n.name, w.saturating_sub(5)), dim)]
+    } else {
+        vec![Span::styled("/ search", dim)]
+    };
+    f.render_widget(Paragraph::new(Line::from(spans)), bottom);
+}
+
+/// A kind-only search's results in the mini player: name · whose, the cursor's highlighted.
+fn draw_mini_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+    let th = theme();
+    let dim = Style::new().fg(th.dim);
+    let shown = app.shown();
+    let total = shown.len();
+    if total == 0 {
+        let l = if app.view.loading { Line::from(Span::styled(" searching…", dim)) } else { empty_line(app, th) };
+        f.render_widget(Paragraph::new(l), area);
+        return;
+    }
+    let h = area.height as usize;
+    let sel = app.tr_state.selected().map(|s| s.min(total - 1));
+    let mut off = app.tr_off.min(total.saturating_sub(h));
+    if let Some(s) = sel {
+        off = off.min(s).max((s + 1).saturating_sub(h));
+    }
+    let w = (area.width as usize).saturating_sub(1);
+    let sel_bg = Style::new().bg(th.hl).bold();
+    let mut lines = vec![];
+    for r in off..(off + h).min(total) {
+        let Some(i) = shown.get(r) else { break };
+        let (name, sub) = if app.view.kind == Kind::Tracks {
+            let t = &app.view.tracks[i];
+            (t.name.as_str(), t.artists.as_str())
+        } else {
+            let l = &app.view.links[i];
+            (l.name.as_str(), l.sub.as_str())
+        };
+        let here = sel == Some(r);
+        let name = fit(name, w);
+        let mut spans = vec![Span::styled(if here { "┃" } else { " " }, Style::new().fg(th.accent)), Span::styled(name.clone(), Style::new().fg(th.text))];
+        let rest = w.saturating_sub(Span::raw(&name).width() + 3);
+        if rest >= 4 {
+            spans.push(Span::styled(" · ", dim));
+            spans.push(Span::styled(fit(sub, rest), Style::new().fg(th.sub)));
+        }
+        if here {
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            spans.push(Span::raw(" ".repeat(w + 1 - used.min(w + 1))));
+            spans = spans.into_iter().map(|s| s.patch_style(sel_bg)).collect();
+        }
+        lines.push(Line::from(spans));
+    }
+    app.tr_off = off;
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// What an empty list says: why, when loading it failed (a search Spotify didn't answer reads
+/// differently from one that found nothing).
+fn empty_line(app: &App, th: &Theme) -> Line<'static> {
+    match &app.view.failed {
+        Some(e) => Line::from(vec![Span::styled(" couldn't load: ", Style::new().fg(th.err).bold()), Span::styled(e.clone(), Style::new().fg(th.err))]),
+        None => Line::from(Span::styled(if app.view.search_query().is_some() { " no results" } else { " nothing here" }, Style::new().fg(th.dim))),
+    }
+}
+
 /// A card's width on an overview, in cells, and the gap between cards.
 const CARD_W: usize = 30;
 const CARD_GAP: usize = 3;
 
 /// An artist's overview or a search of everything: sections of songs and cards, laid out by
 /// `App::blocks` (the cursor walks them with `grid_step`), scrolled to keep the cursor in view.
-fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focused: bool, playing_uri: Option<String>) {
+/// `compact`: no blank lines between sections (the mini player).
+fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focused: bool, playing_uri: Option<String>, compact: bool) {
     use unicode_width::UnicodeWidthStr;
     let th = theme();
     let dim = Style::new().fg(th.dim);
@@ -510,10 +682,22 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
     let section_title = |s: Option<Section>| match s {
         None if all => "songs".to_string(),
         None => "popular".into(),
-        Some(Section::Top) => "top result".into(),
+        // what it is leads its card's line ("Album · whose · 2020"): said here instead
+        Some(Section::Top) => match app.view.hit.as_ref().and_then(|h| h.link.sub.split(" · ").next()).filter(|k| !k.is_empty()) {
+            Some(kind) => format!("top result · {}", kind.to_lowercase()),
+            None => "top result".into(),
+        },
         Some(Section::Releases) if all => "albums".into(),
-        Some(Section::Releases) => app.view.filter.label().into(),
+        Some(Section::Releases) => "albums".into(),
+        Some(Section::Singles) => "singles".into(),
+        Some(Section::Appears) if all => match app.view.hit.as_ref().and_then(|h| Some((h.by.as_ref()?, h.song.is_none() && h.link.uri.starts_with("spotify:artist:")))) {
+            Some(((_, name), true)) => format!("latest from {name}"),
+            Some(((_, name), false)) => format!("more by {name}"),
+            None => "more".into(),
+        },
         Some(Section::Appears) => "appears on".into(),
+        Some(Section::Playlists) => "playlists".into(),
+        Some(Section::Shows) => "podcasts".into(),
         Some(Section::Related) if all => "artists".into(),
         Some(Section::Related) => "fans also like".into(),
     };
@@ -526,7 +710,7 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
         if focused { st.bold() } else { st }
     };
     // one stop as `w` cells of spans
-    let stop = |i: usize, section: Option<Section>, w: usize| -> Vec<Span<'static>> {
+    let stop = |i: usize, section: Option<Section>, w: usize, top: bool| -> Vec<Span<'static>> {
         let pad = |mut spans: Vec<Span<'static>>| {
             let used: usize = spans.iter().map(|s| s.content.width()).sum();
             spans.push(Span::raw(" ".repeat(w.saturating_sub(used))));
@@ -537,13 +721,18 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
             let playing = playing_uri.as_deref() == Some(t.uri.as_str());
             let n = if playing { format!("{:>2} ", if app.playing { "▶" } else { "‖" }) } else { format!("{:>2} ", i + 1) };
             let time = format!(" {}", mmss(t.ms));
+            let chip = if t.explicit { 2 } else { 0 };
             let room = w.saturating_sub(n.width() + time.width());
-            let name = fit(&t.name, room);
-            let rest = room.saturating_sub(name.width() + 3);
+            let name = fit(&t.name, room.saturating_sub(chip));
+            let rest = room.saturating_sub(name.width() + chip + 3);
             let mut spans = vec![
                 Span::styled(n, if playing { Style::new().fg(th.accent).bold() } else { dim }),
                 Span::styled(name, Style::new().fg(if playing { th.accent } else { th.text })),
             ];
+            if t.explicit {
+                spans.push(Span::raw(" "));
+                spans.push(explicit_chip(if playing { th.accent } else { th.dim }));
+            }
             if rest >= 6 {
                 spans.push(Span::styled(" · ", dim));
                 spans.push(Span::styled(fit(&t.artists, rest), Style::new().fg(th.sub)));
@@ -553,13 +742,40 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
             spans.push(Span::styled(time, dim));
             return spans;
         }
-        let Some((_, l)) = app.card_at(i) else { return pad(vec![]) };
-        let name = fit(&l.name, w);
-        let rest = w.saturating_sub(name.width() + 2);
+        let Some((s, l)) = app.card_at(i) else { return pad(vec![]) };
+        // an artist's discography is a list: the year in a gutter (once per run of the same
+        // year), the name, and what it is at the right ("album · 12 songs")
+        if !all && matches!(s, Section::Releases | Section::Singles) {
+            let (year, what) = match l.sub.split_once(' ') {
+                Some((y, rest)) if y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()) => (y, rest),
+                _ => ("", l.sub.as_str()),
+            };
+            let what = what.strip_prefix("single · ").unwrap_or(what);
+            let again = !top && !year.is_empty() && i > 0 && app.card_at(i - 1).is_some_and(|(ps, p)| ps == s && p.sub.starts_with(year));
+            let room = w.saturating_sub(6);
+            let what_w = if room >= what.width() + 16 { what.width() } else { 0 };
+            let name = fit(&l.name, room.saturating_sub(if what_w > 0 { what_w + 2 } else { 0 }));
+            let gap = room.saturating_sub(name.width() + what_w);
+            let mut spans = vec![Span::styled(format!("{:<4}  ", if again { "" } else { year }), dim), Span::styled(name, Style::new().fg(th.text)), Span::raw(" ".repeat(gap))];
+            if what_w > 0 {
+                spans.push(Span::styled(what.to_string(), dim));
+            }
+            return pad(spans);
+        }
+        let explicit = s == Section::Top && app.view.hit.as_ref().and_then(|h| h.song.as_ref()).is_some_and(|t| t.explicit);
+        let chip = if explicit { 2 } else { 0 };
+        let name = fit(&l.name, w.saturating_sub(chip));
+        let rest = w.saturating_sub(name.width() + chip + 2);
         let mut spans = vec![Span::styled(name, Style::new().fg(th.text))];
-        if rest >= 6 && !l.sub.is_empty() {
+        if explicit {
+            spans.push(Span::raw(" "));
+            spans.push(explicit_chip(th.dim));
+        }
+        // the top result's line without what it is, which its section's title says
+        let about = if s == Section::Top { l.sub.split_once(" · ").map_or("", |(_, rest)| rest) } else { l.sub.as_str() };
+        if rest >= 6 && !about.is_empty() {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(fit(&l.sub, rest), Style::new().fg(th.sub)));
+            spans.push(Span::styled(fit(about, rest), Style::new().fg(th.sub)));
         }
         pad(spans)
     };
@@ -567,7 +783,7 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
     let mut sel_line = 0;
     for (bi, b) in app.blocks().into_iter().enumerate() {
         // a search's first section is also set off from the title above it
-        if bi > 0 || all {
+        if (bi > 0 || all) && !compact {
             lines.push(Line::default());
         }
         lines.push(Line::from(Span::styled(format!(" {}", section_title(b.section)), Style::new().fg(th.accent2).bold())));
@@ -586,7 +802,7 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
                 if col > 0 {
                     spans.push(Span::raw(" ".repeat(CARD_GAP)));
                 }
-                let cell = stop(i, b.section, cell_w);
+                let cell = stop(i, b.section, cell_w, line == 0);
                 spans.extend(if here { cell.into_iter().map(|s| s.patch_style(sel_bg)).collect() } else { cell });
                 if here {
                     sel_line = lines.len();
@@ -596,8 +812,7 @@ fn draw_overview(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect, focu
         }
     }
     if lines.is_empty() {
-        let what = if app.view.loading { "loading…" } else { "nothing here" };
-        lines.push(Line::from(Span::styled(format!(" {what}"), dim)));
+        lines.push(if app.view.loading { Line::from(Span::styled(" loading…", dim)) } else { empty_line(app, th) });
     }
     // keep the cursor's line in view, with its section's title when that fits
     let height = area.height as usize;
@@ -668,5 +883,22 @@ mod tests {
         });
         assert_eq!(off, 99_971);
         assert!(calls.get() <= 30);
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::fit;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn fit_counts_wide_glyphs_as_drawn() {
+        assert_eq!(fit("🗑️", 4), "🗑️");
+        for max in 1..12 {
+            for s in ["🗑️🗑️🗑️🗑️ trash", "日本語のプレイリスト", "e33 soundtrack but only"] {
+                assert!(fit(s, max).width() <= max, "{s:?} at {max}: {:?}", fit(s, max));
+            }
+        }
+        assert_eq!(fit("🗑️🗑️🗑️", 4), "🗑️…");
     }
 }

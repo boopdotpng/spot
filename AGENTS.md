@@ -11,16 +11,17 @@ the main thread's run loop on macOS).
 1. Install Rust with https://rustup.rs (stable; the crate is edition 2024) and the Xcode
    command line tools (`xcode-select --install`). Full Xcode isn't needed.
 2. `git clone https://github.com/boopdotpng/spot && cd spot && ./install.sh`. This makes a
-   release build and copies it to `~/.local/bin/spot`. It also removes the 2.0 window version
-   (`~/Applications/Spot.app` and its login item) if it's there. The first build takes a few
-   minutes; later ones are incremental.
+   release build and copies it to `~/.local/bin/spot`, and builds the ⌥Space launcher into
+   `~/Applications/Spot Launcher.app` (it starts at login). The first build takes a few minutes;
+   later ones are incremental.
 3. Make sure `~/.local/bin` is on `PATH`.
 4. First run: `spot` in a terminal asks for the Client ID of a Spotify app of the user's own. They
    create it at https://developer.spotify.com/dashboard with the redirect URI
    `http://127.0.0.1:19872/login` and **Web API** ticked. Then it logs in through the browser. The
    user has to do this part; see "First run" in the README.
 
-To update, `git pull` and run `./install.sh` again, then `spot quit` and `spot`.
+To update, `git pull` and run `./install.sh` again. It restarts a running player on the new build
+(still playing); an open TUI needs `spot` again.
 
 ## Working on it
 
@@ -44,8 +45,8 @@ To update, `git pull` and run `./install.sh` again, then `spot quit` and `spot`.
 
 - **librespot-core** is vendored in `vendor/librespot-core` with a fix for Spotify refusing audio
   keys. `vendor/README.md` explains it.
-- Builds use `--locked`. vergen is pinned to 9.0.x in `Cargo.lock`, and librespot-core 0.8 fails
-  to build with vergen 9.1.
+- Builds use `--locked`.
+- Logging is a small `log::Log` in `src/main.rs` (levels in `LOG_LEVELS`), not env_logger.
 
 ## Where things are
 
@@ -62,5 +63,8 @@ Each file starts with a comment saying what it holds.
 - `src/cache.rs`: everything on disk under `~/.cache/spot`.
 - `src/ctl.rs`, `src/cli.rs`: the command line (`spot play`, `spot queue`, …) over a Unix socket.
 - `src/settings.rs`: `~/.config/spot/config.toml`, documented in `docs/config.md`.
-- `install.sh`: builds and installs spot.
+- `src/launch.rs`: what the ⌥Space launcher asks the player (`spot launcher …`, tab-separated).
+- `mac/Launcher.swift`: the ⌥Space launcher, plain AppKit on Liquid Glass. Keep it redrawing
+  rarely: redrawing its card twice a second held ~100 MB of window server buffers.
+- `install.sh`: builds and installs spot and the launcher.
 - `docs/skills/spot/SKILL.md`: the Claude Code skill for driving spot from the command line.

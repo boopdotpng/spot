@@ -14,12 +14,14 @@ tools (`xcode-select --install`):
 
     git clone https://github.com/boopdotpng/spot && spot/install.sh
 
-That installs `spot` to `~/.local/bin` (set `SPOT_INSTALL_DIR` to change). It also removes
-`Spot.app` and its login item, if you had the 2.0 window version. The first build takes a few
-minutes. To update, `git pull` and run `install.sh` again, then `spot quit` and `spot`.
-Builds use `--locked`: vergen is pinned to 9.0.x in Cargo.lock, and librespot-core 0.8 fails to
-build with vergen 9.1.
+That installs `spot` to `~/.local/bin` (set `SPOT_INSTALL_DIR` to change), and the ⌥Space
+launcher to `~/Applications` (`--no-launcher` leaves it out). The first build takes a few
+minutes. To update, `git pull` and run `install.sh` again: it restarts a running player on the
+new build, still playing.
 
+The launcher is a Spotlight-style bar on Liquid Glass: ⌥Space from any app, type, ⏎ plays (⌘⏎
+queues, → opens an album, playlist or artist, ⌘C copies a link, esc closes). It starts at login;
+`defaults write com.github.boopdotpng.spot.launcher hotkey cmd+shift+space` changes its key.
 Using Claude Code or Codex? Point it at this repo and ask it to build and install spot:
 [AGENTS.md](AGENTS.md) tells it how.
 
@@ -68,7 +70,7 @@ light or dark following the terminal.
 
 | key | action |
 |---|---|
-| `/` | search as you type (`tab` in the prompt cycles all / songs / albums / artists / podcasts, `↑`/`↓` move, `enter` keeps the results, `esc` goes back) |
+| `/` | search as you type (`enter` plays the top result, or whichever one the cursor's on: a song, or an album from its first; an artist is opened. `tab` goes into the results without playing, `↑`/`↓` move while typing, `shift+tab` cycles all / songs / albums / artists / podcasts, `esc` goes back) |
 | `enter` | play song (the rest of the list plays after it) · open album / artist / card |
 | `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
 | `space` | pause / resume (with a short volume fade); right after launch, resumes what was playing at quit |
@@ -89,7 +91,7 @@ light or dark following the terminal.
 | `f` | on an artist's overview or discography: all → albums (incl. EPs) → singles (remembered) |
 | `esc`, `backspace`, `[` | back to the previous list |
 | `]` | forward again |
-| `tab`, `h`/`l`, `←`/`→` | switch pane (on cards, `h`/`l` move card to card; left off a line's first card goes to the sidebar) |
+| `tab`, `h`/`l`, `←`/`→` | switch pane (on cards, `h`/`l` move card to card; left off a line's first card goes to the sidebar; on a search's results or an artist's page, `tab` and `shift+tab` jump from section to section) |
 | `j`/`k`, `↑`/`↓`, `ctrl+d`/`ctrl+u` | move |
 | `g` / `M` / `G` (also `home` / `end`) | jump to top / middle / bottom of the list |
 | `ctrl+t` | next theme (desert, lagoon, moss, iris, blossom, mint, sorbet, and yours); remembered |
@@ -176,7 +178,7 @@ Audio quality, the song cache's size, loudness normalization and your own colors
   song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate
   single/album versions removed: find, sort and play from here) and to the discography.
 - **Search** (`/`) of everything shows the top result, songs, artists and albums on one page;
-  `tab` narrows it to one kind, listed in full.
+  `shift+tab` narrows it to one kind, listed in full.
 - **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
   isn't exposed to third-party/Connect players, so librespot can't select it.
 - Audio: librespot (no Spotify app needed).

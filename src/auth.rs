@@ -2,17 +2,12 @@
 
 use crate::*;
 
-/// The file spot kept the client id in before config.toml; still read, so nobody sets up again.
-pub fn old_client_id() -> Option<String> {
-    fs::read_to_string(config_dir().join("client_id")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
 /// The user's Spotify app client id: env, then config.toml, then a one-time prompt that saves it.
 pub fn client_id(redirect: &str, saved: Option<String>) -> Result<String, String> {
     if let Ok(id) = std::env::var("SPOT_CLIENT_ID") {
         return Ok(id);
     }
-    if let Some(id) = saved.or_else(old_client_id) {
+    if let Some(id) = saved {
         return Ok(id);
     }
     if !std::io::stdin().is_terminal() {

@@ -138,24 +138,42 @@ impl App {
         self.search_soon();
     }
 
-    /// The search field's keys that aren't typing: enter keeps the results, esc goes back to
+    /// The search field's keys that aren't typing: enter plays the top result, tab goes into the
+    /// results, shift+tab changes what's searched for, esc goes back to
     /// what was open. True when it took the key.
     pub fn on_search_key(&mut self, k: Key) -> bool {
         match k {
             Key::Enter => {
+                let typed = self.input.as_deref().is_some_and(|q| !q.trim().is_empty());
                 self.search_at = None;
                 self.run_search();
                 self.input = None;
                 self.live_search = false;
                 self.focus = Focus::Tracks;
+                // enter plays what the cursor's on (the top result, unless it was moved), now or
+                // once the results are in
+                if typed && self.view.search_query().is_some() {
+                    self.act_on_load = Some(self.view.id);
+                    if !self.view.loading {
+                        self.act_on_found();
+                    }
+                }
             }
             Key::Esc => {
                 self.input = None;
                 self.search_at = None;
                 self.end_live_search();
             }
-            Key::Tab => self.cycle_search_kind(false),
-            Key::BackTab => self.cycle_search_kind(true),
+            // into the results, playing nothing: the cursor's theirs from here (tab again goes
+            // on through a page's sections)
+            Key::Tab => {
+                self.search_at = None;
+                self.run_search();
+                self.input = None;
+                self.live_search = false;
+                self.focus = Focus::Tracks;
+            }
+            Key::BackTab => self.cycle_search_kind(false),
             // the results' cursor: by line on a page of cards, else by row
             Key::Up if self.live_search => {
                 if self.grid_move(0, -1).is_none() {
@@ -170,6 +188,26 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    /// Enter on a search: play the highlighted song, or the album from its first (opened too,
+    /// and played once its songs are in); an artist is only opened. A search for only albums,
+    /// artists or podcasts just lists them.
+    pub fn act_on_found(&mut self) {
+        self.act_on_load = None;
+        if self.view.kind != Kind::Tracks {
+            return;
+        }
+        let Some(i) = self.selected_track() else { return };
+        let from = self.view.id;
+        self.activate(i);
+        if self.view.id != from && self.view.key.starts_with("spotify:album:") {
+            if self.view.tracks.is_empty() {
+                self.act_on_load = Some(self.view.id);
+            } else {
+                self.activate(0);
+            }
+        }
     }
 
     pub fn cycle_search_kind(&mut self, back: bool) {
@@ -195,6 +233,8 @@ impl App {
             Key::Right | Key::Char('l') if self.focus == Focus::Tracks && self.grid_move(1, 0).is_some() => {}
             Key::Down | Key::Char('j') if self.focus == Focus::Tracks && self.grid_move(0, 1).is_some() => {}
             Key::Up | Key::Char('k') if self.focus == Focus::Tracks && self.grid_move(0, -1).is_some() => {}
+            // a search's page or an artist's: tab goes section to section (left still reaches the sidebar)
+            Key::Tab | Key::BackTab if self.focus == Focus::Tracks && self.view.info.is_some() && self.section_jump(k == Key::BackTab) => {}
             Key::Char('P') if self.view.artist.is_some() && self.view.info.is_some() => self.play_artist(),
             Key::Tab | Key::BackTab | Key::Left | Key::Right | Key::Char('h') | Key::Char('l') => {
                 self.focus = match (&self.focus, k) {

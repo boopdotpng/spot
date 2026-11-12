@@ -9,18 +9,50 @@ fn search_key(kind: Option<Kind>, q: &str) -> String {
     format!("search:{}:{q}", search_label(kind))
 }
 
-/// The songs, albums and artists a search of everything shows: the top result, five songs, and
-/// a line each of artists and albums (as many as Spotify gives one request).
+/// Songs a search of everything lists under its top result.
+const FOUND_SONGS: usize = 10;
+
+/// A search's top result as a card whose line says what it is: "Artist",
+/// "Album · whose · 2020", "Song · whose".
+fn found_hit(kind: &str, i: &Value) -> Option<Hit> {
+    let first = &i["artists"][0];
+    let artist = |a: &Value| Some((a["uri"].as_str()?.to_string(), a["name"].as_str()?.to_string()));
+    if kind == "track" {
+        let t = parse_track(i)?;
+        return Some(Hit { link: song_link(&t), song: Some(t), by: artist(first) });
+    }
+    let mut link = parse_link(kind, i)?;
+    let (what, by) = match kind {
+        "artist" => ("Artist", artist(i)),
+        _ => {
+            let what = match i["album_type"].as_str() {
+                Some("single") => "Single",
+                Some("compilation") => "Compilation",
+                _ => "Album",
+            };
+            // parse_link's line ends "2020 album": the kind leads here instead
+            if let Some((rest, _)) = link.sub.rsplit_once(' ') {
+                link.sub = rest.trim_end().trim_end_matches(" ·").to_string();
+            }
+            (what, artist(first))
+        }
+    };
+    link.sub = if link.sub.is_empty() { what.into() } else { format!("{what} · {}", link.sub) };
+    Some(Hit { link, song: None, by })
+}
+
+/// What a search of everything shows: the top result, songs, artists, albums, playlists and
+/// podcasts (as many as Spotify gives one request).
 fn found(q: &str, v: &Value) -> (Option<Hit>, ArtistInfo) {
     let m = mixed(q, v);
-    let hit = m.top.and_then(|(kind, i)| match kind {
-        "track" => parse_track(i).map(|t| Hit { link: song_link(&t), song: Some(t) }),
-        _ => parse_link(kind, i).map(|link| Hit { link, song: None }),
-    });
+    let hit = m.top.and_then(|(kind, i)| found_hit(kind, i));
+    let links = |ty: &str, l: Vec<&Value>| l.into_iter().filter_map(|i| parse_link(ty, i)).collect();
     let info = ArtistInfo {
-        top: m.tracks.into_iter().filter_map(parse_track).take(5).collect(),
-        releases: m.albums.into_iter().filter_map(|i| parse_link("album", i)).collect(),
-        related: m.artists.into_iter().filter_map(|i| parse_link("artist", i)).collect(),
+        top: m.tracks.into_iter().filter_map(parse_track).take(FOUND_SONGS).collect(),
+        releases: links("album", m.albums),
+        related: links("artist", m.artists),
+        playlists: links("playlist", m.playlists),
+        shows: links("show", m.shows),
         ..Default::default()
     };
     (hit, info)
@@ -102,9 +134,26 @@ impl App {
         v.loading = cached.is_empty();
         if uri.starts_with("spotify:album:") {
             v.about = read_about(&uri);
+            // whose it is, as the album credits it, over whatever opened it guessed
+            if let Some(by) = By::album(read_album_by(&uri)) {
+                v.by = Some(by);
+            }
         }
         self.rt.spawn(load_list(self.api.clone(), self.sess.subscribe(), self.tx.clone(), v.id, uri, cached));
         self.show(v, true);
+    }
+
+    /// A playlist a search found: one of theirs as from the sidebar, anyone else's by its uri.
+    pub fn open_found_playlist(&mut self, uri: String, name: String) {
+        if let Some(i) = self.playlists.iter().position(|p| p.uri() == uri) {
+            self.open_playlist(i);
+        } else {
+            let key = uri.strip_prefix("spotify:playlist:").unwrap_or(&uri).to_string();
+            let cached = self.cached_list(&key);
+            let v = self.new_view(key, name, Kind::Tracks);
+            self.show_list(v, uri, cached);
+        }
+        self.focus = Focus::Tracks;
     }
 
     /// Opens instantly from the disk cache (or the playing queue), then refreshes in the background.
@@ -213,14 +262,14 @@ impl App {
             v.info = Some(Arc::default());
             let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
             let task = self.rt.spawn(async move {
-                let found = match search_all(&api, &q, 10).await {
-                    Ok(v) => found(&q, &v),
-                    Err(e) => {
-                        let _ = tx.send(Msg::Error(e));
-                        (None, ArtistInfo::default())
+                match search_all(&api, &q, 10).await {
+                    Ok(v) => {
+                        let _ = tx.send(Msg::Found { view, found: Box::new(found(&q, &v)) });
                     }
-                };
-                let _ = tx.send(Msg::Found { view, found: Box::new(found) });
+                    Err(error) => {
+                        let _ = tx.send(Msg::Failed { view, error });
+                    }
+                }
             });
             self.search_task = Some(task.abort_handle());
             self.show(v, back);
@@ -238,9 +287,8 @@ impl App {
                 });
             })
             .await;
-            if let Err(e) = res {
-                let _ = tx.send(Msg::Error(e));
-                let _ = tx.send(Msg::Tracks { view, tracks: vec![], done: true });
+            if let Err(error) = res {
+                let _ = tx.send(Msg::Failed { view, error });
             }
         });
         self.search_task = Some(task.abort_handle());
@@ -292,7 +340,7 @@ impl App {
             return self.goto_show(t);
         }
         let Some(uri) = id_uri("album", t.album_id) else { return };
-        self.open_album(uri, t.album.clone(), By::of(&t));
+        self.open_album(uri, t.album.clone(), By::lead(&t));
     }
 
     pub fn goto_artist(&mut self) {
@@ -413,5 +461,22 @@ impl App {
     pub fn move_to_middle(&mut self) {
         let (len, cur) = self.focused_rows();
         self.move_sel((len / 2) as isize - cur.unwrap_or(0) as isize);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_top_result_says_what_it_is() {
+        let artist = serde_json::json!({"uri": "spotify:artist:1", "name": "LikeWise", "genres": []});
+        let h = found_hit("artist", &artist).unwrap();
+        assert_eq!(h.link.sub, "Artist");
+        assert_eq!(h.by, Some(("spotify:artist:1".into(), "LikeWise".into())));
+        let album = serde_json::json!({"uri": "spotify:album:2", "name": "Likewise", "album_type": "single", "release_date": "2021-03-01", "artists": [{"uri": "spotify:artist:3", "name": "Chrmng"}]});
+        let h = found_hit("album", &album).unwrap();
+        assert_eq!(h.link.sub, "Single · Chrmng · 2021");
+        assert_eq!(h.by, Some(("spotify:artist:3".into(), "Chrmng".into())));
     }
 }
