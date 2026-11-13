@@ -262,9 +262,11 @@ impl App {
     pub fn seek_to(&mut self, ms: u64) {
         if self.loaded {
             self.player.seek(ms as u32);
-        } else {
-            self.pos_ms = ms;
+            // say so now, not on librespot's Seeked: a client asking right after a seek (the
+            // launcher, after ⌘←) would get the old position
+            self.pos_at = self.playing.then(Instant::now);
         }
+        self.pos_ms = ms;
     }
 
     pub fn on_media(&mut self, ev: MediaControlEvent) {
