@@ -79,12 +79,12 @@ impl App {
             self.listen = Some(Listen { track: t.clone(), started: 0, listened: Duration::ZERO, since: None, announced: false });
         }
         if let Some(m) = &mut self.media {
-            let _ = m.set_metadata(MediaMetadata {
-                title: Some(&t.name),
-                artist: Some(&t.artists),
-                album: Some(&t.album),
+            m.set_metadata(Metadata {
+                title: &t.name,
+                artist: &t.artists,
+                album: &t.album,
                 cover_url: t.cover.as_deref(),
-                duration: Some(Duration::from_millis(t.ms)),
+                duration: Duration::from_millis(t.ms),
             });
         }
         self.cur = Some(uri);
@@ -197,14 +197,14 @@ impl App {
     }
 
     pub fn sync_media(&mut self) {
-        let progress = Some(MediaPosition(Duration::from_millis(self.position())));
+        let at = Duration::from_millis(self.position());
         let state = match (&self.cur, self.playing) {
-            (None, _) => MediaPlayback::Stopped,
-            (_, true) => MediaPlayback::Playing { progress },
-            (_, false) => MediaPlayback::Paused { progress },
+            (None, _) => Playback::Stopped,
+            (_, true) => Playback::Playing(at),
+            (_, false) => Playback::Paused(at),
         };
         if let Some(m) = &mut self.media {
-            let _ = m.set_playback(state);
+            m.set_playback(state);
         }
     }
 
@@ -269,30 +269,23 @@ impl App {
         self.pos_ms = ms;
     }
 
-    pub fn on_media(&mut self, ev: MediaControlEvent) {
-        use MediaControlEvent as E;
-        let step = Duration::from_secs(10);
-        self.ctl.skipped |= matches!(ev, E::Next | E::Previous | E::Seek(_) | E::SeekBy(..));
+    pub fn on_media(&mut self, ev: MediaEvent) {
+        use MediaEvent as E;
+        self.ctl.skipped |= matches!(ev, E::Next | E::Previous);
         match ev {
             E::Toggle => self.toggle(),
             E::Play if !self.want_play => self.toggle(),
             E::Pause if self.want_play => self.toggle(),
             E::Next => self.skip_soon(1),
             E::Previous => self.prev(),
-            E::Seek(d) => self.seek_by(d, step),
-            E::SeekBy(d, by) => self.seek_by(d, by),
-            E::SetPosition(MediaPosition(p)) => self.seek_to(p.as_millis() as u64),
+            E::SetPosition(p) => self.seek_to(p.as_millis() as u64),
             _ => {}
         }
     }
 
-    pub fn seek_by(&mut self, d: SeekDirection, by: Duration) {
-        let by = by.as_millis() as u64;
-        let pos = self.position();
-        self.seek_to(match d {
-            SeekDirection::Forward => pos + by,
-            SeekDirection::Backward => pos.saturating_sub(by),
-        });
+    /// Ahead `ms` (back when -).
+    pub fn seek_by(&mut self, ms: i64) {
+        self.seek_to(self.position().saturating_add_signed(ms));
     }
 
     pub fn prev(&mut self) {

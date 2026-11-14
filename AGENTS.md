@@ -3,8 +3,8 @@
 spot is a small Spotify TUI for Apple Silicon Macs, with a command line (`spot help`). Audio comes
 from librespot, so no Spotify app is needed, but Spotify Premium is. The player runs in the
 background; the TUI (ratatui) is a disposable client that attaches to it over a Unix socket. Only
-macOS is tested. The platform-specific code is the media keys hookup in `src/main.rs` (it needs
-the main thread's run loop on macOS).
+macOS is tested. The platform-specific code is Now Playing and the media keys in
+`src/nowplaying.rs` (attached on the main thread, whose run loop `src/main.rs` runs).
 
 ## Building it for someone
 
@@ -58,6 +58,7 @@ Each file starts with a comment saying what it holds.
 - `src/ui.rs`, `src/theme.rs`, `src/art.rs`: drawing the TUI, its colors, and the cover.
 - `src/terminal.rs`: attaching a terminal to the background player, and the client side of it.
 - `src/playback.rs`: the list, the queue, skipping, seeking, volume.
+- `src/nowplaying.rs`: macOS Now Playing and the media keys, straight to MediaPlayer on objc2.
 - `src/lists.rs`, `src/metadata.rs`, `src/webapi.rs`: fetching from Spotify (its internal metadata
   API for list contents, the Web API for the library and search).
 - `src/cache.rs`: everything on disk under `~/.cache/spot`.

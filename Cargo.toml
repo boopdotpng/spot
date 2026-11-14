@@ -19,7 +19,6 @@ serde_json = "1"
 librespot-metadata = "0.8"
 librespot-protocol = "0.8"
 protobuf = "3.7"
-souvlaki = "0.8.3"
 rand = "0.9"
 md-5 = "0.10"
 open = "5"
@@ -28,9 +27,12 @@ toml = { version = "1.1.8", default-features = false, features = ["std", "parse"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# macOS takes media key / Control Center commands on the main thread
+# macOS Now Playing (src/nowplaying.rs); media key / Control Center commands on the main thread
 [target.'cfg(target_os = "macos")'.dependencies]
-dispatch = "0.2"
+dispatch2 = "0.3"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSDictionary", "NSValue", "NSURL", "NSGeometry", "objc2-core-foundation"] }
 
 # Local release builds (install.sh, `cargo build --release`) are incremental: an edit rebuilds in
 # seconds rather than minutes. Published builds use the dist profile below.

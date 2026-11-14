@@ -31,7 +31,6 @@ use ratatui::{
     widgets::{Block, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState},
 };
 use serde_json::Value;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
 mod app;
 mod art;
@@ -47,6 +46,7 @@ mod launch;
 mod lists;
 mod metadata;
 mod model;
+mod nowplaying;
 mod playback;
 mod settings;
 mod terminal;
@@ -64,6 +64,7 @@ use lastfm::*;
 use lists::*;
 use metadata::*;
 use model::*;
+use nowplaying::*;
 use theme::*;
 use ui::*;
 use webapi::*;
@@ -238,7 +239,9 @@ fn player() {
 /// another, it snapshots them part way through and the rest stay greyed out for good.
 #[cfg(target_os = "macos")]
 fn on_main<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    dispatch::Queue::main().exec_sync(f)
+    let mut out = None;
+    dispatch2::DispatchQueue::main().exec_sync(|| out = Some(f()));
+    out.expect("ran on the main thread")
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -411,18 +414,12 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         let _ = stx.send(Msg::Quit);
     });
 
-    let media = MediaControls::new(PlatformConfig { display_name: "spot", dbus_name: "spot", hwnd: None })
-        .ok()
-        .and_then(|mut m| {
-            let mtx = tx.clone();
-            on_main(move || {
-                m.attach(move |ev| {
-                    let _ = mtx.send(Msg::Media(ev));
-                })
-                .ok()?;
-                Some(m)
-            })
-        });
+    let mtx = tx.clone();
+    let media = on_main(move || {
+        MediaControls::attach(move |ev| {
+            let _ = mtx.send(Msg::Media(ev));
+        })
+    });
 
     let mut app = App {
         rt,

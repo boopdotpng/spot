@@ -267,7 +267,7 @@ pub enum Msg {
     Found { view: u64, found: Box<(Option<Hit>, ArtistInfo)> }, // a search of everything: songs, albums (releases) and artists (related)
     About { view: u64, about: Vec<String>, artists: Vec<(String, String)> }, // an album's year and kind ("2022 album"), its release date and label, then its copyrights; and its artists (uri, name)  // an artist's overview, fresh (or None came: see lists)
     Error(String),
-    Media(MediaControlEvent),
+    Media(MediaEvent),
     Relogin(bool), // true: waiting on browser login; false: it finished
     Connected(Result<Session, String>),
     Status(String),
