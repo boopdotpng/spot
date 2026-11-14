@@ -6,17 +6,19 @@ description = "Tiny Spotify TUI, with a command line"
 repository = "https://github.com/boopdotpng/spot"
 
 [dependencies]
-librespot-core = "0.8"
-librespot-playback = "0.8"
-librespot-oauth = "0.8"
+# TLS is rustls, trusting the system's roots, not native-tls: that's Apple's deprecated Secure
+# Transport, which leaks on every handshake with an EC certificate (i.scdn.co's, so every cover).
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"] }
+librespot-oauth = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
 ratatui = "0.30"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 log = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 serde_json = "1"
-librespot-metadata = "0.8"
+librespot-metadata = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-protocol = "0.8"
 protobuf = "3.7"
 rand = "0.9"
