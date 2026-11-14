@@ -31,7 +31,8 @@ const SHOWN: usize = 5;
 
 /// What a background lookup was for, carried back to the main loop with its songs.
 pub enum Then {
-    Play { from: Option<String> },
+    /// `shuffle`: turn shuffle on and start the list at a random song (the launcher's playlists)
+    Play { from: Option<String>, shuffle: bool },
     /// `queue`: the new queue, None where the next fetched uri's songs go
     Queue(Vec<Option<Track>>),
 }
@@ -253,7 +254,7 @@ impl App {
             "play" => {
                 let from = opt(&mut args, "--from")?.map(|f| link_uri(&f));
                 let [uri] = &args[..] else { return Err(usage("play: one uri (--from <song uri> starts a list at that song)")) };
-                self.load(vec![uri.clone()], Then::Play { from }, reply.clone());
+                self.load(vec![uri.clone()], Then::Play { from, shuffle: false }, reply.clone());
                 return Ok(None);
             }
             "queue" => return self.queue_cmd(args, reply),
@@ -397,7 +398,7 @@ impl App {
     /// <uri>` would. Nobody waits on the answer.
     pub fn play_uri(&mut self, uri: String) {
         let (reply, _) = mpsc::channel();
-        self.load(vec![uri], Then::Play { from: None }, reply);
+        self.load(vec![uri], Then::Play { from: None, shuffle: false }, reply);
     }
 
     /// Fetch the songs behind each uri in the background; on_loaded acts on them.
@@ -428,7 +429,7 @@ impl App {
     pub fn on_loaded(&mut self, reply: Reply, then: Then, list: List) {
         let List { uri, name, mut parts } = list;
         match then {
-            Then::Play { from } => {
+            Then::Play { from, shuffle } => {
                 let tracks = parts.pop().unwrap_or_default();
                 if (uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:")) && self.queue.is_some() {
                     // a single song plays now, then the queue and the list carry on
@@ -445,6 +446,9 @@ impl App {
                     };
                     // the same key the TUI uses, so the sidebar marks it playing
                     let key = uri.strip_prefix("spotify:playlist:").unwrap_or(&uri).into();
+                    if shuffle && !self.shuffle {
+                        self.shuffle = true;
+                    }
                     self.play_queue(Queue { key, name, tracks: Arc::new(tracks), order: vec![], pos: 0, sorted: vec![] }, start);
                 }
             }

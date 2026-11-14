@@ -1,13 +1,16 @@
 // What the ⌥Space launcher (mac/Launcher.swift) asks the player, over the same socket as the
-// command line: `spot launcher status | lists | search <words> | songs <uri>`. Every answer is
+// command line: `spot launcher status | lists | search <words> | songs <uri> | song <uri> | play <uri> | queue <uri>`. Every answer is
 // tab-separated rows, for a program rather than a person, so it isn't in `spot help`.
 //
 // A result row: uri, name, subtitle, cover url, ms (0 for what isn't a song), explicit (1 or
-// empty), section, and inside an album the song's track number.
+// empty), section, inside an album the song's track number, and an album's year.
 
-use crate::{ctl::Reply, *};
+use crate::{ctl::{Reply, Then}, *};
 
 type Fail = (i32, String);
+
+/// Popular songs atop an artist's page in the launcher, before their discography.
+const ARTIST_TOP: usize = 3;
 
 /// Fields joined by tabs, with any tabs or newlines inside them made spaces.
 fn tsv_row(fields: &[&str]) -> String {
@@ -25,9 +28,22 @@ fn link_row(l: &Link, section: &str) -> String {
     tsv_row(&[&l.uri, &l.name, &l.sub, l.image.as_deref().unwrap_or(""), "0", "", section])
 }
 
+/// One of an artist's releases, its year (which leads its subtitle) a field of its own: the
+/// launcher shows it on the right, where a song's length goes. "2004 album · 11 songs" is
+/// "Album · 11 songs".
+fn release_row(l: &Link, section: &str) -> String {
+    let (year, rest) = match l.sub.split_once(' ') {
+        Some((y, rest)) if y.len() == 4 && y.bytes().all(|b| b.is_ascii_digit()) => (y, rest),
+        _ => ("", l.sub.as_str()),
+    };
+    let mut c = rest.chars();
+    let sub: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+    tsv_row(&[&l.uri, &l.name, &sub, l.image.as_deref().unwrap_or(""), "0", "", section, "", year])
+}
+
 impl App {
     pub fn launcher_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
-        let usage = || (2, "launcher: status, lists, search <words>, songs <uri> or queue <uri>".to_string());
+        let usage = || (2, "launcher: status, lists, search <words>, songs <uri>, song <uri>, play <uri> or queue <uri>".to_string());
         let (sub, rest) = args.split_first().ok_or_else(usage)?;
         match sub.as_str() {
             // playing (1 or empty), name, artists, uri, cover url, position ms, length ms,
@@ -74,6 +90,13 @@ impl App {
                 });
                 Ok(None)
             }
+            // ⏎ on a result: a playlist (or Liked Songs) plays shuffled, anything else as `play` would
+            "play" => {
+                let [uri] = &rest[..] else { return Err(usage()) };
+                let shuffle = uri.starts_with("spotify:playlist:") || uri == "liked";
+                self.load(vec![uri.clone()], Then::Play { from: None, shuffle }, reply.clone());
+                Ok(None)
+            }
             // ⌘⏎: after what's queued
             "queue" => {
                 if rest.is_empty() {
@@ -88,35 +111,94 @@ impl App {
                 self.songs(uri, reply);
                 Ok(None)
             }
+            "song" => {
+                let Some(uri) = rest.first().cloned() else { return Err(usage()) };
+                self.song_page(uri, reply);
+                Ok(None)
+            }
             _ => Err(usage()),
         }
     }
 
-    /// An album, playlist or artist's songs (an artist's popular ones), for → in the launcher.
+    /// → on a song in the launcher: its album, then each of its artists, to go to either.
+    /// Portraits of artists not seen before take one more lookup before answering; their pages
+    /// are fetched after, so → on one opens at once.
+    fn song_page(&mut self, uri: String, reply: &Reply) {
+        let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
+        self.rt.spawn(async move {
+            let t = match resolve(api, sess.clone(), &uri, None).await {
+                Ok((_, mut t)) if !t.is_empty() => t.remove(0),
+                Ok(_) => return drop(reply.send((1, "song not found".into()))),
+                Err(e) => return drop(reply.send((1, e))),
+            };
+            let artists: Vec<(String, String, Option<String>)> = t
+                .credits()
+                .into_iter()
+                .filter_map(|(name, id)| {
+                    let uri = id_uri("artist", id)?;
+                    let portrait = read_artist(&uri).and_then(|i| i.portrait);
+                    Some((uri, name.to_string(), portrait))
+                })
+                .collect();
+            let unseen: Vec<String> = artists.iter().filter(|a| a.2.is_none()).map(|a| a.0.clone()).collect();
+            let mut found = HashMap::new();
+            if !unseen.is_empty()
+                && let Ok(session) = ready(sess.clone()).await
+                && let Ok(meta) = batch_meta::<PbArtist>(&session, &unseen, ExtensionKind::ARTIST_V4).await
+            {
+                for (uri, a) in meta {
+                    if let Some(p) = image_url(&a.portrait_group.image).or_else(|| image_url(&a.portrait)) {
+                        found.insert(uri, p);
+                    }
+                }
+            }
+            let mut rows = vec![];
+            if let Some(album) = id_uri("album", t.album_id) {
+                rows.push(tsv_row(&[&album, &t.album, "Album", t.cover.as_deref().unwrap_or(""), "0", "", "Album"]));
+            }
+            for (uri, name, portrait) in &artists {
+                let portrait = portrait.as_deref().or(found.get(uri).map(String::as_str)).unwrap_or("");
+                rows.push(tsv_row(&[uri, name, "Artist", portrait, "0", "", "Artists"]));
+            }
+            let _ = reply.send((0, rows.join("\n")));
+            for artist in unseen {
+                let (nobody, _) = mpsc::channel();
+                artist_overview(sess.clone(), nobody, 0, artist, None).await;
+            }
+        });
+    }
+
+    /// An album or playlist's songs, for → in the launcher; an artist's page: their popular
+    /// songs, then their albums and singles (each opens with → again).
     fn songs(&mut self, uri: String, reply: &Reply) {
         let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
         self.rt.spawn(async move {
-            let artist = uri.starts_with("spotify:artist:");
-            let tracks = if artist {
+            let song = |t: &Track, sub: &str, section: &str, n: &str| {
+                tsv_row(&[&t.uri, &t.name, sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }, section, n])
+            };
+            if uri.starts_with("spotify:artist:") {
                 let mut info = read_artist(&uri);
                 if info.is_none() {
                     let (nobody, _) = mpsc::channel();
                     artist_overview(sess, nobody, 0, uri.clone(), None).await;
                     info = read_artist(&uri);
                 }
-                info.map(|i| i.top).ok_or_else(|| "couldn't get their songs".to_string())
-            } else {
-                resolve(api, sess, &uri, None).await.map(|(_, t)| t)
-            };
+                let _ = reply.send(match info {
+                    None => (1, "couldn't get their page".into()),
+                    Some(i) => {
+                        let top = i.top.iter().take(ARTIST_TOP).map(|t| song(t, &t.album, "Popular", ""));
+                        let albums = i.releases.iter().filter(|l| !l.single).map(|l| release_row(l, "Albums"));
+                        let singles = i.releases.iter().filter(|l| l.single).map(|l| release_row(l, "Singles"));
+                        (0, top.chain(albums).chain(singles).collect::<Vec<_>>().join("\n"))
+                    }
+                });
+                return;
+            }
             let album = uri.starts_with("spotify:album:");
-            let _ = reply.send(match tracks {
+            let _ = reply.send(match resolve(api, sess, &uri, None).await {
                 Err(e) => (1, e),
-                Ok(t) => {
-                    let row = |t: &Track| {
-                        let sub = if artist { &t.album } else { &t.artists };
-                        let n = if album && t.number > 0 { t.number.to_string() } else { String::new() };
-                        tsv_row(&[&t.uri, &t.name, sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }, "", &n])
-                    };
+                Ok((_, t)) => {
+                    let row = |t: &Track| song(t, &t.artists, "", &if album && t.number > 0 { t.number.to_string() } else { String::new() });
                     (0, t.iter().map(row).collect::<Vec<_>>().join("\n"))
                 }
             });
@@ -176,10 +258,14 @@ fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
         let sub = if kind { format!("Song · {}", t.artists) } else { format!("{} · {}", t.artists, t.album) };
         Some(tsv_row(&[&t.uri, &t.name, &sub, &cover(&i["album"]), &t.ms.to_string(), if t.explicit { "1" } else { "" }, section]))
     };
+    // its artists, its year apart (on the right, as on an artist's page)
     let album_row = |i: &Value, section: &str, kind: bool| {
         let l = parse_link("album", i)?;
-        let sub = if kind { format!("Album · {}", l.sub) } else { l.sub };
-        Some(tsv_row(&[&l.uri, &l.name, &sub, &cover(i), "0", "", section]))
+        let by = i["artists"].as_array().map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+        let year = i["release_date"].as_str().and_then(|d| d.get(..4)).unwrap_or("");
+        let what = if i["album_type"] == "single" { "Single" } else if i["album_type"] == "compilation" { "Compilation" } else { "Album" };
+        let sub = if kind { format!("{what} · {by}") } else { by };
+        Some(tsv_row(&[&l.uri, &l.name, &sub, &cover(i), "0", "", section, "", year]))
     };
     let artist_row = |i: &Value, section: &str| {
         let l = parse_link("artist", i)?;

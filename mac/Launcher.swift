@@ -1,9 +1,12 @@
 // Spot Launcher: ⌥Space from any app opens a Spotlight-style bar on Liquid Glass that searches
 // Spotify through the running spot and plays what you pick. Empty, it lists what was played
 // lately; typed in, the best match among your playlists comes first, then Spotify's top result,
-// songs, an album and an artist. ↑↓ move, tab jumps to the next section, → opens an album,
-// playlist or artist's songs (← or esc goes back), ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with
-// no results, to what's playing), ⌃S shuffle, ⌃R repeat, esc closes.
+// songs, an album and an artist. ↑↓ move, tab jumps to the next section, → opens an album or
+// playlist's songs, an artist's popular songs and discography, or a song's album and artists
+// (→ again goes on to one of those; ← or esc goes back), ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with
+// no results, to what's playing), ⌃S shuffle, ⌃R repeat, esc closes. For a keyboard without
+// media keys: space on an empty bar plays or pauses, ⌘← ⌘→ go to the previous or next song,
+// ⌥⌘← ⌥⌘→ seek back or ahead 10 seconds (the foot has buttons for the first two too).
 //
 // Plain AppKit, no SwiftUI: one text field and one view that draws the rest, in the system's
 // label colors with vibrancy, the way Apple's own apps sit on glass (covers in a view above it). It asks the player
@@ -102,9 +105,10 @@ struct Hit {
     let explicit: Bool
     let section: String
     let number: Int  // inside an album: the song's track number
+    let year: String  // an album's
 
     /// A row of `launcher search / songs / lists`: uri, name, subtitle, cover, ms, explicit,
-    /// section, track number.
+    /// section, track number, year.
     init?(_ line: Substring) {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 7 else { return nil }
@@ -113,10 +117,13 @@ struct Hit {
         explicit = f[5] == "1"
         section = f[6]
         number = f.count > 7 ? Int(f[7]) ?? 0 : 0
+        year = f.count > 8 ? f[8] : ""
     }
 
-    /// An album, playlist or artist: → lists its songs.
-    var opens: Bool { uri == "liked" || ["spotify:album:", "spotify:playlist:", "spotify:artist:"].contains { uri.hasPrefix($0) } }
+    /// An album, playlist or artist: → lists its songs. A song: → lists its album and artists.
+    var opens: Bool { uri == "liked" || ["spotify:album:", "spotify:playlist:", "spotify:artist:", "spotify:track:"].contains { uri.hasPrefix($0) } }
+    /// A list of songs to play from, rather than a page of other things.
+    var list: Bool { uri == "liked" || uri.hasPrefix("spotify:album:") || uri.hasPrefix("spotify:playlist:") }
     var round: Bool { uri.hasPrefix("spotify:artist:") }
 }
 
@@ -169,16 +176,26 @@ func small(_ url: String) -> String {
         .replacingOccurrences(of: "ab67616100005174", with: "ab6761610000f178")
 }
 
+/// Spotify's 300 px copy of a cover.
+func medium(_ url: String) -> String {
+    url.replacingOccurrences(of: "ab67616d0000b273", with: "ab67616d00001e02")
+        .replacingOccurrences(of: "ab67616d00004851", with: "ab67616d00001e02")
+        .replacingOccurrences(of: "ab6761610000e5eb", with: "ab67616100005174")
+        .replacingOccurrences(of: "ab6761610000f178", with: "ab67616100005174")
+}
+
 func mmss(_ ms: Int) -> String { String(format: "%d:%02d", ms / 60000, ms / 1000 % 60) }
 
 // MARK: sizes and colors
 
-let width: CGFloat = 640
+let width: CGFloat = 540  // the card's; with the height below, about 1.2:1
 let margin: CGFloat = 24  // around the card, for its shadow
 let barH: CGFloat = 54
 let hitH: CGFloat = 38
 let footH: CGFloat = 50
 let headH: CGFloat = 22
+let pageH: CGFloat = 62  // inside an album, playlist or artist: its cover and name, atop the list
+let pageArt: CGFloat = 44
 let thumb: CGFloat = 28
 let height: CGFloat = 492  // the window's, always: it never grows into the bottom of the screen
 let listTop = barH + 1 + 4
@@ -214,7 +231,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     var scroll = 0
     var recent: [Hit] = []
     var playlists: [Hit] = []
-    var inside: (parent: Hit, back: [Hit], picked: Int, scroll: Int)?
+    /// What → opened, innermost last (an artist, then one of their albums), each with what it
+    /// was opened from.
+    var pages: [(parent: Hit, back: [Hit], picked: Int, scroll: Int)] = []
+    var inside: (parent: Hit, back: [Hit], picked: Int, scroll: Int)? { pages.last }
+    var topH: CGFloat { inside != nil ? pageH : 0 }
     var note: String?
     var busy = false
     var generation = 0
@@ -394,7 +415,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         generation += 1  // answers on their way are moot
         field.stringValue = ""
         results = recent
-        inside = nil
+        pages = []
         note = nil
         busy = false
         picked = 0
@@ -465,7 +486,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     func search() {
         generation += 1
         let g = generation, q = query
-        inside = nil
+        pages = []
         note = nil
         picked = 0
         scroll = 0
@@ -506,7 +527,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     /// starts a section (has a title).
     func shown(from: Int? = nil) -> [(Int, Bool)] {
         let from = from ?? scroll
-        var used: CGFloat = inside != nil ? headH : 0
+        var used: CGFloat = topH
         var out: [(Int, Bool)] = []
         for i in results.indices where i >= from {
             let s = results[i].section
@@ -532,22 +553,25 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         pick(back ? starts.last { $0 < picked } ?? starts.last! : starts.first { $0 > picked } ?? 0)
     }
 
-    /// →: the picked album, playlist or artist's songs, in place.
+    /// →: the picked album, playlist or artist's page, in place.
     func openPicked() -> Bool {
-        guard inside == nil, results.indices.contains(picked), results[picked].opens else { return false }
+        guard results.indices.contains(picked), results[picked].opens else { return false }
         let h = results[picked]
         generation += 1
         let g = generation
-        inside = (h, results, picked, scroll)
+        // from a song's page to its album: that song picked there
+        let song = inside.map(\.parent.uri).flatMap { $0.hasPrefix("spotify:track:") ? $0 : nil }
+        pages.append((h, results, picked, scroll))
         results = []
         (picked, scroll, note, busy) = (0, 0, nil, true)
         card.needsDisplay = true
-        ask(["launcher", "songs", h.uri]) { code, text in
+        ask(["launcher", h.uri.hasPrefix("spotify:track:") ? "song" : "songs", h.uri]) { code, text in
             guard self.generation == g, self.inside != nil else { return }
             self.busy = false
             if code == 0 {
                 self.results = rows(text)
                 self.note = self.results.isEmpty ? "no songs" : nil
+                if let song, let i = self.results.firstIndex(where: { $0.uri == song }) { self.pick(i) }
             } else {
                 self.note = text
             }
@@ -558,9 +582,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// ← or esc inside: back to what it was opened from.
     func goBack() -> Bool {
-        guard let i = inside else { return false }
+        guard let i = pages.popLast() else { return false }
         generation += 1
-        inside = nil
         (results, picked, scroll, note, busy) = (i.back, i.picked, i.scroll, nil, false)
         card.needsDisplay = true
         return true
@@ -578,15 +601,15 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
             hide()
             ask(["launcher", "search", q]) { code, text in
                 guard code == 0, let first = rows(text).first else { return }
-                ask(queue ? ["launcher", "queue", first.uri] : ["play", first.uri])
+                ask(["launcher", queue ? "queue" : "play", first.uri])
             }
             return
         }
         guard results.indices.contains(picked) else { return }
         let uri = results[picked].uri
         // a song inside an album or playlist plays it from there on; an artist's, on its own
-        let from = inside.map(\.parent.uri).flatMap { $0.hasPrefix("spotify:artist:") || queue ? nil : $0 }
-        let args = queue ? ["launcher", "queue", uri] : from.map { ["play", $0, "--from", uri] } ?? ["play", uri]
+        let from = inside.map(\.parent).flatMap { $0.list && !queue && uri.hasPrefix("spotify:track:") ? $0.uri : nil }
+        let args = queue ? ["launcher", "queue", uri] : from.map { ["play", $0, "--from", uri] } ?? ["launcher", "play", uri]
         ask(args) { code, text in
             if code == 0 {
                 self.hide()
@@ -616,6 +639,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         n.shuffle.toggle()
         now = n
         card.needsDisplay = true
+        card.syncButtons()
+        card.pulse("shuffle")
         ask(["set", "shuffle=\(n.shuffle ? "on" : "off")"])
     }
 
@@ -624,13 +649,32 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         n.repeatMode = ["off": "all", "all": "one"][n.repeatMode] ?? "off"
         now = n
         card.needsDisplay = true
+        card.syncButtons()
+        card.pulse("repeat")
         ask(["set", "repeat=\(n.repeatMode)"])
     }
 
     func togglePlay() {
-        guard now != nil else { return }
-        let paused = now!.playing
+        guard var n = now else { return }
+        let paused = n.playing
+        // flip the button now (its symbol morphs); the player's answer settles it
+        n.playing.toggle()
+        now = n
+        card.syncButtons()
         ask(["set", "paused=\(paused ? "yes" : "no")"]) { _, _ in self.fetchNow() }
+    }
+
+    /// The previous (-1) or next (1) song.
+    func skip(_ by: Int) {
+        guard now != nil else { return }
+        card.pulse(by < 0 ? "prev" : "next")
+        ask([by < 0 ? "prev" : "next"]) { _, _ in self.fetchNow() }
+    }
+
+    /// Back or ahead `secs` seconds in the song.
+    func seek(_ secs: Int) {
+        guard now != nil else { return }
+        ask(["set", "seek=\(secs < 0 ? "-" : "+")\(abs(secs))"]) { _, _ in self.fetchNow() }
     }
 
     // MARK: keys
@@ -650,6 +694,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         case kVK_ANSI_P where ctrl && n > 0: pick((picked + n - 1) % n)
         case kVK_Return, kVK_ANSI_KeypadEnter: choose(queue: cmd)
         case kVK_Tab: nextSection(back: m.contains(.shift))
+        case kVK_Space where field.stringValue.isEmpty && !cmd && !ctrl: togglePlay()
+        case kVK_LeftArrow where cmd && m.contains(.option): seek(-10)
+        case kVK_RightArrow where cmd && m.contains(.option): seek(10)
+        case kVK_LeftArrow where cmd && !m.contains(.shift): skip(-1)
+        case kVK_RightArrow where cmd && !m.contains(.shift): skip(1)
         case kVK_RightArrow where caretAtEnd && !m.contains(.shift): return openPicked()
         case kVK_LeftArrow where inside != nil: return goBack()
         case kVK_ANSI_S where ctrl: toggleShuffle()
@@ -663,20 +712,22 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     // MARK: covers
 
-    func image(_ url: String) -> NSImage? {
+    /// A cover at `size` points: Spotify's 64 px copy for a row's, its 300 px one for bigger.
+    func image(_ url: String, size: CGFloat = thumb) -> NSImage? {
         guard !url.isEmpty else { return nil }
-        let u = small(url)
-        if let i = images.object(forKey: u as NSString) { return i }
-        if !loading.contains(u), let url = URL(string: u) {
-            loading.insert(u)
+        let u = size > thumb ? medium(url) : small(url)
+        let key = "\(u)#\(size)"
+        if let i = images.object(forKey: key as NSString) { return i }
+        if !loading.contains(key), let url = URL(string: u) {
+            loading.insert(key)
             URLSession.shared.dataTask(with: url) { data, _, _ in
                 // decoded once, at the size it's drawn (2x), so the cache holds small bitmaps
-                let img = data.flatMap(NSImage.init(data:)).map { downsized($0, to: thumb * 2) }
+                let img = data.flatMap(NSImage.init(data:)).map { downsized($0, to: size * 2) }
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let me = NSApp.delegate as? Launcher else { return }
-                        me.loading.remove(u)
-                        if let img { me.images.setObject(img, forKey: u as NSString) }
+                        me.loading.remove(key)
+                        if let img { me.images.setObject(img, forKey: key as NSString) }
                         me.card.needsDisplay = true
                     }
                 }
@@ -712,6 +763,9 @@ final class Card: NSView {
 
     let progress = NSView()
     var art: Art!
+    /// The foot's buttons, as image views so SF Symbols' own effects animate them (Core
+    /// Animation runs those; the card isn't redrawn).
+    var glyphs: [String: Glyph] = [:]
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -722,6 +776,58 @@ final class Card: NSView {
         addSubview(art)
         progress.wantsLayer = true
         art.addSubview(progress)
+        for (r, k) in buttons {
+            let g = Glyph(frame: r)
+            g.imageScaling = .scaleNone
+            g.imageAlignment = .alignCenter
+            g.autoresizingMask = [.minXMargin, .minYMargin]
+            g.isHidden = true
+            addSubview(g, positioned: .below, relativeTo: art)
+            glyphs[k] = g
+        }
+    }
+
+    /// Each button's symbol and color for what's playing. A changed symbol (play to pause,
+    /// repeat to repeat one) morphs into the new one.
+    func syncButtons() {
+        guard let l = launcher else { return }
+        for (k, g) in glyphs {
+            guard let n = l.now else { g.isHidden = true; continue }
+            g.isHidden = false
+            let (name, lit) = switch k {
+            case "shuffle": ("shuffle", n.shuffle)
+            case "repeat": (n.repeatMode == "one" ? "repeat.1" : "repeat", n.repeatMode != "off")
+            case "next": ("forward.fill", true)
+            case "prev": ("backward.fill", true)
+            default: (n.playing ? "pause.fill" : "play.fill", true)
+            }
+            g.contentTintColor = lit ? .labelColor : .secondaryLabelColor
+            guard name != g.name else { continue }
+            let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 14, weight: .semibold))
+            if g.name == nil {
+                g.image = img
+            } else if let img {
+                g.setSymbolImage(img, contentTransition: .replace.downUp)
+            }
+            g.name = name
+        }
+    }
+
+    /// A little flourish on a button when it's pressed (by click or key): the arrows nudge
+    /// the way they point, repeat spins, shuffle hops.
+    func pulse(_ k: String) {
+        guard let g = glyphs[k], !g.isHidden else { return }
+        if #available(macOS 15, *) {
+            switch k {
+            case "next": g.addSymbolEffect(.wiggle.right.byLayer, options: .nonRepeating); return
+            case "prev": g.addSymbolEffect(.wiggle.left.byLayer, options: .nonRepeating); return
+            case "repeat" where g.name == "repeat": g.addSymbolEffect(.rotate.byLayer, options: .nonRepeating); return
+            default: break
+            }
+        }
+        if k == "repeat" && g.name != "repeat" { return }  // repeat one morphs in; that's enough
+        g.addSymbolEffect(.bounce.byLayer, options: .nonRepeating)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -732,18 +838,19 @@ final class Card: NSView {
         art.effectiveAppearance.performAsCurrentDrawingAppearance { progress.layer?.backgroundColor = NSColor.controlAccentColor.cgColor }
         progress.isHidden = l.now == nil
         progress.frame = NSRect(x: 0, y: f.maxY - 2, width: (f.width * (l.now?.ratio ?? 0)).rounded(), height: 2)
+        syncButtons()
     }
 
     var footRect: NSRect { NSRect(x: 0, y: bounds.height - footH, width: bounds.width, height: footH) }
     var buttons: [(NSRect, String)] {
         let f = footRect
-        return ["repeat", "play", "shuffle"].enumerated().map { i, k in (NSRect(x: f.maxX - 20 - 30 * CGFloat(i + 1) - 4 * CGFloat(i), y: f.midY - 15, width: 30, height: 30), k) }
+        return ["repeat", "next", "play", "prev", "shuffle"].enumerated().map { i, k in (NSRect(x: f.maxX - 20 - 30 * CGFloat(i + 1) - 4 * CGFloat(i), y: f.midY - 15, width: 30, height: 30), k) }
     }
 
     /// Where each row on screen is drawn.
     func rowRects() -> [(Int, Bool, NSRect)] {
         guard let l = launcher else { return [] }
-        var y = listTop + (l.inside != nil ? headH : 0)
+        var y = listTop + l.topH
         return l.shown().map { i, titled in
             if titled { y += headH }
             defer { y += hitH }
@@ -779,9 +886,11 @@ final class Card: NSView {
             switch k {
             case "shuffle": launcher.toggleShuffle()
             case "repeat": launcher.cycleRepeat()
+            case "next": launcher.skip(1)
+            case "prev": launcher.skip(-1)
             default: launcher.togglePlay()
             }
-        } else if launcher.inside != nil && p.y >= listTop && p.y < listTop + headH {
+        } else if launcher.inside != nil && p.y >= listTop && p.y < listTop + launcher.topH {
             _ = launcher.goBack()
         } else {
             window?.performDrag(with: e)  // anywhere else moves it; it opens there next time
@@ -803,8 +912,8 @@ final class Card: NSView {
             NSRect(x: 20, y: barH, width: bounds.width - 40, height: 1).fill()
         }
         let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
-        if let inside = l.inside {
-            draw("‹  " + inside.parent.name, at: NSRect(x: 20, y: listTop + 4, width: bounds.width - 40, height: 16), size: 11.5, weight: .semibold, color: .secondaryLabelColor)
+        if let page = l.inside {
+            drawPage(page.parent, text: text)
         }
         for (i, titled, r) in rowRects() {
             let h = l.results[i]
@@ -821,12 +930,16 @@ final class Card: NSView {
                 draw(h.number > 0 ? "\(h.number)" : "", at: t.offsetBy(dx: 0, dy: 6), size: 12, weight: .medium, color: .tertiaryLabelColor, align: .center, mono: true)
             }
             var right = r.maxX - 12
-            if on && h.opens && l.inside == nil {
+            if on && h.opens {
                 draw("›", at: NSRect(x: right - 10, y: r.midY - 11, width: 10, height: 20), size: 17, weight: .medium, color: .tertiaryLabelColor)
                 right -= 18
             }
             if h.ms > 0 {
                 draw(mmss(h.ms), at: NSRect(x: right - 44, y: r.midY - 8, width: 44, height: 16), size: 12, weight: .regular, color: .tertiaryLabelColor, align: .right, mono: true)
+                right -= 52
+            } else if !h.year.isEmpty {
+                // an album's year, where a song's length goes: how a discography reads
+                draw(h.year, at: NSRect(x: right - 44, y: r.midY - 9, width: 44, height: 18), size: 13, weight: .medium, color: .secondaryLabelColor, align: .right, mono: true)
                 right -= 52
             }
             let x = t.maxX + 12
@@ -838,7 +951,7 @@ final class Card: NSView {
         }
         // stand-ins for Spotify's results while they're on their way
         if l.busy {
-            var y = (rowRects().last.map { $0.2.maxY } ?? listTop + (l.inside != nil ? headH : 0))
+            var y = (rowRects().last.map { $0.2.maxY } ?? listTop + l.topH)
             var k = 0
             while y + hitH <= listTop + room {
                 text.withAlphaComponent(0.06).setFill()
@@ -851,10 +964,36 @@ final class Card: NSView {
             }
         }
         if let n = l.note {
-            let y = listed ? (rowRects().last.map { $0.2.maxY + 8 } ?? listTop + (l.inside != nil ? headH : 0) + 8) : barH + 14
+            let y = listed ? (rowRects().last.map { $0.2.maxY + 8 } ?? listTop + l.topH + 8) : barH + 14
             draw(n, at: NSRect(x: 24, y: y, width: bounds.width - 48, height: 18), size: 13, weight: .medium, color: .secondaryLabelColor)
         }
         drawFoot(text: text)
+    }
+
+    var pageArtRect: NSRect { NSRect(x: 36, y: listTop + (pageH - pageArt) / 2 - 2, width: pageArt, height: pageArt) }
+
+    /// Atop an album, playlist or artist: back, its cover, its name, and what's in it.
+    func drawPage(_ p: Hit, text: NSColor) {
+        guard let l = launcher else { return }
+        let a = pageArtRect
+        draw("‹", at: NSRect(x: 18, y: a.midY - 12, width: 12, height: 22), size: 18, weight: .medium, color: .tertiaryLabelColor)
+        let x = a.maxX + 14, w = bounds.width - x - 20
+        let album = p.uri.hasPrefix("spotify:album:")
+        var what: [String] = []
+        if p.round {
+            what.append("Artist")
+        } else {
+            // an album's artists are its songs'; a playlist's subtitle says it's one
+            if album, let by = l.results.first?.sub, !by.isEmpty { what.append(by) } else if !album, !p.sub.isEmpty { what.append(p.sub) }
+            if !p.year.isEmpty { what.append(p.year) }
+            let songs = l.results.filter { $0.ms > 0 }
+            if !songs.isEmpty {
+                let mins = (songs.reduce(0) { $0 + $1.ms } + 30000) / 60000
+                what.append("\(songs.count) song\(songs.count == 1 ? "" : "s"), " + (mins >= 60 ? "\(mins / 60) hr \(mins % 60) min" : "\(mins) min"))
+            }
+        }
+        draw(p.name, at: NSRect(x: x, y: a.minY + 3, width: w, height: 20), size: 15, weight: .semibold, color: text)
+        draw(what.joined(separator: " · "), at: NSRect(x: x, y: a.minY + 24, width: w, height: 15), size: 11.5, weight: .regular, color: .secondaryLabelColor)
     }
 
     func drawFoot(text: NSColor) {
@@ -870,20 +1009,11 @@ final class Card: NSView {
         if l.copied {
             draw("link copied", at: NSRect(x: right + 4, y: f.midY - 7, width: 76, height: 15), size: 11, weight: .medium, color: text)
         }
-        for (r, k) in buttons {
-            let (name, lit) = switch k {
-            case "shuffle": ("shuffle", n.shuffle)
-            case "repeat": (n.repeatMode == "one" ? "repeat.1" : "repeat", n.repeatMode != "off")
-            default: (n.playing ? "pause.fill" : "play.fill", true)
-            }
-            // shuffle and repeat, when on, sit on a soft pill (the way Music marks them)
-            if lit && k != "play" {
-                NSColor.quaternaryLabelColor.setFill()
-                NSBezierPath(roundedRect: r, xRadius: 8, yRadius: 8).fill()
-            }
-            if let s = symbol(name, 14, .semibold, lit ? text : .secondaryLabelColor) {
-                s.draw(in: NSRect(x: r.midX - s.size.width / 2, y: r.midY - s.size.height / 2, width: s.size.width, height: s.size.height))
-            }
+        // shuffle and repeat, when on, sit on a soft pill (the way Music marks them); the
+        // symbols themselves are Glyphs (syncButtons)
+        for (r, k) in buttons where (k == "shuffle" && n.shuffle) || (k == "repeat" && n.repeatMode != "off") {
+            NSColor.quaternaryLabelColor.setFill()
+            NSBezierPath(roundedRect: r, xRadius: 8, yRadius: 8).fill()
         }
     }
 
@@ -891,6 +1021,9 @@ final class Card: NSView {
     func drawArt() {
         guard let l = launcher else { return }
         let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
+        if let p = l.inside?.parent {
+            drawThumb(l.image(p.cover, size: pageArt), in: pageArtRect, round: p.round, liked: p.uri == "liked")
+        }
         for (i, _, r) in rowRects() {
             let h = l.results[i]
             if i == l.picked {
@@ -953,6 +1086,13 @@ final class Card: NSView {
         let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight).applying(.init(paletteColors: [color]))
         return NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
     }
+}
+
+/// One of the foot's buttons: a vibrant symbol, clicks going through to the card.
+final class Glyph: NSImageView {
+    var name: String?
+    override var allowsVibrancy: Bool { true }
+    override func hitTest(_ p: NSPoint) -> NSView? { nil }
 }
 
 /// Covers and the accent, over the card and outside its vibrancy (blended, they'd wash out).
