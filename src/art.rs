@@ -87,10 +87,18 @@ fn disk_path(url: &str) -> PathBuf {
     cache_dir().join("art").join(name)
 }
 
-/// An image fetched before, from disk.
+/// An image fetched before, from disk, marked as just shown (the least recently shown go first
+/// when the covers outgrow their share of the cache).
 fn cached(url: &str) -> Option<Vec<u8>> {
-    fs::read(disk_path(url)).ok().filter(|b| !b.is_empty())
+    let path = disk_path(url);
+    let bytes = fs::read(&path).ok().filter(|b| !b.is_empty())?;
+    let _ = fs::File::options().write(true).open(&path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    Some(bytes)
 }
+
+/// Covers written since the last pruning: every so often they're held to their budget again,
+/// so a player left running for weeks stays under the limit too.
+static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// From disk if it's been fetched before, else from Spotify, kept on disk for next time.
 async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
@@ -104,6 +112,9 @@ async fn fetch_bytes(url: &str) -> Option<Vec<u8>> {
     let tmp = path.with_extension(format!("tmp{:08x}", rand::random::<u32>()));
     if fs::write(&tmp, &bytes).is_ok() && fs::rename(&tmp, &path).is_err() {
         let _ = fs::remove_file(&tmp);
+    }
+    if WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 50 == 49 {
+        tokio::task::spawn_blocking(prune_art);
     }
     Some(bytes)
 }

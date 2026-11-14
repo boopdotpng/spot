@@ -194,8 +194,10 @@ Audio quality, the song cache's size, loudness normalization and your own colors
 - **Albums & artists** you've opened before (track lists and releases) also show instantly from
   the cache and refresh in the background.
 - **Audio cache**: played songs are kept in `~/.cache/spot/audio` (as streamed, encrypted), so
-  replaying them starts instantly without the network. Capped at 1 GB, least recently played
-  dropped first; set `audio_cache_gb` in [config.toml](docs/config.md) to change the cap (`0` turns it off).
+  replaying them starts instantly without the network. The whole cache (songs, covers, lists)
+  stays under 1.5 GB: covers get a tenth, least recently shown dropped first, and songs fill the
+  rest, least recently played dropped first. Set `cache_gb` in [config.toml](docs/config.md) to
+  change it (`0` keeps no songs).
 - **`spot clean`** clears the caches (songs, playlist / album / artist lists, covers). Login,
   settings, the resume point and unsent scrobbles are kept.
 - **Resume**: quitting saves the list, the queue, shuffle/repeat and position; next launch shows that song

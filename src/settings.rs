@@ -11,7 +11,7 @@ const TEMPLATE: &str = "\
 # Every key: https://github.com/boopdotpng/spot/blob/master/docs/config.md
 
 # quality = 320         # 96, 160 or 320 kbps
-# audio_cache_gb = 1    # played songs kept on disk; 0 turns it off
+# cache_gb = 1.5        # all spot keeps on disk: songs, covers, lists; 0 keeps no songs
 # normalize = true      # play every song at about the same loudness
 
 # Your own colors for the TUI: change a built-in theme, or add one to ctrl+t.
@@ -22,14 +22,14 @@ const TEMPLATE: &str = "\
 pub struct Settings {
     pub client_id: Option<String>, // your Spotify app's; the first run saves it here
     pub quality: u16, // kbps: 96, 160 or 320
-    pub audio_cache_gb: f64, // played songs kept on disk; 0 = off
+    pub cache_gb: f64, // the whole cache on disk, songs filling what the rest leaves; 0 = no songs
     pub normalize: bool, // Spotify's loudness data evens out songs
     pub themes: Vec<Family>, // added to the built-in ones, or replacing them by name
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { client_id: None, quality: 320, audio_cache_gb: 1.0, normalize: true, themes: vec![] }
+        Settings { client_id: None, quality: 320, cache_gb: 1.5, normalize: true, themes: vec![] }
     }
 }
 
@@ -80,9 +80,10 @@ fn parse(text: &str) -> (Settings, Vec<String>) {
             ("client_id", _) => bad.push("client_id: your Spotify app's client id, in quotes".into()),
             ("quality", Value::Integer(q @ (96 | 160 | 320))) => s.quality = *q as u16,
             ("quality", _) => bad.push("quality: 96, 160 or 320".into()),
-            ("audio_cache_gb", v) => match v.as_float().or(v.as_integer().map(|i| i as f64)) {
-                Some(x) if x >= 0.0 && x.is_finite() => s.audio_cache_gb = x,
-                _ => bad.push("audio_cache_gb: a number, 0 or above".into()),
+            // audio_cache_gb: its name from when it counted only the songs
+            ("cache_gb" | "audio_cache_gb", v) => match v.as_float().or(v.as_integer().map(|i| i as f64)) {
+                Some(x) if x >= 0.0 && x.is_finite() => s.cache_gb = x,
+                _ => bad.push(format!("{key}: a number, 0 or above")),
             },
             ("normalize", Value::Boolean(b)) => s.normalize = *b,
             ("normalize", _) => bad.push("normalize: true or false".into()),
@@ -152,7 +153,7 @@ mod tests {
         let (s, bad) = parse(&on);
         let d = Settings::default();
         assert!(bad.is_empty(), "{bad:?}");
-        assert_eq!((s.quality, s.audio_cache_gb), (d.quality, d.audio_cache_gb));
+        assert_eq!((s.quality, s.cache_gb), (d.quality, d.cache_gb));
         assert_eq!(s.normalize, d.normalize);
         assert_eq!(s.themes.len(), 1);
     }
@@ -169,7 +170,7 @@ mod tests {
     fn empty_is_the_defaults() {
         let (s, bad) = parse("");
         assert!(bad.is_empty());
-        assert_eq!((s.quality, s.audio_cache_gb), (320, 1.0));
+        assert_eq!((s.quality, s.cache_gb), (320, 1.5));
     }
 
     #[test]
@@ -177,15 +178,16 @@ mod tests {
         let (s, bad) = parse("quality = 160\nnormalize = false\n");
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!((s.quality, s.normalize), (160, false));
-        assert_eq!(parse("audio_cache_gb = 0").0.audio_cache_gb, 0.0);
-        assert_eq!(parse("audio_cache_gb = 2.5").0.audio_cache_gb, 2.5);
-        assert_eq!(parse("audio_cache_gb = -1").1.len(), 1);
+        assert_eq!(parse("cache_gb = 0").0.cache_gb, 0.0);
+        assert_eq!(parse("cache_gb = 2.5").0.cache_gb, 2.5);
+        assert_eq!(parse("audio_cache_gb = 2").0.cache_gb, 2.0);
+        assert_eq!(parse("cache_gb = -1").1.len(), 1);
     }
 
     #[test]
     fn bad_values_keep_defaults_and_say_so() {
         let (s, bad) = parse("quality = 128\nnormalize = 1\naudio_cache_gb = -1\nnope = 1\n");
-        assert_eq!((s.quality, s.normalize, s.audio_cache_gb), (320, true, 1.0));
+        assert_eq!((s.quality, s.normalize, s.cache_gb), (320, true, 1.5));
         assert_eq!(bad.len(), 4, "{bad:?}");
         let (s, bad) = parse("this isn't toml");
         assert_eq!(s.quality, 320);

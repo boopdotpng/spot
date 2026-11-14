@@ -367,16 +367,53 @@ pub fn save_last(q: &Queue, pos_ms: u64, shuffle: bool, repeat: Repeat) {
 /// or unsent scrobbles).
 const CLEARABLE: [&str; 7] = ["audio", "lists", "releases", "artists", "playlists", "shows", "art"];
 
+/// Bytes a file or directory takes on disk.
+pub fn disk_size(p: &std::path::Path) -> u64 {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::read_dir(p).into_iter().flatten().flatten().map(|e| disk_size(&e.path())).sum(),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
+}
+
 /// Bytes the clearable cache takes on disk.
 fn cache_size() -> u64 {
-    fn size(p: &std::path::Path) -> u64 {
-        match fs::symlink_metadata(p) {
-            Ok(m) if m.is_dir() => fs::read_dir(p).into_iter().flatten().flatten().map(|e| size(&e.path())).sum(),
-            Ok(m) => m.len(),
-            Err(_) => 0,
+    CLEARABLE.iter().map(|n| disk_size(&cache_dir().join(n))).sum()
+}
+
+/// Bytes the covers in `art` may take: a share of the whole cache's limit, set at startup.
+static ART_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub fn set_art_budget(bytes: u64) {
+    ART_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drop covers until they fit their budget, least recently shown first (showing one touches
+/// its file's modified time).
+pub fn prune_art() {
+    let budget = ART_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+    let mut files: Vec<_> = fs::read_dir(cache_dir().join("art"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    let mut used: u64 = files.iter().map(|f| f.1).sum();
+    if used <= budget {
+        return;
+    }
+    files.sort_by_key(|f| f.0);
+    for (_, len, path) in files {
+        if used <= budget {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            used -= len;
         }
     }
-    CLEARABLE.iter().map(|n| size(&cache_dir().join(n))).sum()
 }
 
 /// `spot clean`: drop everything that's only a cache, with the player stopped so nothing holds

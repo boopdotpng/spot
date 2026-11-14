@@ -286,11 +286,18 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
 
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Played songs are kept (encrypted, as streamed) so replays start instantly and skip the
-    // network, least recently played dropped first past the limit: audio_cache_gb in config.toml (SPOT_AUDIO_CACHE_GB overrides), 0 = off.
-    let audio_gb: f64 = std::env::var("SPOT_AUDIO_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(settings.audio_cache_gb);
-    let audio = (audio_gb > 0.0).then(|| dir.join("audio"));
-    let limit = audio.as_ref().map(|_| (audio_gb * 1e9) as u64);
+    // The whole cache stays under cache_gb in config.toml (SPOT_CACHE_GB overrides). Covers get a
+    // tenth of it, least recently shown dropped first; played songs (kept encrypted, as streamed,
+    // so replays start instantly and skip the network) fill what's left, least recently played
+    // dropped first. 0 keeps no songs.
+    let gb: f64 = ["SPOT_CACHE_GB", "SPOT_AUDIO_CACHE_GB"].iter().find_map(|k| std::env::var(k).ok()?.parse().ok()).unwrap_or(settings.cache_gb);
+    let total = (gb * 1e9) as u64;
+    set_art_budget(total / 10);
+    prune_art();
+    let others = disk_size(&dir).saturating_sub(disk_size(&dir.join("audio")));
+    let audio = (gb > 0.0).then(|| dir.join("audio"));
+    let limit = audio.as_ref().map(|_| total.saturating_sub(others));
+    log::info!("cache: {:.0} MB besides songs, {:.0} MB left for songs", others as f64 / 1e6, limit.unwrap_or(0) as f64 / 1e6);
     let cache = Cache::new(Some(dir.clone()), Some(dir.clone()), audio, limit).map_err(|e| e.to_string())?;
     let refresh_path = dir.join("refresh_token");
 

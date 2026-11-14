@@ -16,13 +16,13 @@ keeps its default.
 | --- | --- | --- | --- |
 | `client_id` | none | your Spotify app's client id, in quotes | Saved here by the first-run setup. `SPOT_CLIENT_ID` overrides it. |
 | `quality` | `320` | `96`, `160`, `320` | Audio quality in kbps. 320 is the most librespot can stream. |
-| `audio_cache_gb` | `1` | `0` or above; decimals work | How much played music to keep on disk, least recently played dropped first. `0` turns the cache off. `SPOT_AUDIO_CACHE_GB` overrides it. |
+| `cache_gb` | `1.5` | `0` or above; decimals work | How much spot keeps on disk in `~/.cache/spot`, all told. Covers get a tenth of it, least recently shown dropped first; played songs fill what the rest leaves, least recently played dropped first. `0` keeps no songs. `audio_cache_gb`, its old name, still works. `SPOT_CACHE_GB` overrides it. |
 | `normalize` | `true` | `true`, `false` | Play every song at about the same loudness, using Spotify's loudness data. |
 
 ```toml
 client_id = "0123456789abcdef0123456789abcdef"
 quality = 320
-audio_cache_gb = 1
+cache_gb = 1.5
 normalize = true
 ```
 
