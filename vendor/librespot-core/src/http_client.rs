@@ -9,10 +9,9 @@ use governor::{
     Quota, RateLimiter, clock::MonotonicClock, middleware::NoOpMiddleware,
     state::keyed::DefaultKeyedStateStore,
 };
-use http::{Uri, header::HeaderValue};
+use http::header::HeaderValue;
 use http_body_util::{BodyExt, Full};
 use hyper::{HeaderMap, Request, Response, StatusCode, body::Incoming, header::USER_AGENT};
-use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
 use hyper_util::{
     client::legacy::{Client, ResponseFuture, connect::HttpConnector},
     rt::TokioExecutor,
@@ -92,7 +91,8 @@ impl From<HttpClientError> for Error {
     }
 }
 
-type HyperClient = Client<ProxyConnector<HttpsConnector<HttpConnector>>, Full<bytes::Bytes>>;
+// spot patch: no ProxyConnector (hyper-proxy2) around it: spot sets no proxy
+type HyperClient = Client<HttpsConnector<HttpConnector>, Full<bytes::Bytes>>;
 
 pub struct HttpClient {
     user_agent: HeaderValue,
@@ -159,17 +159,15 @@ impl HttpClient {
         #[cfg(all(feature = "native-tls", not(feature = "__rustls")))]
         let https_connector = HttpsConnector::new();
 
-        // When not using a proxy a dummy proxy is configured that will not intercept any traffic.
-        // This prevents needing to carry the Client Connector generics through the whole project
-        let proxy = match &proxy_url {
-            Some(proxy_url) => Proxy::new(Intercept::All, proxy_url.to_string().parse()?),
-            None => Proxy::new(Intercept::None, Uri::from_static("0.0.0.0")),
-        };
-        let proxy_connector = ProxyConnector::from_proxy(https_connector, proxy)?;
+        // spot patch: HTTP requests don't go through a proxy (hyper-proxy2 is gone, and with it a
+        // second, older rustls); spot never sets one
+        if let Some(proxy_url) = proxy_url {
+            warn!("Ignoring proxy \"{proxy_url}\" for HTTP requests");
+        }
 
         let client = Client::builder(TokioExecutor::new())
             .http2_adaptive_window(true)
-            .build(proxy_connector);
+            .build(https_connector);
         Ok(client)
     }
 
