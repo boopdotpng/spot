@@ -20,7 +20,10 @@ minutes. To update, `git pull` and run `install.sh` again: it restarts a running
 new build, still playing.
 
 The launcher is a Spotlight-style bar on Liquid Glass: ⌥Space from any app, type, ⏎ plays (⌘⏎
-queues, → opens an album, playlist or artist, ⌘C copies a link, esc closes). It starts at login;
+queues, → opens an album, playlist or artist, ⌘C copies a link, esc closes). With the mouse, a
+song plays on a click (⌘-click queues), an album, playlist or artist opens, a row's cover plays it
+whole, and a right click has the rest; two fingers to the right or the mouse's back button go
+back. It starts at login;
 `defaults write com.github.boopdotpng.spot.launcher hotkey cmd+shift+space` changes its key.
 Using Claude Code or Codex? Point it at this repo and ask it to build and install spot:
 [AGENTS.md](AGENTS.md) tells it how.

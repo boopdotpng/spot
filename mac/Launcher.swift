@@ -422,6 +422,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         scroll = 0
         copied = false
         hover = nil
+        card.spot = .none
         card.needsDisplay = true
     }
 
@@ -544,6 +545,20 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         if i < scroll { scroll = i }
         while scroll < i, let last = shown().last?.0, last < i { scroll += 1 }
         card.needsDisplay = true
+    }
+
+    /// The wheel: the list `by` rows down (up when -), the picked row left where it is. False
+    /// when it was already at that end.
+    func scrollRows(by n: Int) -> Bool {
+        // the furthest down: where the last row just shows
+        var most = scroll
+        while let last = shown(from: most).last?.0, last < results.count - 1 { most += 1 }
+        while most > 0, shown(from: most - 1).last?.0 == results.count - 1 { most -= 1 }
+        let to = max(0, min(scroll + n, most))
+        guard to != scroll else { return false }
+        scroll = to
+        card.needsDisplay = true
+        return true
     }
 
     /// tab: the first row of the next section (⇧: of this one, or the one before).
@@ -858,43 +873,166 @@ final class Card: NSView {
         }
     }
 
+    /// What's under the mouse: a row's cover (plays it), its › (opens it), the rest of it, or
+    /// the page's header (back).
+    enum Spot: Equatable { case none, row(Int), cover(Int), open(Int), back }
+    var spot: Spot = .none
+
+    func thumbRect(_ r: NSRect) -> NSRect { NSRect(x: r.minX + 12, y: r.midY - thumb / 2, width: thumb, height: thumb) }
+    func chevronRect(_ r: NSRect) -> NSRect { NSRect(x: r.maxX - 30, y: r.minY, width: 30, height: r.height) }
+
+    func spot(at p: NSPoint) -> Spot {
+        guard let l = launcher else { return .none }
+        if let (i, _, r) = rowRects().first(where: { NSMouseInRect(p, $0.2, true) }) {
+            let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
+            if !numbered && NSMouseInRect(p, thumbRect(r).insetBy(dx: -6, dy: -4), true) { return .cover(i) }
+            if l.results[i].opens && NSMouseInRect(p, chevronRect(r), true) { return .open(i) }
+            return .row(i)
+        }
+        if l.inside != nil && p.y >= listTop && p.y < listTop + l.topH { return .back }
+        return .none
+    }
+
+    func hoverRow(_ s: Spot) -> Int? {
+        switch s {
+        case .row(let i), .cover(let i), .open(let i): i
+        default: nil
+        }
+    }
+
+    /// Where the mouse is now, after a move or a scroll moved the rows under it.
+    func trackMouse(_ p: NSPoint? = nil) {
+        guard let w = window, let l = launcher else { return }
+        let s = spot(at: p ?? convert(w.mouseLocationOutsideOfEventStream, from: nil))
+        guard s != spot else { return }
+        spot = s
+        l.hover = hoverRow(s)
+        needsDisplay = true
+        (s == .none ? NSCursor.arrow : NSCursor.pointingHand).set()
+    }
+
     override func updateTrackingAreas() {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
 
-    override func mouseMoved(with e: NSEvent) {
-        let p = convert(e.locationInWindow, from: nil)
-        let h = rowRects().first { NSMouseInRect(p, $0.2, true) }?.0
-        if h != launcher.hover {
-            launcher.hover = h
-            needsDisplay = true
-        }
-    }
+    override func mouseMoved(with e: NSEvent) { trackMouse(convert(e.locationInWindow, from: nil)) }
 
     override func mouseExited(with e: NSEvent) {
+        spot = .none
         launcher.hover = nil
+        NSCursor.arrow.set()
         needsDisplay = true
     }
 
+    /// A click does what the keys would: a song plays (⌘: queues), an album, playlist or artist
+    /// opens (→), its cover plays it whole (⏎), and the page's header goes back (←).
     override func mouseDown(with e: NSEvent) {
         let p = convert(e.locationInWindow, from: nil)
-        if let (i, _, _) = rowRects().first(where: { NSMouseInRect(p, $0.2, true) }) {
-            launcher.picked = i
-            launcher.choose(queue: e.modifierFlags.contains(.command))
-        } else if let (_, k) = buttons.first(where: { NSMouseInRect(p, $0.0, true) }), launcher.now != nil {
-            switch k {
-            case "shuffle": launcher.toggleShuffle()
-            case "repeat": launcher.cycleRepeat()
-            case "next": launcher.skip(1)
-            case "prev": launcher.skip(-1)
-            default: launcher.togglePlay()
-            }
-        } else if launcher.inside != nil && p.y >= listTop && p.y < listTop + launcher.topH {
-            _ = launcher.goBack()
-        } else {
-            window?.performDrag(with: e)  // anywhere else moves it; it opens there next time
+        let queue = e.modifierFlags.contains(.command)
+        if e.modifierFlags.contains(.control), let m = menu(for: e) {
+            NSMenu.popUpContextMenu(m, with: e, for: self)
+            return
         }
+        let s = spot(at: p)
+        // the second click of a double click lands on what the first one opened: leave it be
+        if e.clickCount > 1, s != .none { return }
+        switch s {
+        case .cover(let i):
+            launcher.pick(i)
+            launcher.choose(queue: queue)
+        case .open(let i):
+            launcher.pick(i)
+            _ = launcher.openPicked()
+            trackMouse(p)
+        case .row(let i):
+            launcher.pick(i)
+            let h = launcher.results[i]
+            if h.opens && !h.uri.hasPrefix("spotify:track:") && !queue {
+                _ = launcher.openPicked()
+                trackMouse(p)
+            } else {
+                launcher.choose(queue: queue)
+            }
+        case .back:
+            _ = launcher.goBack()
+            trackMouse(p)
+        case .none:
+            if let (_, k) = buttons.first(where: { NSMouseInRect(p, $0.0, true) }), launcher.now != nil {
+                switch k {
+                case "shuffle": launcher.toggleShuffle()
+                case "repeat": launcher.cycleRepeat()
+                case "next": launcher.skip(1)
+                case "prev": launcher.skip(-1)
+                default: launcher.togglePlay()
+                }
+            } else {
+                window?.performDrag(with: e)  // anywhere else moves it; it opens there next time
+            }
+        }
+    }
+
+    /// The mouse's back button: back, like ←.
+    override func otherMouseDown(with e: NSEvent) {
+        if e.buttonNumber == 3, launcher.goBack() { trackMouse() }
+    }
+
+    /// A right click on a row: everything that can be done with it.
+    override func menu(for e: NSEvent) -> NSMenu? {
+        guard let i = hoverRow(spot(at: convert(e.locationInWindow, from: nil))) else { return nil }
+        let l = launcher!
+        l.pick(i)
+        let h = l.results[i]
+        let m = NSMenu()
+        func add(_ title: String, _ symbol: String, _ key: String = "", _ mods: NSEvent.ModifierFlags = [], _ run: @escaping () -> Void) {
+            let item = MenuItem(title: title, run: run)
+            item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+            item.keyEquivalent = key
+            item.keyEquivalentModifierMask = mods
+            m.addItem(item)
+        }
+        add("Play", "play.fill", "\r") { l.choose(queue: false) }
+        add("Add to Queue", "text.line.last.and.arrowtriangle.forward", "\r", .command) { l.choose(queue: true) }
+        if h.opens {
+            add(h.uri.hasPrefix("spotify:track:") ? "Album and Artists" : "Open", "chevron.right", String(UnicodeScalar(NSRightArrowFunctionKey)!)) {
+                _ = l.openPicked()
+                self.trackMouse()
+            }
+        }
+        if shareLink(h.uri) != nil {
+            m.addItem(.separator())
+            add("Copy Link", "link", "c", .command) { l.copyLink() }
+        }
+        return m
+    }
+
+    /// Two fingers or the wheel scroll the list a row at a time; two fingers across, to the
+    /// right, go back (as in Safari).
+    var scrolled: CGFloat = 0
+    var across: CGFloat = 0
+    var swiped = false
+
+    override func scrollWheel(with e: NSEvent) {
+        guard let l = launcher else { return }
+        if e.phase == .began { (across, scrolled, swiped) = (0, 0, false) }
+        if e.momentumPhase != [] && swiped { return }  // the coast after a swipe goes nowhere
+        if e.hasPreciseScrollingDeltas && e.momentumPhase == [] {
+            // fingers to the right are + however scrolling is set
+            across += e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX
+            if !swiped && across > 70 && abs(across) > 2 * abs(scrolled) + 20 {
+                swiped = true
+                scrolled = 0
+                if l.goBack() { trackMouse() }
+                return
+            }
+            if swiped { return }
+        }
+        let step = e.hasPreciseScrollingDeltas ? hitH : 1
+        scrolled += e.scrollingDeltaY
+        let rows = Int((scrolled / step).rounded(.towardZero))
+        guard rows != 0 else { return }
+        scrolled -= CGFloat(rows) * step
+        if l.scrollRows(by: -rows) { trackMouse() }
     }
 
     override func draw(_ dirty: NSRect) {
@@ -930,8 +1068,8 @@ final class Card: NSView {
                 draw(h.number > 0 ? "\(h.number)" : "", at: t.offsetBy(dx: 0, dy: 6), size: 12, weight: .medium, color: .tertiaryLabelColor, align: .center, mono: true)
             }
             var right = r.maxX - 12
-            if on && h.opens {
-                draw("›", at: NSRect(x: right - 10, y: r.midY - 11, width: 10, height: 20), size: 17, weight: .medium, color: .tertiaryLabelColor)
+            if (on || i == l.hover) && h.opens {
+                draw("›", at: NSRect(x: right - 10, y: r.midY - 11, width: 10, height: 20), size: 17, weight: .medium, color: spot == .open(i) ? text : .tertiaryLabelColor)
                 right -= 18
             }
             if h.ms > 0 {
@@ -976,7 +1114,7 @@ final class Card: NSView {
     func drawPage(_ p: Hit, text: NSColor) {
         guard let l = launcher else { return }
         let a = pageArtRect
-        draw("‹", at: NSRect(x: 18, y: a.midY - 12, width: 12, height: 22), size: 18, weight: .medium, color: .tertiaryLabelColor)
+        draw("‹", at: NSRect(x: 18, y: a.midY - 12, width: 12, height: 22), size: 18, weight: .medium, color: spot == .back ? .labelColor : .tertiaryLabelColor)
         let x = a.maxX + 14, w = bounds.width - x - 20
         let album = p.uri.hasPrefix("spotify:album:")
         var what: [String] = []
@@ -1031,7 +1169,17 @@ final class Card: NSView {
                 NSBezierPath(roundedRect: NSRect(x: r.minX, y: r.minY + 10, width: 3, height: r.height - 20), xRadius: 1.5, yRadius: 1.5).fill()
             }
             if !numbered {
-                drawThumb(l.image(h.cover), in: NSRect(x: r.minX + 12, y: r.midY - thumb / 2, width: thumb, height: thumb), round: h.round, liked: h.uri == "liked")
+                let t = thumbRect(r)
+                drawThumb(l.image(h.cover), in: t, round: h.round, liked: h.uri == "liked")
+                // hovered: its cover plays it (an album, playlist or artist whole)
+                if i == l.hover {
+                    let rad = h.round ? t.width / 2 : 6
+                    NSColor.black.withAlphaComponent(spot == .cover(i) ? 0.55 : 0.35).setFill()
+                    NSBezierPath(roundedRect: t, xRadius: rad, yRadius: rad).fill()
+                    if let play = symbol("play.fill", 11, .bold, .white) {
+                        play.draw(in: NSRect(x: t.midX - play.size.width / 2 + 1, y: t.midY - play.size.height / 2, width: play.size.width, height: play.size.height))
+                    }
+                }
             }
         }
         if let n = l.now {
@@ -1086,6 +1234,18 @@ final class Card: NSView {
         let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: weight).applying(.init(paletteColors: [color]))
         return NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(cfg)
     }
+}
+
+/// A menu item that runs a closure.
+final class MenuItem: NSMenuItem {
+    let run: () -> Void
+    init(title: String, run: @escaping () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(go), keyEquivalent: "")
+        target = self
+    }
+    required init(coder: NSCoder) { fatalError() }
+    @objc func go() { run() }
 }
 
 /// One of the foot's buttons: a vibrant symbol, clicks going through to the card.
