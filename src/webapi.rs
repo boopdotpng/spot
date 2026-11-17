@@ -38,6 +38,18 @@ impl Api {
                 }
                 Err(e) => return Err(format!("token refresh: {e}")),
             };
+            // a login from before spot asked for more (saving songs, editing playlists): ask
+            // again, once; if that's declined, keep going with what was granted
+            let n = if SCOPES.iter().any(|s| !n.scopes.iter().any(|g| g == s)) && t.failed_login.is_none() {
+                log::warn!("the Web API login lacks scopes {:?} has; logging in again", n.scopes);
+                let _ = self.tx.send(Msg::Relogin(true));
+                let r = browser_login(self.oauth.clone(), &self.redirect).await;
+                let _ = self.tx.send(Msg::Relogin(false));
+                t.failed_login = r.is_err().then(Instant::now);
+                r.unwrap_or(n)
+            } else {
+                n
+            };
             if !n.refresh_token.is_empty() && n.refresh_token != t.refresh {
                 t.refresh = n.refresh_token;
                 save_refresh(&self.path, &t.refresh);
@@ -49,23 +61,41 @@ impl Api {
     }
 
     pub async fn get(&self, url: &str) -> Result<Value, String> {
+        self.send(reqwest::Method::GET, url, None).await
+    }
+
+    /// A request with an optional JSON body; its JSON reply (null when it has none).
+    pub async fn send(&self, method: reqwest::Method, url: &str, body: Option<&Value>) -> Result<Value, String> {
         let mut force = false;
         let mut last = 0;
         for _ in 0..4 {
             let tok = self.token(force).await?;
-            let r = self
-                .http
-                .get(url)
-                .bearer_auth(tok)
-                .send()
-                .await
-                .map_err(|e| format!("network: {e}"))?;
+            let mut req = self.http.request(method.clone(), url).bearer_auth(tok);
+            req = match body {
+                Some(b) => req.header("content-type", "application/json").body(b.to_string()),
+                // Spotify wants a length on a PUT or DELETE even when there's nothing in it
+                None if method != reqwest::Method::GET => req.header("content-length", "0"),
+                None => req,
+            };
+            let r = req.send().await.map_err(|e| format!("network: {e}"))?;
             let status = r.status().as_u16();
             last = status;
             match status {
                 200..=299 => {
                     let body = r.text().await.map_err(|e| e.to_string())?;
+                    if body.trim().is_empty() {
+                        return Ok(Value::Null);
+                    }
                     return serde_json::from_str(&body).map_err(|e| e.to_string());
+                }
+                403 if method != reqwest::Method::GET => {
+                    let body = r.text().await.unwrap_or_default();
+                    log::warn!("HTTP 403 on {method} {url}: {body}");
+                    return Err(if body.contains("scope") {
+                        "Spotify didn't grant spot permission to change your library; `spot quit`, then `spot` to log in again".into()
+                    } else {
+                        format!("Spotify refused (HTTP 403): {}", body.chars().take(120).collect::<String>())
+                    });
                 }
                 401 => force = true,
                 429 => {
@@ -149,7 +179,7 @@ pub fn parse_episode(v: &Value, show: Option<(&str, u128)>) -> Option<Track> {
 }
 
 pub fn liked() -> Playlist {
-    Playlist { id: None, name: "Liked Songs".into(), image: None, rank: 0 } // the sidebar puts a heart in its gutter
+    Playlist { id: None, name: "Liked Songs".into(), image: None, rank: 0, mine: true } // the sidebar puts a heart in its gutter
 }
 
 /// The smallest of a list of images that's still sharp in the sidebar (Spotify lists them
@@ -173,9 +203,15 @@ async fn each_item(api: &Api, url: String, mut each: impl FnMut(&Value)) -> Resu
 
 pub async fn load_playlists(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
     let mut out = vec![liked()];
+    // whose each playlist is, so only theirs (and collaborative ones) are offered to add songs to
+    let me = match api.get(&format!("{API}/me")).await {
+        Ok(v) => v["id"].as_str().map(String::from),
+        Err(e) => return drop(tx.send(Msg::Error(format!("playlists: {e}")))),
+    };
     let r = each_item(&api, format!("{API}/me/playlists?limit=50"), |p| {
         let Some(id) = p["id"].as_str() else { return };
-        out.push(Playlist { id: Some(id.into()), name: p["name"].as_str().unwrap_or("?").into(), image: smallest_image(&p["images"]), rank: out.len() });
+        let mine = p["collaborative"].as_bool() == Some(true) || me.is_none() || p["owner"]["id"].as_str() == me.as_deref();
+        out.push(Playlist { id: Some(id.into()), name: p["name"].as_str().unwrap_or("?").into(), image: smallest_image(&p["images"]), rank: out.len(), mine });
     });
     match r.await {
         Ok(()) => {
@@ -329,4 +365,38 @@ mod tests {
         assert_eq!(top_pick("x", [Some("Artist"), None, None]), Some(0));
         assert_eq!(top_pick("x", [None, None, None]), None);
     }
+}
+
+/// Save songs to Liked Songs, or (`on` false) take them out, 40 at a time.
+pub async fn set_liked(api: &Api, uris: &[String], on: bool) -> Result<(), String> {
+    let method = if on { reqwest::Method::PUT } else { reqwest::Method::DELETE };
+    for chunk in uris.chunks(40) {
+        api.send(method.clone(), &format!("{API}/me/library?uris={}", chunk.join(",")), None).await?;
+    }
+    Ok(())
+}
+
+/// Which of `uris` are in Liked Songs, in order.
+pub async fn liked_contains(api: &Api, uris: &[String]) -> Result<Vec<bool>, String> {
+    let mut out = vec![];
+    for chunk in uris.chunks(40) {
+        let v = api.get(&format!("{API}/me/library/contains?uris={}", chunk.join(","))).await?;
+        let got = v.as_array().ok_or("Spotify's answer wasn't a list")?;
+        out.extend(got.iter().map(|b| b.as_bool().unwrap_or(false)));
+    }
+    Ok(out)
+}
+
+/// Add songs to the end of a playlist, or (`on` false) take every copy of them out of it.
+pub async fn set_in_playlist(api: &Api, id: &str, uris: &[String], on: bool) -> Result<(), String> {
+    let url = format!("{API}/playlists/{id}/items");
+    for chunk in uris.chunks(100) {
+        if on {
+            api.send(reqwest::Method::POST, &url, Some(&serde_json::json!({ "uris": chunk }))).await?;
+        } else {
+            let items: Vec<Value> = chunk.iter().map(|u| serde_json::json!({ "uri": u })).collect();
+            api.send(reqwest::Method::DELETE, &url, Some(&serde_json::json!({ "items": items }))).await?;
+        }
+    }
+    Ok(())
 }

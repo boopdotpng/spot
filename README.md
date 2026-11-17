@@ -20,7 +20,10 @@ minutes. To update, `git pull` and run `install.sh` again: it restarts a running
 new build, still playing.
 
 The launcher is a Spotlight-style bar on Liquid Glass: ⌥Space from any app, type, ⏎ plays (⌘⏎
-queues, → opens an album, playlist or artist, ⌘C copies a link, esc closes). With the mouse, a
+queues, → opens an album, playlist or artist, ⌘L likes the highlighted song (or the playing one)
+or unlikes it, ⌘P turns the bar to your playlists to add it to (✓ where it already is; ⏎ adds,
+or takes it out of a ✓ one, and esc goes back), ⌘C copies a link, esc closes). Liked songs
+carry a small heart, and the bar at the bottom has one for the playing song. With the mouse, a
 song plays on a click (⌘-click queues), an album, playlist or artist opens, a row's cover plays it
 whole, and a right click has the rest; two fingers to the right or the mouse's back button go
 back. It starts at login;
@@ -85,6 +88,8 @@ light or dark following the terminal.
 | `+` / `-` | volume |
 | `o` | jump to the list that's playing |
 | `e` | add the highlighted song to the queue (queued songs play before the list carries on) |
+| `L` | like the highlighted song (or the playing one, from the sidebar), or unlike it if it's liked |
+| `t` | add the highlighted song (or the playing one) to Liked Songs and your playlists: a picker of every list you can add to, ✓ where it already is. Type to filter, `tab` marks several, `enter` adds to the marked ones (or the one under the cursor; on a ✓ row it takes the song out), `esc` closes |
 | `Q` | up next: the queue, then the rest of the list. `enter` plays a song from it now, `x` removes a queued one |
 | `S` | playlists: sort by date added (newest first, oldest first, as listed); remembered |
 | `m` | switch the sidebar between playlists and podcasts |

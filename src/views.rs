@@ -121,7 +121,7 @@ impl App {
     }
 
     /// The list with view key `key` as last seen: the playing queue's copy, else the disk cache's.
-    fn cached_list(&self, key: &str) -> Arc<Vec<Track>> {
+    pub fn cached_list(&self, key: &str) -> Arc<Vec<Track>> {
         match &self.queue {
             Some(q) if q.key == key => q.tracks.clone(),
             _ => Arc::new(read_tracks(&tracks_path(&list_key(key)))),

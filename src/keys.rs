@@ -38,6 +38,9 @@ impl App {
         if ctrl && k == Key::Char('c') {
             return self.detach_terminal_saying(DETACHED);
         }
+        if self.picker.is_some() {
+            return self.on_picker_key(Press { key: k, ctrl });
+        }
         if let Some(mut text) = self.find.clone() {
             match k {
                 Key::Char('n') if ctrl => self.move_sel(1),
@@ -264,6 +267,8 @@ impl App {
             Key::Char('e') => self.enqueue_selected(),
             Key::Char('Q') => self.open_queue(),
             Key::Char('x') => self.dequeue_selected(),
+            Key::Char('L') => self.toggle_like(),
+            Key::Char('t') => self.open_picker(),
             Key::Enter => self.enter(),
             Key::Down | Key::Char('j') => self.move_sel(1),
             Key::Up | Key::Char('k') => self.move_sel(-1),

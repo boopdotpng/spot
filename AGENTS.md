@@ -61,6 +61,7 @@ Each file starts with a comment saying what it holds.
 - `src/nowplaying.rs`: macOS Now Playing and the media keys, straight to MediaPlayer on objc2.
 - `src/lists.rs`, `src/metadata.rs`, `src/webapi.rs`: fetching from Spotify (its internal metadata
   API for list contents, the Web API for the library and search).
+- `src/save.rs`: liking songs and adding them to playlists (`L`, the `t` picker, `spot add` / `spot remove`).
 - `src/cache.rs`: everything on disk under `~/.cache/spot`.
 - `src/ctl.rs`, `src/cli.rs`: the command line (`spot play`, `spot queue`, …) over a Unix socket.
 - `src/settings.rs`: `~/.config/spot/config.toml`, documented in `docs/config.md`.

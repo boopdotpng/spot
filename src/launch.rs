@@ -1,9 +1,11 @@
 // What the ⌥Space launcher (mac/Launcher.swift) asks the player, over the same socket as the
-// command line: `spot launcher status | lists | search <words> | songs <uri> | song <uri> | play <uri> | queue <uri>`. Every answer is
+// command line: `spot launcher status | lists | search <words> | songs <uri> | song <uri> | play <uri> | queue <uri> | has <uri>`. Every answer is
 // tab-separated rows, for a program rather than a person, so it isn't in `spot help`.
 //
 // A result row: uri, name, subtitle, cover url, ms (0 for what isn't a song), explicit (1 or
-// empty), section, inside an album the song's track number, and an album's year.
+// empty), section, inside an album the song's track number, an album's year, liked (1 or empty:
+// the song's in Liked Songs), and on `lists`, for their playlists, editable (1: songs can be
+// added to it).
 
 use crate::{ctl::{Reply, Then}, *};
 
@@ -22,6 +24,17 @@ fn cover(v: &Value) -> String {
     let images = v["images"].as_array().map_or(&[][..], Vec::as_slice);
     let near = images.iter().min_by_key(|i| i["width"].as_u64().unwrap_or(0).abs_diff(300));
     near.and_then(|i| i["url"].as_str()).unwrap_or("").into()
+}
+
+/// Rows filled out to the liked field (the tenth), which is set for a liked song.
+fn mark_liked(rows: Vec<String>, liked: &HashSet<String>) -> Vec<String> {
+    rows.into_iter()
+        .map(|r| {
+            let (n, uri) = (r.split('\t').count(), r.split('\t').next().unwrap_or(""));
+            let on = if liked.contains(uri) { "1" } else { "" };
+            format!("{r}{}{on}", "\t".repeat(10usize.saturating_sub(n).max(1)))
+        })
+        .collect()
 }
 
 fn link_row(l: &Link, section: &str) -> String {
@@ -43,11 +56,11 @@ fn release_row(l: &Link, section: &str) -> String {
 
 impl App {
     pub fn launcher_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
-        let usage = || (2, "launcher: status, lists, search <words>, songs <uri>, song <uri>, play <uri> or queue <uri>".to_string());
+        let usage = || (2, "launcher: status, lists, search <words>, songs <uri>, song <uri>, play <uri>, queue <uri> or has <uri>".to_string());
         let (sub, rest) = args.split_first().ok_or_else(usage)?;
         match sub.as_str() {
             // playing (1 or empty), name, artists, uri, cover url, position ms, length ms,
-            // shuffle (1 or empty), repeat (off, all, one); nothing playing is no line
+            // shuffle (1 or empty), repeat (off, all, one), liked (1 or empty); nothing playing is no line
             "status" => {
                 let on = |b: bool| if b { "1" } else { "" };
                 let repeat = match self.repeat {
@@ -57,7 +70,7 @@ impl App {
                 };
                 let row = |t: &Track| {
                     let pos = self.position().min(t.ms).to_string();
-                    tsv_row(&[on(self.want_play), &t.name, &t.artists, &t.uri, t.cover.as_deref().unwrap_or(""), &pos, &t.ms.to_string(), on(self.shuffle), repeat])
+                    tsv_row(&[on(self.want_play), &t.name, &t.artists, &t.uri, t.cover.as_deref().unwrap_or(""), &pos, &t.ms.to_string(), on(self.shuffle), repeat, on(self.liked.contains(&t.uri))])
                 };
                 Ok(Some(self.now().map(row).unwrap_or_default()))
             }
@@ -70,22 +83,24 @@ impl App {
                     let sub = l.sub.split_once(" · ").map_or(l.sub.as_str(), |(_, by)| by);
                     link_row(&Link { sub: sub.into(), ..l.clone() }, "Recent songs")
                 });
-                let recent = lists.chain(songs);
+                let recent = mark_liked(lists.chain(songs).collect(), &self.liked);
                 let mine = self.playlists.iter().map(|p| {
                     let l = Link { uri: p.uri(), name: p.name.clone(), sub: "Playlist".into(), single: false, image: p.image.clone() };
-                    link_row(&l, "Your playlists")
+                    // ⌘P lists those songs can be added to
+                    let row = mark_liked(vec![link_row(&l, "Your playlists")], &self.liked).remove(0);
+                    format!("{row}\t{}", if p.mine { "1" } else { "" })
                 });
-                Ok(Some(recent.chain(mine).collect::<Vec<_>>().join("\n")))
+                Ok(Some(recent.into_iter().chain(mine).collect::<Vec<_>>().join("\n")))
             }
             "search" => {
                 if rest.is_empty() {
                     return Err(usage());
                 }
-                let (api, q, reply) = (self.api.clone(), rest.join(" "), reply.clone());
+                let (api, q, reply, liked) = (self.api.clone(), rest.join(" "), reply.clone(), self.liked.clone());
                 self.rt.spawn(async move {
                     let _ = reply.send(match search_all(&api, &q, 5).await {
                         Err(e) => (1, e),
-                        Ok(v) => (0, mixed_rows(&q, &v).join("\n")),
+                        Ok(v) => (0, mark_liked(mixed_rows(&q, &v), &liked).join("\n")),
                     });
                 });
                 Ok(None)
@@ -105,6 +120,30 @@ impl App {
                 let mut uris: Vec<String> = self.upnext.iter().map(|t| t.uri.clone()).collect();
                 uris.extend(rest.iter().cloned());
                 self.queue_cmd(uris, reply).map(|r| r.map(|_| String::new()))
+            }
+            // ⌘P's ✓ marks: which of Liked Songs and their playlists have the song, as Spotify
+            // says (all asked at once), a uri a line (`liked` for Liked Songs)
+            "has" => {
+                let [uri] = &rest[..] else { return Err(usage()) };
+                let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
+                let asks: Vec<_> = self
+                    .dests()
+                    .into_iter()
+                    .map(|d| {
+                        let (api, sess, uri) = (api.clone(), sess.clone(), uri.clone());
+                        self.rt.spawn(async move { has_song(&api, sess, &d, &uri).await.unwrap_or(false).then_some(d) })
+                    })
+                    .collect();
+                self.rt.spawn(async move {
+                    let mut out = vec![];
+                    for a in asks {
+                        if let Ok(Some(d)) = a.await {
+                            out.push(d.id.map_or_else(|| "liked".to_string(), |id| format!("spotify:playlist:{id}")));
+                        }
+                    }
+                    let _ = reply.send((0, out.join("\n")));
+                });
+                Ok(None)
             }
             "songs" => {
                 let Some(uri) = rest.first().cloned() else { return Err(usage()) };
@@ -171,7 +210,7 @@ impl App {
     /// An album or playlist's songs, for → in the launcher; an artist's page: their popular
     /// songs, then their albums and singles (each opens with → again).
     fn songs(&mut self, uri: String, reply: &Reply) {
-        let (api, sess, reply) = (self.api.clone(), self.sess.subscribe(), reply.clone());
+        let (api, sess, reply, liked) = (self.api.clone(), self.sess.subscribe(), reply.clone(), self.liked.clone());
         self.rt.spawn(async move {
             let song = |t: &Track, sub: &str, section: &str, n: &str| {
                 tsv_row(&[&t.uri, &t.name, sub, t.cover.as_deref().unwrap_or(""), &t.ms.to_string(), if t.explicit { "1" } else { "" }, section, n])
@@ -189,7 +228,7 @@ impl App {
                         let top = i.top.iter().take(ARTIST_TOP).map(|t| song(t, &t.album, "Popular", ""));
                         let albums = i.releases.iter().filter(|l| !l.single).map(|l| release_row(l, "Albums"));
                         let singles = i.releases.iter().filter(|l| l.single).map(|l| release_row(l, "Singles"));
-                        (0, top.chain(albums).chain(singles).collect::<Vec<_>>().join("\n"))
+                        (0, mark_liked(top.chain(albums).chain(singles).collect(), &liked).join("\n"))
                     }
                 });
                 return;
@@ -199,7 +238,7 @@ impl App {
                 Err(e) => (1, e),
                 Ok((_, t)) => {
                     let row = |t: &Track| song(t, &t.artists, "", &if album && t.number > 0 { t.number.to_string() } else { String::new() });
-                    (0, t.iter().map(row).collect::<Vec<_>>().join("\n"))
+                    (0, mark_liked(t.iter().map(row).collect(), &liked).join("\n"))
                 }
             });
         });
@@ -281,4 +320,19 @@ fn mixed_rows(q: &str, v: &Value) -> Vec<String> {
     rows.extend(albums.iter().take(1).filter_map(|i| album_row(i, "Albums", false)));
     rows.extend(artists.iter().take(1).filter_map(|i| artist_row(i, "Artists")));
     rows
+}
+
+#[cfg(test)]
+mod liked_tests {
+    use super::*;
+
+    #[test]
+    fn liked_is_the_tenth_field() {
+        let liked: HashSet<String> = ["spotify:track:a".to_string()].into();
+        let rows = mark_liked(vec![tsv_row(&["spotify:track:a", "n", "s", "", "1", "", "Songs"]), tsv_row(&["spotify:album:b", "n", "s", "", "0", "", "Albums", "", "2004"])], &liked);
+        assert_eq!(rows[0].split('\t').collect::<Vec<_>>().len(), 10);
+        assert_eq!(rows[0].split('\t').nth(9), Some("1"));
+        assert_eq!(rows[1].split('\t').nth(8), Some("2004"));
+        assert_eq!(rows[1].split('\t').nth(9), Some(""));
+    }
 }

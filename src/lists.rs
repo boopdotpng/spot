@@ -580,3 +580,30 @@ mod tests {
         assert!(merge_newest(&episodes(&[9, 8]), &[], 2).is_none());
     }
 }
+
+/// A view id no view has, for lists fetched in the background with nothing open to show them.
+pub const NO_VIEW: u64 = u64::MAX;
+
+/// What's in a playlist as Spotify has it now, by uri: one lookup, none of the songs' metadata.
+pub async fn playlist_uris(sess: Sess, id: &str) -> Result<HashSet<String>, String> {
+    use librespot_metadata::Metadata;
+    let session = ready(sess).await?;
+    let uri = SpotifyUri::from_uri(&format!("spotify:playlist:{id}")).map_err(|e| e.to_string())?;
+    let pl = librespot_metadata::Playlist::get(&session, &uri).await.map_err(|e| format!("playlist: {e}"))?;
+    Ok(pl.contents.items.iter().filter_map(|it| it.id.to_uri().ok()).collect())
+}
+
+/// Liked Songs, refreshed in the background at startup, so the hearts beside liked songs are
+/// current without opening it.
+pub async fn refresh_liked(api: Arc<Api>, tx: mpsc::Sender<Msg>) {
+    let path = tracks_path(&list_key("liked"));
+    let cached = read_tracks(&path);
+    match liked_tracks(api, &cached, &tx, NO_VIEW).await {
+        Ok(Some(tracks)) => {
+            save_tracks(&path, &tracks);
+            let _ = tx.send(Msg::LikedSongs(Arc::new(tracks)));
+        }
+        Ok(None) => {}
+        Err(e) => log::warn!("liked songs: {e}"),
+    }
+}

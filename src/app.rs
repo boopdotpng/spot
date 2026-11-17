@@ -203,6 +203,8 @@ pub struct App {
     pub fade_gen: Arc<std::sync::atomic::AtomicU64>, // bumps cancel an in-flight fade
     pub vol_until: Option<Instant>, // volume meter shows until then, after a change
     pub help: bool,                 // key help at the bottom
+    pub liked: Arc<HashSet<String>>, // the songs in Liked Songs (as last fetched), for their hearts (shared with the launcher's lookups)
+    pub picker: Option<Picker>,     // `t`: which of Liked Songs and their playlists a song goes in
     pub lastfm: Option<Arc<LastFm>>,
     pub listen: Option<Listen>, // current play, for scrobbling (only with lastfm)
     pub plays: u64,             // bumped per song started, so `spot watch` can tell plays apart
@@ -242,6 +244,9 @@ impl App {
                 self.sh_state.select(Some(self.sh_state.selected().unwrap_or(0).min(n.saturating_sub(1))));
             }
             Msg::Replace { view, tracks } => {
+                if self.view_mut(view).is_some_and(|v| v.key == "liked") {
+                    self.liked = Arc::new(tracks.iter().map(|t| t.uri.clone()).collect());
+                }
                 // keep the cursor on the same song (unless it's at the top, where new likes land)
                 let keep = (view == self.view.id && self.find.is_none())
                     .then(|| self.selected_track().filter(|&i| i > 0).and_then(|i| self.view.tracks.get(i)).map(|t| t.uri.clone()))
@@ -421,6 +426,14 @@ impl App {
             Msg::Loaded(reply, then, list) => self.on_loaded(reply, then, list),
             Msg::Watch(w) => self.watch(w),
             Msg::Art(url, art) => self.on_art(url, art),
+            Msg::Saved(s) => self.on_saved(s),
+            Msg::Has { key, uri, has } => self.on_has(&key, &uri, has),
+            Msg::LikedSongs(tracks) => {
+                self.liked = Arc::new(tracks.iter().map(|t| t.uri.clone()).collect());
+                if self.view.key == "liked" {
+                    let _ = self.tx.send(Msg::Replace { view: self.view.id, tracks });
+                }
+            }
             Msg::Quit => self.quit = true,
         }
     }

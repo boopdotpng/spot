@@ -106,9 +106,11 @@ struct Hit {
     let section: String
     let number: Int  // inside an album: the song's track number
     let year: String  // an album's
+    var liked: Bool  // a song in Liked Songs
+    let editable: Bool  // one of your playlists songs can be added to
 
     /// A row of `launcher search / songs / lists`: uri, name, subtitle, cover, ms, explicit,
-    /// section, track number, year.
+    /// section, track number, year, liked, editable.
     init?(_ line: Substring) {
         let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
         guard f.count >= 7 else { return nil }
@@ -118,6 +120,8 @@ struct Hit {
         section = f[6]
         number = f.count > 7 ? Int(f[7]) ?? 0 : 0
         year = f.count > 8 ? f[8] : ""
+        liked = f.count > 9 && f[9] == "1"
+        editable = f.count > 10 && f[10] == "1"
     }
 
     /// An album, playlist or artist: → lists its songs. A song: → lists its album and artists.
@@ -125,6 +129,8 @@ struct Hit {
     /// A list of songs to play from, rather than a page of other things.
     var list: Bool { uri == "liked" || uri.hasPrefix("spotify:album:") || uri.hasPrefix("spotify:playlist:") }
     var round: Bool { uri.hasPrefix("spotify:artist:") }
+    /// A song or an episode: it can be liked (a song) or added to a playlist.
+    var song: Bool { uri.hasPrefix("spotify:track:") || uri.hasPrefix("spotify:episode:") }
 }
 
 func rows(_ text: String) -> [Hit] { text.split(separator: "\n").compactMap(Hit.init) }
@@ -135,6 +141,7 @@ struct Now {
     var pos, len: Int  // ms
     var shuffle: Bool
     var repeatMode: String
+    var liked: Bool
     let at = Date()  // when pos was true
 
     init?(_ line: String) {
@@ -145,6 +152,7 @@ struct Now {
         (pos, len) = (Int(f[5]) ?? 0, Int(f[6]) ?? 0)
         shuffle = f[7] == "1"
         repeatMode = f[8]
+        liked = f.count > 9 && f[9] == "1"
     }
 
     var ratio: CGFloat {
@@ -183,6 +191,26 @@ func medium(_ url: String) -> String {
         .replacingOccurrences(of: "ab6761610000e5eb", with: "ab67616100005174")
         .replacingOccurrences(of: "ab6761610000f178", with: "ab67616100005174")
 }
+
+/// ⌘P's mode: the song, which of your lists have it (nil until the player says), and what was
+/// on screen before, to go back to with esc.
+struct Adding {
+    let song: Hit
+    var has: Set<String>?
+    var back: [Hit]
+    let pages: [(parent: Hit, back: [Hit], picked: Int, scroll: Int)]
+    let picked, scroll: Int
+    let query: String
+}
+
+/// An action's outcome, said briefly: its words, an SF Symbol, and whether it went wrong.
+struct Toast {
+    let text, symbol: String
+    let bad: Bool
+}
+
+/// The first line of the player's answer: an error's gist.
+func firstLine(_ text: String) -> String { text.split(separator: "\n").first.map(String.init) ?? text }
 
 func mmss(_ ms: Int) -> String { String(format: "%d:%02d", ms / 60000, ms / 1000 % 60) }
 
@@ -235,12 +263,19 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     /// was opened from.
     var pages: [(parent: Hit, back: [Hit], picked: Int, scroll: Int)] = []
     var inside: (parent: Hit, back: [Hit], picked: Int, scroll: Int)? { pages.last }
-    var topH: CGFloat { inside != nil ? pageH : 0 }
+    var topH: CGFloat { header != nil ? pageH : 0 }
+    /// ⌘P: the song being added to playlists, while the bar searches your playlists instead.
+    var adding: Adding?
+    /// Atop the list: the song being added, or the album, playlist or artist that's open.
+    var header: Hit? { adding?.song ?? inside?.parent }
+    /// Why the list is empty ("no results", an error), said in its place.
     var note: String?
+    /// What an action did ("Added to bops!"), in a pill over the bottom of the list for a moment.
+    var toast: Toast?
+    var toastGen = 0
     var busy = false
     var generation = 0
     var now: Now?
-    var copied = false
     var hover: Int?
     let images = NSCache<NSString, NSImage>()
     var loading = Set<String>()
@@ -334,7 +369,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
             }
         }
         // a login item once installed (a test build elsewhere isn't)
-        if Bundle.main.bundlePath.contains("/Applications/"), SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
+        // (never registered reads as .notFound, not only .notRegistered)
+        let login = SMAppService.mainApp
+        if Bundle.main.bundlePath.contains("/Applications/"), login.status == .notRegistered || login.status == .notFound {
+            do { try login.register() } catch { NSLog("spot launcher: couldn't add the login item (status \(login.status.rawValue)): \(error)") }
+        }
         if CommandLine.arguments.contains("--show") { show() }
     }
 
@@ -346,10 +385,15 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     var dark: Bool { panel.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
 
+    /// The bar's hint: what it searches.
+    func setPlaceholder() {
+        field.placeholderAttributedString = NSAttributedString(string: adding != nil ? "Add to a playlist…" : "Songs, albums, artists, your playlists",
+            attributes: [.foregroundColor: NSColor.placeholderTextColor, .font: NSFont.systemFont(ofSize: 20)])
+    }
+
     func applyColors() {
         field.textColor = .labelColor
-        field.placeholderAttributedString = NSAttributedString(string: "Songs, albums, artists, your playlists",
-            attributes: [.foregroundColor: NSColor.placeholderTextColor, .font: NSFont.systemFont(ofSize: 20)])
+        setPlaceholder()
         (field.currentEditor() as? NSTextView)?.insertionPointColor = .labelColor
         card.needsDisplay = true
         card.updateProgress()
@@ -420,8 +464,12 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         busy = false
         picked = 0
         scroll = 0
-        copied = false
+        toast = nil
         hover = nil
+        if adding != nil {
+            adding = nil
+            setPlaceholder()
+        }
         card.spot = .none
         card.needsDisplay = true
     }
@@ -480,7 +528,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     // MARK: searching
 
-    func controlTextDidChange(_ n: Notification) { search() }
+    func controlTextDidChange(_ n: Notification) {
+        if adding != nil { filterAdding() } else { search() }
+    }
 
     /// Search as you type: waits a moment for typing to stop and drops answers to older words.
     /// Your playlist that matches shows at once; Spotify's results after.
@@ -570,7 +620,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// →: the picked album, playlist or artist's page, in place.
     func openPicked() -> Bool {
-        guard results.indices.contains(picked), results[picked].opens else { return false }
+        guard adding == nil, results.indices.contains(picked), results[picked].opens else { return false }
         let h = results[picked]
         generation += 1
         let g = generation
@@ -597,6 +647,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// ← or esc inside: back to what it was opened from.
     func goBack() -> Bool {
+        if stopAdding() { return true }
         guard let i = pages.popLast() else { return false }
         generation += 1
         (results, picked, scroll, note, busy) = (i.back, i.picked, i.scroll, nil, false)
@@ -609,6 +660,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     /// Play (or queue) the picked result, then get out of the way. Typed faster than the results
     /// came: the bar closes at once and the first result plays once it's found.
     func choose(queue: Bool) {
+        if adding != nil { return addPicked() }
         let local = results.indices.contains(picked) && results[picked].section == "Your playlists"
         if inside == nil && ((busy && !local) || results.isEmpty) {
             let q = query
@@ -629,8 +681,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
             if code == 0 {
                 self.hide()
             } else {
-                self.note = text.split(separator: "\n").first.map(String.init)
-                self.card.needsDisplay = true
+                self.say(firstLine(text), "exclamationmark.triangle.fill", bad: true)
             }
         }
     }
@@ -641,12 +692,157 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         guard let link = uri.flatMap(shareLink) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
-        copied = true
+        say("Link copied", "link")
+    }
+
+    /// Show a toast; it goes by itself (an error stays a little longer). Two redraws, no animation.
+    func say(_ text: String, _ symbol: String, bad: Bool = false) {
+        toastGen += 1
+        let g = toastGen
+        toast = Toast(text: text, symbol: symbol, bad: bad)
         card.needsDisplay = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            self.copied = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + (bad ? 3 : 1.6)) {
+            guard self.toastGen == g else { return }
+            self.toast = nil
             self.card.needsDisplay = true
         }
+    }
+
+    // MARK: liking, and adding to playlists
+
+    /// The song ⌘L and ⌘P act on: the picked row if it's a song, else what's playing (`playing`:
+    /// what's playing regardless, for the foot's heart). Its uri, name and whether it's liked.
+    func target(playing: Bool = false) -> (uri: String, name: String, liked: Bool, cover: String)? {
+        if !playing, results.indices.contains(picked), results[picked].song {
+            let h = results[picked]
+            return (h.uri, h.name, h.liked, h.cover)
+        }
+        return now.map { ($0.uri, $0.name, $0.liked, $0.cover) }
+    }
+
+    /// Every copy of the song on screen (and what's playing) shown liked or not.
+    func markLiked(_ uri: String, _ on: Bool) {
+        for i in results.indices where results[i].uri == uri { results[i].liked = on }
+        for i in adding?.back.indices ?? 0..<0 where adding!.back[i].uri == uri { adding!.back[i].liked = on }
+        if now?.uri == uri { now?.liked = on }
+        card.needsDisplay = true
+        card.syncButtons()
+    }
+
+    /// ⌘L, or the foot's heart: like the song, or unlike it. Shown at once; put back if Spotify
+    /// says no.
+    func toggleLike(playing: Bool = false) {
+        // adding to playlists: Liked Songs is one of the rows
+        if !playing, adding != nil {
+            if let r = results.firstIndex(where: { $0.uri == "liked" }) {
+                pick(r)
+                addPicked()
+            }
+            return
+        }
+        guard let t = target(playing: playing) else { return }
+        guard t.uri.hasPrefix("spotify:track:") else { return say("Episodes can't be liked", "heart.slash", bad: true) }
+        let on = !t.liked
+        markLiked(t.uri, on)
+        if now?.uri == t.uri { card.pulse("like") }
+        ask([on ? "add" : "remove", "liked", t.uri]) { code, text in
+            if code == 0 {
+                self.say(on ? "Added to Liked Songs" : "Removed from Liked Songs", on ? "heart.fill" : "heart.slash")
+            } else {
+                self.markLiked(t.uri, !on)
+                self.say(firstLine(text), "exclamationmark.triangle.fill", bad: true)
+            }
+        }
+    }
+
+    /// Put the song in one of your playlists; one that has it already isn't given it twice.
+    func add(_ uri: String, to p: Hit) {
+        ask(["add", p.uri, uri]) { code, text in
+            if code != 0 {
+                self.say(firstLine(text), "exclamationmark.triangle.fill", bad: true)
+            } else if text.hasPrefix("was in") {
+                self.say("Already in \(p.name)", "checkmark.circle")
+            } else {
+                self.say("Added to \(p.name)", "text.badge.plus")
+            }
+        }
+    }
+
+    /// ⌘P (or Add to Playlist): the bar turns to your playlists for the song, each ✓ once the
+    /// player has said which have it. ⌘P again, or esc, goes back.
+    func startAdding() {
+        if stopAdding() { return }
+        guard let t = target() else { return }
+        let line = [t.uri, t.name, t.uri.hasPrefix("spotify:episode:") ? "Add to a playlist" : "Add to Liked Songs or a playlist", t.cover, "0", "", ""].joined(separator: "\t")
+        guard var song = Hit(Substring(line)) else { return }
+        song.liked = t.liked
+        generation += 1  // searches and pages on their way are moot
+        adding = Adding(song: song, has: nil, back: results, pages: pages, picked: picked, scroll: scroll, query: field.stringValue)
+        (pages, busy, note) = ([], false, nil)
+        field.stringValue = ""
+        setPlaceholder()
+        filterAdding()
+        ask(["launcher", "has", t.uri]) { code, text in
+            guard self.adding?.song.uri == t.uri else { return }
+            self.adding?.has = code == 0 ? Set(text.split(separator: "\n").map(String.init)) : []
+            self.card.needsDisplay = true
+        }
+    }
+
+    /// Back from adding to what was on screen; false if it wasn't adding.
+    func stopAdding() -> Bool {
+        guard let a = adding else { return false }
+        adding = nil
+        generation += 1
+        field.stringValue = a.query
+        setPlaceholder()
+        (results, pages, picked, scroll, note, busy) = (a.back, a.pages, a.picked, a.scroll, nil, false)
+        card.needsDisplay = true
+        return true
+    }
+
+    /// The lists the song can go in that the words name, best first (Liked Songs first when
+    /// nothing's typed; not for an episode).
+    func filterAdding() {
+        guard let a = adding else { return }
+        let q = query
+        let lists = playlists.filter { $0.editable && ($0.uri != "liked" || !a.song.uri.hasPrefix("spotify:episode:")) }
+        results = q.isEmpty ? lists : lists.map { (matchScore(q, $0.name), $0) }.filter { $0.0 > 0 }.sorted { $0.0 > $1.0 }.map(\.1)
+        (picked, scroll) = (0, 0)
+        note = results.isEmpty ? "no playlist matches" : nil
+        card.needsDisplay = true
+    }
+
+    /// ⏎ while adding: the song into the picked list, or out of it if it's there (✓). Shown at
+    /// once, put back if Spotify says no; it stays open for the next.
+    func addPicked() {
+        guard let a = adding, results.indices.contains(picked) else { return }
+        let p = results[picked], uri = a.song.uri
+        let had = a.has?.contains(p.uri) ?? false
+        let liked = p.uri == "liked"
+        setHas(p.uri, !had)
+        if liked { markLiked(uri, !had) }
+        ask([had ? "remove" : "add", p.uri, uri]) { code, text in
+            if code != 0 {
+                self.setHas(p.uri, had)
+                if liked { self.markLiked(uri, had) }
+                self.say(firstLine(text), "exclamationmark.triangle.fill", bad: true)
+            } else if !had && text.hasPrefix("was in") {
+                self.say("Already in \(p.name)", "checkmark.circle")
+            } else if had {
+                self.say("Removed from \(p.name)", liked ? "heart.slash" : "minus.circle")
+            } else {
+                self.say("Added to \(p.name)", liked ? "heart.fill" : "text.badge.plus")
+            }
+        }
+    }
+
+    func setHas(_ list: String, _ on: Bool) {
+        guard adding != nil else { return }
+        var h = adding!.has ?? []
+        if on { h.insert(list) } else { h.remove(list) }
+        adding!.has = h
+        card.needsDisplay = true
     }
 
     func toggleShuffle() {
@@ -716,6 +912,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         case kVK_RightArrow where cmd && !m.contains(.shift): skip(1)
         case kVK_RightArrow where caretAtEnd && !m.contains(.shift): return openPicked()
         case kVK_LeftArrow where inside != nil: return goBack()
+        case kVK_ANSI_L where cmd: toggleLike()
+        case kVK_ANSI_P where cmd: startAdding()
         case kVK_ANSI_S where ctrl: toggleShuffle()
         case kVK_ANSI_R where ctrl: cycleRepeat()
         case kVK_ANSI_C where cmd && (editor?.selectedRange.length ?? 0) == 0: copyLink()
@@ -814,6 +1012,7 @@ final class Card: NSView {
             case "repeat": (n.repeatMode == "one" ? "repeat.1" : "repeat", n.repeatMode != "off")
             case "next": ("forward.fill", true)
             case "prev": ("backward.fill", true)
+            case "like": (n.liked ? "heart.fill" : "heart", n.liked)
             default: (n.playing ? "pause.fill" : "play.fill", true)
             }
             g.contentTintColor = lit ? .labelColor : .secondaryLabelColor
@@ -859,7 +1058,7 @@ final class Card: NSView {
     var footRect: NSRect { NSRect(x: 0, y: bounds.height - footH, width: bounds.width, height: footH) }
     var buttons: [(NSRect, String)] {
         let f = footRect
-        return ["repeat", "next", "play", "prev", "shuffle"].enumerated().map { i, k in (NSRect(x: f.maxX - 20 - 30 * CGFloat(i + 1) - 4 * CGFloat(i), y: f.midY - 15, width: 30, height: 30), k) }
+        return ["repeat", "next", "play", "prev", "shuffle", "like"].enumerated().map { i, k in (NSRect(x: f.maxX - 20 - 30 * CGFloat(i + 1) - 4 * CGFloat(i), y: f.midY - 15, width: 30, height: 30), k) }
     }
 
     /// Where each row on screen is drawn.
@@ -884,12 +1083,13 @@ final class Card: NSView {
     func spot(at p: NSPoint) -> Spot {
         guard let l = launcher else { return .none }
         if let (i, _, r) = rowRects().first(where: { NSMouseInRect(p, $0.2, true) }) {
+            if l.adding != nil { return .row(i) }  // a whole row adds to that list
             let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
             if !numbered && NSMouseInRect(p, thumbRect(r).insetBy(dx: -6, dy: -4), true) { return .cover(i) }
             if l.results[i].opens && NSMouseInRect(p, chevronRect(r), true) { return .open(i) }
             return .row(i)
         }
-        if l.inside != nil && p.y >= listTop && p.y < listTop + l.topH { return .back }
+        if l.header != nil && p.y >= listTop && p.y < listTop + l.topH { return .back }
         return .none
     }
 
@@ -945,6 +1145,9 @@ final class Card: NSView {
             launcher.pick(i)
             _ = launcher.openPicked()
             trackMouse(p)
+        case .row(let i) where launcher.adding != nil:
+            launcher.pick(i)
+            launcher.addPicked()
         case .row(let i):
             launcher.pick(i)
             let h = launcher.results[i]
@@ -964,6 +1167,7 @@ final class Card: NSView {
                 case "repeat": launcher.cycleRepeat()
                 case "next": launcher.skip(1)
                 case "prev": launcher.skip(-1)
+                case "like": launcher.toggleLike(playing: true)
                 default: launcher.togglePlay()
                 }
             } else {
@@ -979,7 +1183,7 @@ final class Card: NSView {
 
     /// A right click on a row: everything that can be done with it.
     override func menu(for e: NSEvent) -> NSMenu? {
-        guard let i = hoverRow(spot(at: convert(e.locationInWindow, from: nil))) else { return nil }
+        guard launcher.adding == nil, let i = hoverRow(spot(at: convert(e.locationInWindow, from: nil))) else { return nil }
         let l = launcher!
         l.pick(i)
         let h = l.results[i]
@@ -993,6 +1197,13 @@ final class Card: NSView {
         }
         add("Play", "play.fill", "\r") { l.choose(queue: false) }
         add("Add to Queue", "text.line.last.and.arrowtriangle.forward", "\r", .command) { l.choose(queue: true) }
+        if h.song {
+            m.addItem(.separator())
+            if h.uri.hasPrefix("spotify:track:") {
+                add(h.liked ? "Remove from Liked Songs" : "Add to Liked Songs", h.liked ? "heart.slash" : "heart", "l", .command) { l.toggleLike() }
+            }
+            add("Add to Playlist…", "text.badge.plus", "p", .command) { l.startAdding() }
+        }
         if h.opens {
             add(h.uri.hasPrefix("spotify:track:") ? "Album and Artists" : "Open", "chevron.right", String(UnicodeScalar(NSRightArrowFunctionKey)!)) {
                 _ = l.openPicked()
@@ -1044,14 +1255,14 @@ final class Card: NSView {
             mag.draw(in: NSRect(x: 22, y: (barH - mag.size.height) / 2, width: mag.size.width, height: mag.size.height))
         }
 
-        let listed = !l.results.isEmpty || l.inside != nil || l.busy
+        let listed = !l.results.isEmpty || l.header != nil || l.busy
         if listed {
             NSColor.separatorColor.setFill()
             NSRect(x: 20, y: barH, width: bounds.width - 40, height: 1).fill()
         }
         let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
-        if let page = l.inside {
-            drawPage(page.parent, text: text)
+        if let page = l.header {
+            drawPage(page, text: text)
         }
         for (i, titled, r) in rowRects() {
             let h = l.results[i]
@@ -1068,9 +1279,28 @@ final class Card: NSView {
                 draw(h.number > 0 ? "\(h.number)" : "", at: t.offsetBy(dx: 0, dy: 6), size: 12, weight: .medium, color: .tertiaryLabelColor, align: .center, mono: true)
             }
             var right = r.maxX - 12
-            if (on || i == l.hover) && h.opens {
+            if let a = l.adding {
+                // adding: ✓ where the song is, and on the picked row what ⏎ does
+                let has = a.has?.contains(h.uri) ?? false
+                if has, let tick = symbol("checkmark", 12, .bold, .controlAccentColor) {
+                    tick.draw(in: NSRect(x: right - 14 + (14 - tick.size.width) / 2, y: r.midY - tick.size.height / 2, width: tick.size.width, height: tick.size.height))
+                }
+                right -= 22
+                if on || i == l.hover {
+                    draw(has ? "⏎ Remove" : "⏎ Add", at: NSRect(x: right - 70, y: r.midY - 8, width: 70, height: 16), size: 11.5, weight: .medium, color: .tertiaryLabelColor, align: .right)
+                    right -= 78
+                }
+            } else if (on || i == l.hover) && h.opens {
                 draw("›", at: NSRect(x: right - 10, y: r.midY - 11, width: 10, height: 20), size: 17, weight: .medium, color: spot == .open(i) ? text : .tertiaryLabelColor)
                 right -= 18
+            }
+            if h.song {
+                // a liked song's heart, small and gray like the chevron, in a slot every song row keeps so
+                // the lengths line up
+                if h.liked, let heart = symbol("heart.fill", 10, .semibold, .secondaryLabelColor) {
+                    heart.draw(in: NSRect(x: right - 12 + (12 - heart.size.width) / 2, y: r.midY - heart.size.height / 2, width: heart.size.width, height: heart.size.height))
+                }
+                right -= 20
             }
             if h.ms > 0 {
                 draw(mmss(h.ms), at: NSRect(x: right - 44, y: r.midY - 8, width: 44, height: 16), size: 12, weight: .regular, color: .tertiaryLabelColor, align: .right, mono: true)
@@ -1102,8 +1332,23 @@ final class Card: NSView {
             }
         }
         if let n = l.note {
-            let y = listed ? (rowRects().last.map { $0.2.maxY + 8 } ?? listTop + l.topH + 8) : barH + 14
-            draw(n, at: NSRect(x: 24, y: y, width: bounds.width - 48, height: 18), size: 13, weight: .medium, color: .secondaryLabelColor)
+            if let last = rowRects().last {
+                // rows and a note (a search that failed past your matching playlist): under them
+                draw(n, at: NSRect(x: 24, y: last.2.maxY + 8, width: bounds.width - 48, height: 18), size: 13, weight: .medium, color: .secondaryLabelColor, align: .center)
+            } else {
+                // the empty list's middle: a symbol, and why
+                let top = listTop + l.topH, mid = top + (footRect.minY - top) / 2
+                let name = switch n {
+                case "no results": "magnifyingglass"
+                case "no songs", "no playlist matches": "music.note.list"
+                case "starting spot…": "play.circle"
+                default: "exclamationmark.triangle"
+                }
+                if let img = symbol(name, 26, .regular, .tertiaryLabelColor) {
+                    img.draw(in: NSRect(x: (bounds.width - img.size.width) / 2, y: mid - 26 - img.size.height / 2, width: img.size.width, height: img.size.height))
+                }
+                draw(n.prefix(1).uppercased() + n.dropFirst(), at: NSRect(x: 40, y: mid, width: bounds.width - 80, height: 36), size: 13, weight: .medium, color: .secondaryLabelColor, align: .center)
+            }
         }
         drawFoot(text: text)
     }
@@ -1141,12 +1386,9 @@ final class Card: NSView {
         f.fill()
         NSColor.separatorColor.setFill()
         NSRect(x: 0, y: f.minY, width: f.width, height: 1).fill()
-        let right = buttons.last!.0.minX - 8 - (l.copied ? 80 : 0)
+        let right = buttons.last!.0.minX - 8
         draw(n.name, at: NSRect(x: 60, y: f.minY + 9, width: right - 60, height: 17), size: 13, weight: .semibold, color: text)
         draw(n.artists, at: NSRect(x: 60, y: f.minY + 26, width: right - 60, height: 15), size: 11.5, weight: .regular, color: .secondaryLabelColor)
-        if l.copied {
-            draw("link copied", at: NSRect(x: right + 4, y: f.midY - 7, width: 76, height: 15), size: 11, weight: .medium, color: text)
-        }
         // shuffle and repeat, when on, sit on a soft pill (the way Music marks them); the
         // symbols themselves are Glyphs (syncButtons)
         for (r, k) in buttons where (k == "shuffle" && n.shuffle) || (k == "repeat" && n.repeatMode != "off") {
@@ -1159,7 +1401,7 @@ final class Card: NSView {
     func drawArt() {
         guard let l = launcher else { return }
         let numbered = l.inside?.parent.uri.hasPrefix("spotify:album:") ?? false
-        if let p = l.inside?.parent {
+        if let p = l.header {
             drawThumb(l.image(p.cover, size: pageArt), in: pageArtRect, round: p.round, liked: p.uri == "liked")
         }
         for (i, _, r) in rowRects() {
@@ -1172,7 +1414,7 @@ final class Card: NSView {
                 let t = thumbRect(r)
                 drawThumb(l.image(h.cover), in: t, round: h.round, liked: h.uri == "liked")
                 // hovered: its cover plays it (an album, playlist or artist whole)
-                if i == l.hover {
+                if i == l.hover && l.adding == nil {
                     let rad = h.round ? t.width / 2 : 6
                     NSColor.black.withAlphaComponent(spot == .cover(i) ? 0.55 : 0.35).setFill()
                     NSBezierPath(roundedRect: t, xRadius: rad, yRadius: rad).fill()
@@ -1182,10 +1424,38 @@ final class Card: NSView {
                 }
             }
         }
+        if let t = l.toast { drawToast(t) }
         if let n = l.now {
             let f = footRect
             drawThumb(l.image(n.cover), in: NSRect(x: 20, y: f.midY - thumb / 2, width: thumb, height: thumb), round: false, liked: false)
         }
+    }
+
+    /// A toast: a pill centered just above the foot, over whatever row is there, solid so it
+    /// reads over it.
+    func drawToast(_ t: Toast) {
+        let font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        let words = (t.text as NSString).size(withAttributes: [.font: font]).width
+        let w = min(ceil(words) + 52, bounds.width - 60), h: CGFloat = 32
+        let r = NSRect(x: (bounds.width - w) / 2, y: footRect.minY - h - 10, width: w, height: h)
+        let pill = NSBezierPath(roundedRect: r, xRadius: h / 2, yRadius: h / 2)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.18)
+        shadow.shadowBlurRadius = 10
+        shadow.shadowOffset = NSSize(width: 0, height: -2)
+        shadow.set()
+        NSColor.windowBackgroundColor.setFill()
+        pill.fill()
+        NSGraphicsContext.restoreGraphicsState()
+        NSColor.separatorColor.setStroke()
+        pill.lineWidth = 0.5
+        pill.stroke()
+        let tint: NSColor = t.bad ? .systemRed : t.symbol.hasPrefix("heart.fill") ? .systemPink : .controlAccentColor
+        if let img = symbol(t.symbol, 12, .semibold, tint) {
+            img.draw(in: NSRect(x: r.minX + 14, y: r.midY - img.size.height / 2, width: img.size.width, height: img.size.height))
+        }
+        draw(t.text, at: NSRect(x: r.minX + 34, y: r.midY - 8, width: w - 46, height: 17), size: 12.5, weight: .medium, color: .labelColor)
     }
 
     func drawThumb(_ img: NSImage?, in r: NSRect, round: Bool, liked: Bool) {

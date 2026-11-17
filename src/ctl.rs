@@ -35,6 +35,8 @@ pub enum Then {
     Play { from: Option<String>, shuffle: bool },
     /// `queue`: the new queue, None where the next fetched uri's songs go
     Queue(Vec<Option<Track>>),
+    /// `add` / `remove`: put the songs in these (`on`), or take them out
+    Save { dests: Vec<Dest>, on: bool },
 }
 
 /// What a request named, fetched: each uri's songs, and the last one's uri and name.
@@ -258,6 +260,7 @@ impl App {
                 return Ok(None);
             }
             "queue" => return self.queue_cmd(args, reply),
+            "add" | "remove" => return self.save_cmd(cmd == "add", args, reply),
             "set" => self.set_cmd(&args)?,
             "next" | "prev" if self.now().is_none() && self.upnext.is_empty() => return Err(nothing()),
             "next" => self.skip_soon(1),
@@ -338,6 +341,59 @@ impl App {
         self.queue_changed();
         if !self.upnext.is_empty() && (self.cur.is_none() || self.finished) {
             self.skip(1);
+        }
+    }
+
+    /// `add|remove <where>... [<uri>...]`: songs (the playing one if none are named) into or out
+    /// of Liked Songs and their playlists.
+    fn save_cmd(&mut self, on: bool, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
+        let verb = if on { "add" } else { "remove" };
+        let (mut dests, mut songs) = (vec![], vec![]);
+        for a in args.iter().filter(|a| !a.trim().is_empty()) {
+            let u = link_uri(a.trim());
+            match u.strip_prefix("spotify:").and_then(|r| r.split(':').next()) {
+                Some("track" | "episode" | "album" | "artist") => songs.push(u),
+                _ => dests.push(self.dest(a)?),
+            }
+        }
+        if dests.is_empty() {
+            return Err(usage(&format!("{verb}: where? `liked`, or one of your playlists by name or uri")));
+        }
+        if songs.is_empty() {
+            let Some(t) = self.now().cloned() else { return Err(fail("nothing's playing: name the songs by uri")) };
+            self.save(vec![t], dests, on, Some(reply.clone()));
+        } else {
+            self.load(songs, Then::Save { dests, on }, reply.clone());
+        }
+        Ok(None)
+    }
+
+    /// Liked Songs, or the playlist of theirs `a` names: by uri, by name, else by part of a name
+    /// that only one has (any case).
+    fn dest(&self, a: &str) -> Result<Dest, Fail> {
+        let (u, lower) = (link_uri(a.trim()), a.trim().to_lowercase());
+        if lower == "liked" || lower == "liked songs" || (u.starts_with("spotify:") && u.ends_with(":collection")) {
+            return Ok(Dest::of(&liked()));
+        }
+        let pls: Vec<&Playlist> = self.playlists.iter().filter(|p| p.id.is_some()).collect();
+        let pick = |p: &Playlist| match p.mine {
+            true => Ok(Dest::of(p)),
+            false => Err(fail(format!("{} isn't yours, so songs can't be added to it", p.name))),
+        };
+        if let Some(p) = pls.iter().find(|p| p.uri() == u) {
+            return pick(p);
+        }
+        if u.starts_with("spotify:") {
+            return Err(fail(format!("{u} isn't one of your playlists (`spot library` lists them)")));
+        }
+        if let Some(p) = pls.iter().find(|p| p.name.to_lowercase() == lower) {
+            return pick(p);
+        }
+        let near: Vec<&&Playlist> = pls.iter().filter(|p| p.mine && p.name.to_lowercase().contains(&lower)).collect();
+        match &near[..] {
+            [p] => pick(p),
+            [] => Err(fail(format!("no playlist of yours is called '{}' (`spot library` lists them)", a.trim()))),
+            more => Err(fail(format!("'{}' could be {}", a.trim(), and_list(&more.iter().map(|p| p.name.as_str()).collect::<Vec<_>>())))),
         }
     }
 
@@ -453,6 +509,8 @@ impl App {
                 }
             }
             Then::Queue(plan) => self.set_queue(plan, parts),
+            // answered once Spotify has them
+            Then::Save { dests, on } => return self.save(parts.concat(), dests, on, Some(reply)),
         }
         let _ = reply.send((0, self.status_text(SHOWN)));
     }

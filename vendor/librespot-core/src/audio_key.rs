@@ -45,6 +45,8 @@ component! {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
         pending: HashMap<u32, oneshot::Sender<Result<AudioKey, [u8; 2]>>> = HashMap::new(),
         given_up: HashMap<FileId, Instant> = HashMap::new(),
+        next_waiter: u64 = 0,
+        waiting: Vec<u64> = Vec::new(),
     }
 }
 
@@ -53,11 +55,26 @@ component! {
 // cached on disk, and a refused or timed-out request is retried for up to KEY_RETRY_FOR instead of
 // failing the track. Other codes (0 1: never allowed) fail right away. After giving up on a file,
 // asking again within KEY_GIVEN_UP_FOR fails at once: the player asks twice per failed load.
+// A request retrying a refusal stops once a newer one is refused too: the newer one is for the
+// track skipped to, and the next key Spotify hands out should go to it, not one skipped past.
 const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 const KEY_RETRY_FOR: Duration = Duration::from_secs(40);
 const KEY_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const KEY_GIVEN_UP_FOR: Duration = Duration::from_secs(10);
 const KEY_ERROR_TRANSIENT: [u8; 2] = [0, 2];
+
+/// spot patch: a request retrying refusals, in `waiting` until it's dropped.
+struct Waiter<'a> {
+    keys: &'a AudioKeyManager,
+    id: u64,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.keys.lock(|inner| inner.waiting.retain(|&w| w != id));
+    }
+}
 
 impl AudioKeyManager {
     pub(crate) fn dispatch(&self, cmd: PacketType, mut data: Bytes) -> Result<(), Error> {
@@ -101,6 +118,7 @@ impl AudioKeyManager {
         }
         let start = Instant::now();
         let mut delay = Duration::from_millis(250);
+        let mut waiter: Option<Waiter> = None;
         loop {
             let err = match self.request_once(track, file).await? {
                 Ok(key) => {
@@ -115,6 +133,26 @@ impl AudioKeyManager {
                 }
                 Err(code) => code,
             };
+            let id = waiter.get_or_insert_with(|| {
+                let id = self.lock(|inner| {
+                    let id = inner.next_waiter;
+                    inner.next_waiter += 1;
+                    inner.waiting.push(id);
+                    id
+                });
+                Waiter { keys: self, id }
+            }).id;
+            // given up, as below: the player's second request for this file mustn't count as newer
+            if self.lock(|inner| {
+                let newer = inner.waiting.iter().any(|&w| w > id);
+                if newer {
+                    inner.given_up.insert(file, Instant::now());
+                }
+                newer
+            }) {
+                warn!("error audio key, giving way to a newer request");
+                return Err(AudioKeyError::AesKey.into());
+            }
             if start.elapsed() + delay > KEY_RETRY_FOR {
                 self.lock(|inner| inner.given_up.insert(file, Instant::now()));
                 return Err(match err {

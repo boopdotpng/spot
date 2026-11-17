@@ -8,7 +8,7 @@ use std::{
 
 use crate::*;
 
-pub const COMMANDS: &[&str] = &["start", "quit", "status", "library", "search", "play", "queue", "set", "next", "prev", "watch"];
+pub const COMMANDS: &[&str] = &["start", "quit", "status", "library", "search", "play", "queue", "add", "remove", "set", "next", "prev", "watch"];
 
 pub const USAGE: &str = "\
 spot: a small Spotify player. `spot` alone opens the TUI, starting the player in the background
@@ -35,6 +35,13 @@ status, search and library print them (open.spotify.com links work too).
                              dropped); it plays before the list carries on. An album or playlist
                              adds all its songs. A first song that has started playing since you
                              read the queue is left out. `spot queue clear` empties it
+  spot add <where>... [<uri>...]
+                             save songs to Liked Songs and your playlists: where is `liked`, or a
+                             playlist's name (or enough of it) or uri; the songs are track, episode,
+                             album or artist uris, else the one playing. A playlist that has a
+                             song already doesn't get it twice. `spot add liked 'bops!'`
+  spot remove <where>... [<uri>...]
+                             the same, taking them out (every copy, from a playlist)
   spot set paused=yes volume=40 shuffle=on repeat=all seek=1:30
                              any of them, at once; volume and seek take +10 / -10 too,
                              repeat is off, all or one
@@ -43,7 +50,7 @@ status, search and library print them (open.spotify.com links work too).
                              modes, skip (a media key skipped or seeked), end (nothing left to
                              play), ending (30s before a song ends, with what's next)
 
-Whatever changes something prints the status after.";
+Whatever changes playback prints the status after; add and remove say what they did.";
 
 /// True once no player holds the lock: after a quit, the old one may still be finishing up
 /// (sending a scrobble) for a moment after its socket is gone.

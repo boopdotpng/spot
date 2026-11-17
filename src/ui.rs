@@ -57,6 +57,8 @@ pub fn help_lines(width: usize, th: &Theme) -> Vec<Line<'static>> {
         ("e", "add to queue"),
         ("Q", "up next"),
         ("x", "queue: remove song"),
+        ("L", "like / unlike song"),
+        ("t", "add song to playlists…"),
         ("a  A", "album / artist"),
         ("v", "artist: overview/songs/albums"),
         ("f", "releases: all/albums/singles"),
@@ -114,7 +116,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let dim = Style::new().fg(th.dim);
     let body = f.area();
     if body.width < MINI_W || body.height < MINI_H {
-        return draw_mini(f, app);
+        draw_mini(f, app);
+        if let Some(p) = &app.picker {
+            draw_picker(f, body, p, th);
+        }
+        return;
     }
 
     // A terminal-app frame: two panes split by a thin rule, the player under a rule across the
@@ -290,6 +296,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             ),
             (false, _) => (vec![Constraint::Length(num_w), Constraint::Fill(3), Constraint::Fill(2)], &["", "name", "details"]),
         };
+        // a narrow last column with a heart for each liked song (not in Liked Songs itself, nor
+        // a list of episodes)
+        let heart_col = tracks && !episodes && app.view.key != "liked";
+        let mut cols = cols;
+        let labels: Vec<&str> = labels.iter().copied().chain(heart_col.then_some("")).collect();
+        if heart_col {
+            // two cells for a one-cell heart: fonts draw ♥ wider than a cell, and the overhang
+            // has to land inside the row's highlight
+            cols.push(Constraint::Length(2));
+        }
+        let heart = liked_heart(th);
         const GAP: u16 = 2;
         // the selection bar takes the first cell
         let cols_area = Rect { x: table_area.x + 1, width: table_area.width.saturating_sub(1), ..table_area };
@@ -330,6 +347,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 cells.push(if by_added { cell(&added(t.added, today), 3, album) } else { cell(&t.album, 3, album) });
             }
             cells.push(Cell::from(Line::from(time_text).right_aligned()).style(time));
+            if heart_col {
+                cells.push(Cell::from(if app.liked.contains(&t.uri) { Span::styled("♥", heart) } else { Span::raw("") }));
+            }
             Row::new(cells)
         };
         let disc_style = Style::new().fg(th.accent2).bold();
@@ -418,10 +438,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     let avail = (now.width as usize).saturating_sub(5 + width(&top_right));
     let top_left = match cur {
-        Some(t) => vec![
-            Span::styled(format!("{} ", mark(app.playing)), Style::new().fg(th.accent).bold()),
-            Span::styled(fit(&t.name, avail), Style::new().fg(th.text).bold()),
-        ],
+        Some(t) => {
+            let liked = app.liked.contains(&t.uri);
+            let mut v = vec![
+                Span::styled(format!("{} ", mark(app.playing)), Style::new().fg(th.accent).bold()),
+                Span::styled(fit(&t.name, avail.saturating_sub(2 * usize::from(liked))), Style::new().fg(th.text).bold()),
+            ];
+            if liked {
+                v.push(Span::styled(" ♥", liked_heart(th)));
+            }
+            v
+        }
         None => vec![Span::styled(fit("nothing playing", avail + 3), dim)],
     };
     f.render_widget(Paragraph::new(Line::from(top_left)), now);
@@ -445,6 +472,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     spans.extend(meter(track_w, ratio, cur.is_some(), th));
     spans.push(rt);
     f.render_widget(Paragraph::new(Line::from(spans)), bar);
+
+    if let Some(p) = &app.picker {
+        draw_picker(f, Rect { y: top.y, height: top.height + rule.height + player.height, ..right }, p, th);
+    }
 
     // bottom: on a faint tint of the terminal background (needs truecolor), when it has something to say
     let quiet = !app.help && app.input.is_none() && app.find.is_none() && app.status.is_empty() && app.note.is_none();
@@ -507,6 +538,90 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     f.render_widget(Paragraph::new(Line::from(left_side)), bottom);
     f.render_widget(Paragraph::new(Line::from(right_side).right_aligned()), bottom);
+}
+
+/// A liked song's heart: Liked Songs' pink, faded part way into the background (or into the
+/// theme's dim, when the terminal doesn't say what its background is).
+fn liked_heart(th: &Theme) -> Style {
+    match (bg_hex().or_else(|| rgb_hex(th.dim)), rgb_hex(th.pink)) {
+        (Some(bg), Some(pink)) => Style::new().fg(hex_rgb(mix(bg, pink, 0.55))),
+        _ => Style::new().fg(th.pink),
+    }
+}
+
+/// The `t` picker, a box in `area`: the song, the filter, then Liked Songs and their playlists,
+/// each marked ✓ if the song's in it, and + or − where tab marked it to be added or taken out.
+fn draw_picker(f: &mut Frame, area: ratatui::layout::Rect, p: &Picker, th: &Theme) {
+    use ratatui::{layout::Rect, widgets::{BorderType, Borders, Clear}};
+    let shown = p.shown();
+    let w = area.width.saturating_sub(4).min(56);
+    let h = (shown.len().max(1) as u16 + 7).min(area.height.saturating_sub(2));
+    if w < 24 || h < 8 {
+        return;
+    }
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let dim = Style::new().fg(th.dim);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(dim)
+        .title(Span::styled(" add to ", Style::new().fg(th.accent).bold()));
+    let inner = block.inner(r);
+    f.render_widget(Clear, r);
+    f.render_widget(block, r);
+    let iw = inner.width as usize;
+    // the song is the one under the cursor (or playing), so it isn't named again: just the
+    // filter, set off by a blank line each side, then the rows
+    let mut lines = vec![Line::raw(""), Line::from(prompt("  /", th.accent, &p.filter, iw.saturating_sub(2), th)), Line::raw("")];
+    // the rows, scrolled to keep the cursor in view, then a blank line and the keys
+    let room = (inner.height as usize).saturating_sub(lines.len() + 2);
+    let first = p.sel.saturating_sub(room.saturating_sub(1));
+    for (n, &i) in shown.iter().enumerate().skip(first).take(room) {
+        let row = &p.rows[i];
+        let on = n == p.sel;
+        let (mark, ms) = match (row.has, row.marked) {
+            (true, false) => ("✓", Style::new().fg(th.accent)),
+            (false, true) => ("+", Style::new().fg(th.gold).bold()),
+            (true, true) => ("−", Style::new().fg(th.err).bold()),
+            (false, false) => (" ", dim),
+        };
+        let heart = row.dest.id.is_none();
+        let name_style = if heart { Style::new().fg(th.pink) } else { Style::new().fg(th.text) };
+        // the heart gets a cell of its own and room after it: fonts draw ♥ wider than a cell
+        let name = fit(&row.dest.name, iw.saturating_sub(10));
+        let pad = iw.saturating_sub(6 + Span::raw(&name).width() + 3); // the bar and heart, the name, the mark
+        let mut spans = vec![
+            Span::styled(if on { "┃" } else { " " }, Style::new().fg(th.accent)),
+            Span::styled(if heart { "  ♥  " } else { "     " }, name_style),
+            Span::styled(name, if on { name_style.bold() } else { name_style }),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(mark, ms),
+            Span::raw("  "),
+        ];
+        if on {
+            let bg = match (bg_hex(), rgb_hex(th.hl)) {
+                (Some(s), Some(h)) => hex_rgb(mix(s, h, 0.75)),
+                _ => th.hl,
+            };
+            spans = spans.into_iter().map(|s| { let st = s.style.bg(bg); s.style(st) }).collect();
+        }
+        lines.push(Line::from(spans));
+    }
+    if shown.is_empty() {
+        lines.push(Line::from(Span::styled("      no playlist matches", dim)));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+    // what enter will do
+    let marked = p.rows.iter().filter(|r| r.marked).count();
+    let enter = match (marked, shown.get(p.sel).map(|&i| &p.rows[i])) {
+        (0, Some(r)) if r.has => "⏎ remove",
+        (0, Some(_)) => "⏎ add",
+        (0, None) => "",
+        _ => "⏎ apply",
+    };
+    let hint = format!(" tab mark · {enter} · esc  ");
+    let foot = Rect { y: inner.y + inner.height.saturating_sub(1), height: 1, ..inner };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, dim)).right_aligned()), foot);
 }
 
 /// Below either of these the full layout gives way to the mini player: what's playing, and search.

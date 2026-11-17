@@ -277,7 +277,9 @@ pub fn read_playlists() -> Vec<Playlist> {
         let mut f = l.split('\t');
         let (id, name) = (f.next()?, f.next()?);
         let image = f.next().filter(|u| !u.is_empty()).map(String::from);
-        Some(Playlist { id: Some(id.into()), name: name.into(), image, rank: rank + 1 })
+        // cached before this was kept: taken as theirs until the list is fetched again
+        let mine = f.next() != Some("0");
+        Some(Playlist { id: Some(id.into()), name: name.into(), image, rank: rank + 1, mine })
     });
     let mut all: Vec<Playlist> = std::iter::once(liked()).chain(saved).collect();
     pin_order(&mut all, &read_pinned());
@@ -308,7 +310,7 @@ pub fn save_playlists(pls: &[Playlist]) {
     let mut s = String::new();
     for p in pls {
         if let Some(id) = &p.id {
-            let _ = writeln!(s, "{id}\t{}\t{}", clean(&p.name), p.image.as_deref().unwrap_or(""));
+            let _ = writeln!(s, "{id}\t{}\t{}\t{}", clean(&p.name), p.image.as_deref().unwrap_or(""), u8::from(p.mine));
         }
     }
     write_atomic(&cache_dir().join("playlists"), &s);

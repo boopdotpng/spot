@@ -48,6 +48,7 @@ mod metadata;
 mod model;
 mod nowplaying;
 mod playback;
+mod save;
 mod settings;
 mod terminal;
 mod theme;
@@ -66,6 +67,7 @@ use metadata::*;
 use model::*;
 use nowplaying::*;
 use theme::*;
+use save::*;
 use ui::*;
 use webapi::*;
 
@@ -79,6 +81,9 @@ const SCOPES: &[&str] = &[
     "playlist-read-private",
     "playlist-read-collaborative",
     "user-library-read",
+    "user-library-modify",
+    "playlist-modify-public",
+    "playlist-modify-private",
 ];
 const SESSION_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 const SESSION_REDIRECT: &str = "http://127.0.0.1:8898/login";
@@ -385,6 +390,7 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         rt.spawn(start_session(session, cache.clone(), tx.clone()));
     }
     rt.spawn(load_playlists(api.clone(), tx.clone()));
+    rt.spawn(refresh_liked(api.clone(), tx.clone()));
     rt.spawn(load_shows(api.clone(), tx.clone()));
 
     let theme = fs::read_to_string(dir.join("theme")).unwrap_or_default();
@@ -479,6 +485,8 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         fade_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         vol_until: None,
         help: false,
+        liked: Arc::new(read_tracks(&tracks_path(&list_key("liked"))).into_iter().map(|t| t.uri).collect()),
+        picker: None,
         lastfm,
         listen: None,
         plays: 0,

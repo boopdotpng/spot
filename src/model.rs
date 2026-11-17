@@ -221,6 +221,7 @@ pub struct Playlist {
     pub name: String,
     pub image: Option<String>, // its cover, the smallest Spotify has
     pub rank: usize,           // where Spotify lists it, to go back to when it's unpinned
+    pub mine: bool,            // songs can be added to it: theirs, or collaborative
 }
 
 impl Playlist {
@@ -275,6 +276,9 @@ pub enum Msg {
     Loaded(ctl::Reply, ctl::Then, ctl::List), // what a `spot play` / `spot queue` named, fetched
     Watch(ctl::Watcher),
     Art(String, Option<ratatui_image::protocol::Protocol>), // a cover's url, and it drawn for the terminal
+    Saved(Saved), // songs went into (or out of) Liked Songs and playlists
+    Has { key: String, uri: String, has: bool }, // whether a list (`liked`, a playlist id) has a song, as Spotify says
+    LikedSongs(Arc<Vec<Track>>), // Liked Songs, refreshed in the background
     Quit, // SIGTERM / SIGINT, or `spot quit`
 }
 
