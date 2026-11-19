@@ -412,7 +412,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         pad.width -= w + 1;
     }
     let [now, sub, bar] = Layout::vertical([Constraint::Length(1); 3]).areas(pad);
-    let gold = Style::new().fg(th.gold).bold();
     let sep_span = || Span::styled("  ·  ", dim);
     let cur = app.now();
     // where it's playing from
@@ -489,14 +488,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // status line: prompt (search / find) > error > notice > what's next; position and volume at the right
     let bw = bottom.width as usize;
     let (left_side, right_side): (Vec<Span>, Vec<Span>) = if let Some(buf) = &app.input {
-        let mut right = vec![];
-        for k in [None, Some(Kind::Tracks), Some(Kind::Albums), Some(Kind::Artists), Some(Kind::Shows)] {
-            if !right.is_empty() {
-                right.push(Span::styled(" · ", dim));
-            }
-            right.push(Span::styled(search_label(k), if k == app.search_kind { gold } else { dim }));
-        }
-        right.push(Span::styled(if bw >= 100 { " ⇧tab   ⏎ play · tab browse " } else { " ⇧tab " }, dim));
+        let right = if bw >= 60 { vec![Span::styled("⏎ play · tab browse ", dim)] } else { vec![] };
         (prompt(" /", th.accent, buf, bw.saturating_sub(width(&right) + 2), th), right)
     } else if let Some(buf) = &app.find {
         let right = vec![Span::styled(format!("{} of {} ", num(total), num(app.view.len())), dim)];
@@ -701,14 +693,7 @@ fn draw_mini(f: &mut Frame, app: &mut App) {
     // the bottom line: the search prompt, an error or notice, or what's next
     let bottom = line(area.height.saturating_sub(1));
     let spans = if let Some(buf) = &app.input {
-        let kind = Span::styled(format!(" {}", search_label(app.search_kind)), dim);
-        let mut v = prompt("/", th.accent, buf, w.saturating_sub(kind.width()), th);
-        let used: usize = v.iter().map(|s| s.width()).sum();
-        if used + kind.width() <= w {
-            v.push(Span::raw(" ".repeat(w - used - kind.width())));
-            v.push(kind);
-        }
-        v
+        prompt("/", th.accent, buf, w, th)
     } else if let Some(buf) = &app.find {
         prompt("find", th.gold, buf, w, th)
     } else if !app.status.is_empty() {
@@ -723,7 +708,7 @@ fn draw_mini(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(Line::from(spans)), bottom);
 }
 
-/// A kind-only search's results in the mini player: name · whose, the cursor's highlighted.
+/// A list in the mini player while a search is typed: name · whose, the cursor's highlighted.
 fn draw_mini_list(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let th = theme();
     let dim = Style::new().fg(th.dim);

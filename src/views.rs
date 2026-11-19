@@ -5,8 +5,8 @@ use crate::*;
 /// How long typing has to stop for before searching.
 const SEARCH_SETTLE: Duration = Duration::from_millis(140);
 
-fn search_key(kind: Option<Kind>, q: &str) -> String {
-    format!("search:{}:{q}", search_label(kind))
+fn search_key(q: &str) -> String {
+    format!("search:all:{q}")
 }
 
 /// Songs a search of everything lists under its top result.
@@ -218,19 +218,11 @@ impl App {
 
     /// Search for what's in the prompt, unless those are already the results on show.
     pub fn run_search(&mut self) {
-        let Some(q) = self.input.as_deref().map(str::trim).map(String::from) else {
-            // a chip on a search's results: the same words, for something else, in its place
-            if let Some(q) = self.view.search_query().map(String::from)
-                && self.view.key != search_key(self.search_kind, &q)
-            {
-                self.open_search(q, false);
-            }
-            return;
-        };
+        let Some(q) = self.input.as_deref().map(str::trim).map(String::from) else { return };
         if q.is_empty() {
             return self.end_live_search();
         }
-        if !(self.live_search && self.view.key == search_key(self.search_kind, &q)) {
+        if !(self.live_search && self.view.key == search_key(&q)) {
             self.open_search(q, !self.live_search);
             self.live_search = true;
         }
@@ -257,38 +249,17 @@ impl App {
         if let Some(task) = self.search_task.take() {
             task.abort();
         }
-        let Some(kind) = self.search_kind else {
-            let mut v = self.new_view(search_key(None, &q), format!("Search: {q}"), Kind::Tracks);
-            v.info = Some(Arc::default());
-            let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
-            let task = self.rt.spawn(async move {
-                match search_all(&api, &q, 10).await {
-                    Ok(v) => {
-                        let _ = tx.send(Msg::Found { view, found: Box::new(found(&q, &v)) });
-                    }
-                    Err(error) => {
-                        let _ = tx.send(Msg::Failed { view, error });
-                    }
-                }
-            });
-            self.search_task = Some(task.abort_handle());
-            self.show(v, back);
-            self.focus = Focus::Tracks;
-            return;
-        };
-        let title = format!("Search {}: {q}", kind.label());
-        let v = self.new_view(search_key(Some(kind), &q), title, kind);
+        let mut v = self.new_view(search_key(&q), format!("Search: {q}"), Kind::Tracks);
+        v.info = Some(Arc::default());
         let (api, tx, view) = (self.api.clone(), self.tx.clone(), v.id);
         let task = self.rt.spawn(async move {
-            let res = search(&api, &q, kind.ty(), 50, |items, done| {
-                let _ = tx.send(match kind {
-                    Kind::Tracks => Msg::Tracks { view, tracks: items.iter().filter_map(parse_track).collect(), done },
-                    _ => Msg::Links { view, links: items.iter().filter_map(|i| parse_link(kind.ty(), i)).collect(), done },
-                });
-            })
-            .await;
-            if let Err(error) = res {
-                let _ = tx.send(Msg::Failed { view, error });
+            match search_all(&api, &q, 10).await {
+                Ok(v) => {
+                    let _ = tx.send(Msg::Found { view, found: Box::new(found(&q, &v)) });
+                }
+                Err(error) => {
+                    let _ = tx.send(Msg::Failed { view, error });
+                }
             }
         });
         self.search_task = Some(task.abort_handle());

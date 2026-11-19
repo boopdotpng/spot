@@ -178,7 +178,6 @@ pub struct App {
     pub find: Option<String>, // ctrl+f filter over the open track list
     pub matches: Vec<usize>,  // view indices matching `find`, kept current by refilter()
     pub sort: Sort,           // playlists' order: as listed, or by date added (remembered)
-    pub search_kind: Option<Kind>, // what to search for; None: everything
     pub shuffle: bool,
     pub repeat: Repeat,
     pub fails: usize, // consecutive unplayable tracks, so repeat-all can't spin forever

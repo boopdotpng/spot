@@ -76,7 +76,7 @@ light or dark following the terminal.
 
 | key | action |
 |---|---|
-| `/` | search as you type (`enter` plays the top result, or whichever one the cursor's on: a song, or an album from its first; an artist is opened. `tab` goes into the results without playing, `↑`/`↓` move while typing, `shift+tab` cycles all / songs / albums / artists / podcasts, `esc` goes back) |
+| `/` | search as you type (`enter` plays the top result, or whichever one the cursor's on: a song, or an album from its first; an artist is opened. `tab` goes into the results without playing, `↑`/`↓` move while typing, `esc` goes back) |
 | `enter` | play song (the rest of the list plays after it) · open album / artist / card |
 | `ctrl+f` | filter the open list; `enter` plays the match but keeps the whole list playing, `esc` closes |
 | `space` | pause / resume (with a short volume fade); right after launch, resumes what was playing at quit |
@@ -185,8 +185,7 @@ Audio quality, the song cache's size, loudness normalization and your own colors
   and related artists as cards, as many to a line as the terminal fits. `P` there shuffles every
   song they have. `v` goes on to every song (albums + singles/EPs, newest first, duplicate
   single/album versions removed: find, sort and play from here) and to the discography.
-- **Search** (`/`) of everything shows the top result, songs, artists and albums on one page;
-  `shift+tab` narrows it to one kind, listed in full.
+- **Search** (`/`) shows the top result, songs, artists and albums on one page.
 - **Quality**: 320 kbps Ogg Vorbis by default (`quality` in [config.toml](docs/config.md)), the highest librespot can stream. Spotify's lossless (FLAC)
   isn't exposed to third-party/Connect players, so librespot can't select it.
 - Audio: librespot (no Spotify app needed).

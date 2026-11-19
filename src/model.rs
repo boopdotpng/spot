@@ -184,11 +184,6 @@ impl Kind {
     }
 }
 
-/// What a search is for, as its chip says it: everything, or songs, albums, ….
-pub fn search_label(kind: Option<Kind>) -> &'static str {
-    kind.map_or("all", Kind::label)
-}
-
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum Repeat {
     #[default]

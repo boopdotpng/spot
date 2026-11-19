@@ -460,7 +460,6 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         find: None,
         matches: vec![],
         sort: Sort::from_name(&fs::read_to_string(cache_dir().join("sort")).unwrap_or_default()),
-        search_kind: None,
         shuffle: false,
         repeat: Repeat::Off,
         fails: 0,

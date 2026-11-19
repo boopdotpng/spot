@@ -142,8 +142,7 @@ impl App {
     }
 
     /// The search field's keys that aren't typing: enter plays the top result, tab goes into the
-    /// results, shift+tab changes what's searched for, esc goes back to
-    /// what was open. True when it took the key.
+    /// results, esc goes back to what was open. True when it took the key.
     pub fn on_search_key(&mut self, k: Key) -> bool {
         match k {
             Key::Enter => {
@@ -176,7 +175,6 @@ impl App {
                 self.live_search = false;
                 self.focus = Focus::Tracks;
             }
-            Key::BackTab => self.cycle_search_kind(false),
             // the results' cursor: by line on a page of cards, else by row
             Key::Up if self.live_search => {
                 if self.grid_move(0, -1).is_none() {
@@ -211,13 +209,6 @@ impl App {
                 self.activate(0);
             }
         }
-    }
-
-    pub fn cycle_search_kind(&mut self, back: bool) {
-        const ORDER: [Option<Kind>; 5] = [None, Some(Kind::Tracks), Some(Kind::Albums), Some(Kind::Artists), Some(Kind::Shows)];
-        let at = ORDER.iter().position(|&k| k == self.search_kind).unwrap_or(0);
-        self.search_kind = ORDER[(at + if back { ORDER.len() - 1 } else { 1 }) % ORDER.len()];
-        self.search_at = Some(Instant::now()); // nothing being typed to wait for
     }
 
     /// A key while no prompt has the keyboard. `cmd`: a modifier was held. True when it did something.
