@@ -686,9 +686,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         }
     }
 
-    /// ⌘C: the link to the picked result, or with no results what's playing.
-    func copyLink() {
-        let uri = results.indices.contains(picked) ? results[picked].uri : now?.uri
+    /// ⌘C: the link to what's playing on the home page (empty search, recents showing),
+    /// otherwise to the picked result. A row's menu passes `row` to copy that row's link.
+    func copyLink(row: Bool = false) {
+        let home = query.isEmpty && inside == nil
+        let uri = (row || !home) && results.indices.contains(picked) ? results[picked].uri : now?.uri
         guard let link = uri.flatMap(shareLink) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(link, forType: .string)
@@ -1212,7 +1214,7 @@ final class Card: NSView {
         }
         if shareLink(h.uri) != nil {
             m.addItem(.separator())
-            add("Copy Link", "link", "c", .command) { l.copyLink() }
+            add("Copy Link", "link", "c", .command) { l.copyLink(row: true) }
         }
         return m
     }
