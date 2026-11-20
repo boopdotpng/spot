@@ -4,7 +4,8 @@
 // songs, an album and an artist. ↑↓ move, tab jumps to the next section, → opens an album or
 // playlist's songs, an artist's popular songs and discography, or a song's album and artists
 // (→ again goes on to one of those; ← or esc goes back), ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with
-// no results, to what's playing), ⌃S shuffle, ⌃R repeat, esc closes. For a keyboard without
+// no results, to what's playing), ⌘F inside a list finds among its songs (esc back to all of them),
+// ⌃S shuffle, ⌃R repeat, esc closes. For a keyboard without
 // media keys: space on an empty bar plays or pauses, ⌘← ⌘→ go to the previous or next song,
 // ⌥⌘← ⌥⌘→ seek back or ahead 10 seconds (the foot has buttons for the first two too).
 //
@@ -266,6 +267,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     var topH: CGFloat { header != nil ? pageH : 0 }
     /// ⌘P: the song being added to playlists, while the bar searches your playlists instead.
     var adding: Adding?
+    /// ⌘F inside a list: all of its rows, while the bar finds among them instead of searching.
+    var finding: [Hit]?
     /// Atop the list: the song being added, or the album, playlist or artist that's open.
     var header: Hit? { adding?.song ?? inside?.parent }
     /// Why the list is empty ("no results", an error), said in its place.
@@ -387,7 +390,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// The bar's hint: what it searches.
     func setPlaceholder() {
-        field.placeholderAttributedString = NSAttributedString(string: adding != nil ? "Add to a playlist…" : "Songs, albums, artists, your playlists",
+        let hint = adding != nil ? "Add to a playlist…" : finding != nil ? "Find in \(inside?.parent.name ?? "this list")" : "Songs, albums, artists, your playlists"
+        field.placeholderAttributedString = NSAttributedString(string: hint,
             attributes: [.foregroundColor: NSColor.placeholderTextColor, .font: NSFont.systemFont(ofSize: 20)])
     }
 
@@ -466,8 +470,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         scroll = 0
         toast = nil
         hover = nil
-        if adding != nil {
-            adding = nil
+        if adding != nil || finding != nil {
+            (adding, finding) = (nil, nil)
             setPlaceholder()
         }
         card.spot = .none
@@ -529,7 +533,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     // MARK: searching
 
     func controlTextDidChange(_ n: Notification) {
-        if adding != nil { filterAdding() } else { search() }
+        if adding != nil { filterAdding() } else if finding != nil { filterFind() } else { search() }
     }
 
     /// Search as you type: waits a moment for typing to stop and drops answers to older words.
@@ -620,7 +624,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// →: the picked album, playlist or artist's page, in place.
     func openPicked() -> Bool {
-        guard adding == nil, results.indices.contains(picked), results[picked].opens else { return false }
+        guard adding == nil, finding == nil, results.indices.contains(picked), results[picked].opens else { return false }
         let h = results[picked]
         generation += 1
         let g = generation
@@ -647,11 +651,48 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// ← or esc inside: back to what it was opened from.
     func goBack() -> Bool {
-        if stopAdding() { return true }
+        if stopAdding() || stopFinding() { return true }
         guard let i = pages.popLast() else { return false }
         generation += 1
         (results, picked, scroll, note, busy) = (i.back, i.picked, i.scroll, nil, false)
         card.needsDisplay = true
+        return true
+    }
+
+    // MARK: finding inside a list
+
+    /// ⌘F: find among the open list's songs as you type; ⌘F again stops.
+    func toggleFind() {
+        if stopFinding() { return }
+        guard adding == nil, inside != nil, !busy, !results.isEmpty else { return }
+        finding = results
+        field.stringValue = ""
+        setPlaceholder()
+        filterFind()
+    }
+
+    /// The list's rows that have every typed word in their name or subtitle (artists).
+    func filterFind() {
+        guard let all = finding else { return }
+        let words = query.lowercased().split(separator: " ")
+        results = words.isEmpty ? all : all.filter { h in
+            let hay = "\(h.name) \(h.sub)".lowercased()
+            return words.allSatisfy { hay.contains($0) }
+        }
+        (picked, scroll) = (0, 0)
+        note = results.isEmpty ? "no songs match" : nil
+        card.needsDisplay = true
+    }
+
+    /// Back from finding to the whole list, the picked song still picked; false if it wasn't finding.
+    func stopFinding() -> Bool {
+        guard let all = finding else { return false }
+        let keep = results.indices.contains(picked) ? results[picked].uri : nil
+        finding = nil
+        field.stringValue = ""
+        setPlaceholder()
+        (results, note, scroll) = (all, nil, 0)
+        pick(keep.flatMap { u in all.firstIndex { $0.uri == u } } ?? 0)
         return true
     }
 
@@ -726,6 +767,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     func markLiked(_ uri: String, _ on: Bool) {
         for i in results.indices where results[i].uri == uri { results[i].liked = on }
         for i in adding?.back.indices ?? 0..<0 where adding!.back[i].uri == uri { adding!.back[i].liked = on }
+        for i in finding?.indices ?? 0..<0 where finding![i].uri == uri { finding![i].liked = on }
         if now?.uri == uri { now?.liked = on }
         card.needsDisplay = true
         card.syncButtons()
@@ -913,9 +955,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         case kVK_LeftArrow where cmd && !m.contains(.shift): skip(-1)
         case kVK_RightArrow where cmd && !m.contains(.shift): skip(1)
         case kVK_RightArrow where caretAtEnd && !m.contains(.shift): return openPicked()
-        case kVK_LeftArrow where inside != nil: return goBack()
+        case kVK_LeftArrow where inside != nil && finding == nil: return goBack()
         case kVK_ANSI_L where cmd: toggleLike()
         case kVK_ANSI_P where cmd: startAdding()
+        case kVK_ANSI_F where cmd: toggleFind()
         case kVK_ANSI_S where ctrl: toggleShuffle()
         case kVK_ANSI_R where ctrl: cycleRepeat()
         case kVK_ANSI_C where cmd && (editor?.selectedRange.length ?? 0) == 0: copyLink()
