@@ -427,6 +427,7 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         })
     });
 
+    let (recent, recent_albums) = read_recent();
     let mut app = App {
         rt,
         api,
@@ -440,7 +441,8 @@ pub fn start(setup_only: bool) -> Result<Option<(App, mpsc::Receiver<Msg>)>, Str
         pinned: read_pinned(),
         pl_state: Sel::with(Some(0)),
         shows: podcast_home().into_iter().chain(read_links(&shows_path())).collect(),
-        recent: read_links(&recent_path()),
+        recent,
+        recent_albums,
         sh_state: Sel::with(Some(0)),
         podcasts: false,
         view: View { loading: false, ..View::new(0, String::new(), "Tracks".into(), Kind::Tracks) },

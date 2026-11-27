@@ -229,9 +229,8 @@ let thumb: CGFloat = 28
 let height: CGFloat = 492  // the window's, always: it never grows into the bottom of the screen
 let listTop = barH + 1 + 4
 let room = height - 2 * margin - barH - 12 - footH  // what the list has room for
-let recentLists = 3  // on the empty bar: lists you started,
-let recentSongs = 6  // songs you heard (more scroll),
-let fillTo = 7       // and your playlists after them, up to this many rows
+let recentRows = 12  // on the empty bar: what you played lately (more scroll),
+let fillTo = 7       // and your playlists after it, up to this many rows
 let corner: CGFloat = 24
 
 // MARK: the window
@@ -516,12 +515,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         guard code == 0 else { return }
         let all = rows(text)
         playlists = all.filter { $0.section == "Your playlists" }
-        // the lists you started and the songs you heard lately; short of a full bar, your
-        // playlists after them, so it never opens bare
-        let lists = all.filter { $0.section == "Recently played" }.prefix(recentLists)
-        let songs = all.filter { $0.section == "Recent songs" }.prefix(recentSongs)
-        recent = Array(lists) + Array(songs)
-        let more = playlists.filter { p in !lists.contains { $0.uri == p.uri } }
+        // what you played lately (lists, albums, songs); short of a full bar, your playlists
+        // after it, so it never opens bare
+        recent = Array(all.filter { $0.section == "Recent" }.prefix(recentRows))
+        let more = playlists.filter { p in !recent.contains { $0.uri == p.uri } }
         recent += more.prefix(max(0, fillTo - recent.count))
         if query.isEmpty && inside == nil {
             results = recent
@@ -753,10 +750,13 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     // MARK: liking, and adding to playlists
 
-    /// The song ⌘L and ⌘P act on: the picked row if it's a song, else what's playing (`playing`:
-    /// what's playing regardless, for the foot's heart). Its uri, name and whether it's liked.
-    func target(playing: Bool = false) -> (uri: String, name: String, liked: Bool, cover: String)? {
-        if !playing, results.indices.contains(picked), results[picked].song {
+    /// The song ⌘L and ⌘P act on: like ⌘C, what's playing on the home page (empty search,
+    /// recents showing), otherwise the picked row if it's a song, else what's playing. `row`: a
+    /// row's menu, for that row; `playing`: what's playing regardless, for the foot's heart. Its
+    /// uri, name and whether it's liked.
+    func target(row: Bool = false, playing: Bool = false) -> (uri: String, name: String, liked: Bool, cover: String)? {
+        let home = query.isEmpty && inside == nil
+        if !playing, row || !home, results.indices.contains(picked), results[picked].song {
             let h = results[picked]
             return (h.uri, h.name, h.liked, h.cover)
         }
@@ -775,7 +775,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// ⌘L, or the foot's heart: like the song, or unlike it. Shown at once; put back if Spotify
     /// says no.
-    func toggleLike(playing: Bool = false) {
+    func toggleLike(row: Bool = false, playing: Bool = false) {
         // adding to playlists: Liked Songs is one of the rows
         if !playing, adding != nil {
             if let r = results.firstIndex(where: { $0.uri == "liked" }) {
@@ -784,7 +784,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
             }
             return
         }
-        guard let t = target(playing: playing) else { return }
+        guard let t = target(row: row, playing: playing) else { return }
         guard t.uri.hasPrefix("spotify:track:") else { return say("Episodes can't be liked", "heart.slash", bad: true) }
         let on = !t.liked
         markLiked(t.uri, on)
@@ -814,9 +814,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// ⌘P (or Add to Playlist): the bar turns to your playlists for the song, each ✓ once the
     /// player has said which have it. ⌘P again, or esc, goes back.
-    func startAdding() {
+    func startAdding(row: Bool = false) {
         if stopAdding() { return }
-        guard let t = target() else { return }
+        guard let t = target(row: row) else { return }
         let line = [t.uri, t.name, t.uri.hasPrefix("spotify:episode:") ? "Add to a playlist" : "Add to Liked Songs or a playlist", t.cover, "0", "", ""].joined(separator: "\t")
         guard var song = Hit(Substring(line)) else { return }
         song.liked = t.liked
@@ -1245,9 +1245,9 @@ final class Card: NSView {
         if h.song {
             m.addItem(.separator())
             if h.uri.hasPrefix("spotify:track:") {
-                add(h.liked ? "Remove from Liked Songs" : "Add to Liked Songs", h.liked ? "heart.slash" : "heart", "l", .command) { l.toggleLike() }
+                add(h.liked ? "Remove from Liked Songs" : "Add to Liked Songs", h.liked ? "heart.slash" : "heart", "l", .command) { l.toggleLike(row: true) }
             }
-            add("Add to Playlist…", "text.badge.plus", "p", .command) { l.startAdding() }
+            add("Add to Playlist…", "text.badge.plus", "p", .command) { l.startAdding(row: true) }
         }
         if h.opens {
             add(h.uri.hasPrefix("spotify:track:") ? "Album and Artists" : "Open", "chevron.right", String(UnicodeScalar(NSRightArrowFunctionKey)!)) {

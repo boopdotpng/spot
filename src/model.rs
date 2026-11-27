@@ -244,6 +244,13 @@ pub fn song_link(t: &Track) -> Link {
     Link { uri: t.uri.clone(), name: t.name.clone(), sub: format!("{kind} · {}", t.artists), single: false, image: t.cover.clone() }
 }
 
+/// The album a song is on, as a recently played link (None for an episode, or not known).
+pub fn album_link(t: &Track) -> Option<Link> {
+    let uri = id_uri("album", t.album_id).filter(|_| !t.is_episode() && !t.album.is_empty())?;
+    let by = if t.lead > 0 { &t.artists[..t.lead] } else { t.artists.as_str() };
+    Some(Link { uri, name: t.album.clone(), sub: format!("Album · {by}"), single: false, image: t.cover.clone() })
+}
+
 pub enum Msg {
     Failed { view: u64, error: String }, // a view's contents couldn't load: shown in its place
     Key(Press),

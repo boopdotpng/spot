@@ -105,8 +105,43 @@ pub fn is_song(uri: &str) -> bool {
 }
 
 /// What was played lately, for the launcher (`spot launcher lists`).
-pub fn recent_path() -> PathBuf {
+fn recent_path() -> PathBuf {
     cache_dir().join("recent")
+}
+
+/// The recently played, newest first, and the album each song is on (by the song's uri), where
+/// known: a line is a link, then for a song its album's uri, name and artist (older files don't
+/// have them).
+pub fn read_recent() -> (Vec<Link>, HashMap<String, Link>) {
+    let s = fs::read_to_string(recent_path()).unwrap_or_default();
+    let mut albums = HashMap::new();
+    let links = s
+        .lines()
+        .filter_map(|line| {
+            let l = parse_link_line(line)?;
+            let f: Vec<&str> = line.split('\t').skip(5).collect();
+            if let [uri, name, by, ..] = f[..] {
+                let sub = format!("Album · {by}");
+                albums.insert(l.uri.clone(), Link { uri: uri.into(), name: name.into(), sub, single: false, image: l.image.clone() });
+            }
+            Some(l)
+        })
+        .collect();
+    (links, albums)
+}
+
+pub fn save_recent(links: &[Link], albums: &HashMap<String, Link>) {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for l in links {
+        let _ = write!(s, "{}", link_line(l));
+        if let Some(a) = albums.get(&l.uri) {
+            let by = a.sub.strip_prefix("Album · ").unwrap_or(&a.sub);
+            let _ = write!(s, "\t{}\t{}\t{}", a.uri, clean(&a.name), clean(by));
+        }
+        s.push('\n');
+    }
+    write_atomic(&recent_path(), &s);
 }
 
 /// Where each episode was left (ms, or HEARD), one `uri, ms` per line. Not a cache: `spot clean` keeps it.

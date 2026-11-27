@@ -155,8 +155,8 @@ impl App {
         self.repeat = last.repeat;
         let t = last.queue.tracks[last.queue.idx()].clone();
         // the list it carries on with is recently played too (new installs start with it)
-        if let Some(l) = self.recent_link(&last.queue).filter(|l| !self.recent.iter().any(|r| r.uri == l.uri)) {
-            self.remember(l);
+        if let Some((l, album)) = self.recent_link(&last.queue).filter(|(l, _)| !self.recent.iter().any(|r| r.uri == l.uri)) {
+            self.remember(l, album);
         }
         self.queue = Some(last.queue);
         self.set_cur(&t, last.pos_ms);
@@ -341,8 +341,8 @@ impl App {
 
     /// Make `q` the queue and play it from `start` (None: the top, or a random song if shuffling).
     pub fn play_queue(&mut self, mut q: Queue, start: Option<usize>) {
-        if let Some(l) = self.recent_link(&q) {
-            self.remember(l);
+        if let Some((l, album)) = self.recent_link(&q) {
+            self.remember(l, album);
         }
         q.reorder(self.shuffle, start);
         self.queue = Some(q);
@@ -350,11 +350,11 @@ impl App {
         self.play_fresh();
     }
 
-    /// What playing `q` adds to the recently played: the list it is, or the song when it's one
-    /// song. Searches, the queue and the podcast lists aren't kept.
-    fn recent_link(&self, q: &Queue) -> Option<Link> {
+    /// What playing `q` adds to the recently played: the list it is, or the song (and its album)
+    /// when it's one song. Searches, the queue and the podcast lists aren't kept.
+    fn recent_link(&self, q: &Queue) -> Option<(Link, Option<Link>)> {
         let first = q.tracks.first();
-        let link = |uri: String, name: String, sub: String, image: Option<String>| Some(Link { uri, name, sub, single: false, image });
+        let link = |uri: String, name: String, sub: String, image: Option<String>| Some((Link { uri, name, sub, single: false, image }, None));
         let key = q.key.as_str();
         if key == "liked" {
             return link("liked".into(), "Liked Songs".into(), "Playlist".into(), None);
@@ -366,7 +366,7 @@ impl App {
             return link(artist.into(), name, "Artist".into(), read_artist(artist).and_then(|a| a.portrait));
         }
         if key.starts_with("spotify:track:") || key.starts_with("spotify:episode:") {
-            return first.map(song_link);
+            return first.map(|t| (song_link(t), album_link(t)));
         }
         if key.starts_with("spotify:album:") {
             return link(key.into(), q.name.clone(), format!("Album · {}", first.map_or("", |t| t.artists.as_str())), first.and_then(|t| t.cover.clone()));
@@ -381,11 +381,16 @@ impl App {
         link(format!("spotify:playlist:{key}"), q.name.clone(), "Playlist".into(), image)
     }
 
-    /// Put `l` first among the recently played (once), and keep the list on disk.
+    /// Put `l` first among the recently played (once), and keep the list on disk. `album` is
+    /// the album a song is on, so the launcher can show a run of its songs as the album.
     /// Lists and songs are kept apart (up to RECENT_LISTS and RECENT_SONGS), so a run of songs
     /// doesn't push out the lists you started.
-    pub fn remember(&mut self, l: Link) {
+    pub fn remember(&mut self, l: Link, album: Option<Link>) {
         self.recent.retain(|r| r.uri != l.uri);
+        match album {
+            Some(a) => self.recent_albums.insert(l.uri.clone(), a),
+            None => self.recent_albums.remove(&l.uri),
+        };
         self.recent.insert(0, l);
         let mut lists = 0;
         let mut songs = 0;
@@ -394,7 +399,9 @@ impl App {
             *n += 1;
             *n <= if is_song(&r.uri) { RECENT_SONGS } else { RECENT_LISTS }
         });
-        save_links(&recent_path(), &self.recent);
+        let recent = &self.recent;
+        self.recent_albums.retain(|uri, _| recent.iter().any(|r| &r.uri == uri));
+        save_recent(&self.recent, &self.recent_albums);
     }
 
     /// A song heard for HEARD_MS goes into the recently played. Run from `tick`.
@@ -403,8 +410,8 @@ impl App {
             return false;
         }
         self.heard = true;
-        let Some(l) = self.now().map(song_link) else { return false };
-        self.remember(l);
+        let Some((l, album)) = self.now().map(|t| (song_link(t), album_link(t))) else { return false };
+        self.remember(l, album);
         true
     }
 

@@ -159,6 +159,7 @@ pub struct App {
     pub pinned: Vec<String>, // playlist ids kept at the top of the sidebar
     pub shows: Vec<Link>,    // the podcast sidebar: podcast_home(), then the followed shows
     pub recent: Vec<Link>,   // what was played lately, newest first: the ⌥Space launcher's empty bar
+    pub recent_albums: HashMap<String, Link>, // the album each of those songs is on, by its uri
     pub sh_state: Sel,
     pub podcasts: bool,      // the sidebar lists podcasts (else playlists)
     pub view: View,

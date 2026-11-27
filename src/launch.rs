@@ -11,6 +11,9 @@ use crate::{ctl::{Reply, Then}, *};
 
 type Fail = (i32, String);
 
+/// Songs heard from one album that show as the album among the recently played.
+const ALBUM_AFTER: usize = 3;
+
 /// Popular songs atop an artist's page in the launcher, before their discography.
 const ARTIST_TOP: usize = 3;
 
@@ -54,6 +57,30 @@ fn release_row(l: &Link, section: &str) -> String {
     tsv_row(&[&l.uri, &l.name, &sub, l.image.as_deref().unwrap_or(""), "0", "", section, "", year])
 }
 
+/// The recently played, newest first, as one section: an album with ALBUM_AFTER or more of its
+/// songs heard lately is the album instead, where the newest of them is (and once, even if it
+/// was played as an album too). `albums`: the album each song is on, by the song's uri.
+fn recent_rows(recent: &[Link], albums: &HashMap<String, Link>) -> Vec<String> {
+    let mut heard: HashMap<&str, usize> = HashMap::new();
+    for a in recent.iter().filter_map(|l| albums.get(&l.uri)) {
+        *heard.entry(a.uri.as_str()).or_default() += 1;
+    }
+    let mut shown = HashSet::new();
+    let mut rows = vec![];
+    for l in recent {
+        let row = match albums.get(&l.uri).filter(|a| heard[a.uri.as_str()] >= ALBUM_AFTER) {
+            Some(a) => a.clone(),
+            // the subtitle says it's a song: just whose
+            None if is_song(&l.uri) => Link { sub: l.sub.split_once(" · ").map_or(l.sub.as_str(), |(_, by)| by).into(), ..l.clone() },
+            None => l.clone(),
+        };
+        if shown.insert(row.uri.clone()) {
+            rows.push(link_row(&row, "Recent"));
+        }
+    }
+    rows
+}
+
 impl App {
     pub fn launcher_cmd(&mut self, args: Vec<String>, reply: &Reply) -> Result<Option<String>, Fail> {
         let usage = || (2, "launcher: status, lists, search <words>, songs <uri>, song <uri>, play <uri>, queue <uri> or has <uri>".to_string());
@@ -74,16 +101,10 @@ impl App {
                 };
                 Ok(Some(self.now().map(row).unwrap_or_default()))
             }
-            // the lists you started lately, the songs you heard lately (HEARD_MS or more), then all
-            // of your playlists (the launcher matches them as you type)
+            // what was played lately (lists started, songs heard for HEARD_MS or more), newest
+            // first, then all of your playlists (the launcher matches them as you type)
             "lists" => {
-                let lists = self.recent.iter().filter(|l| !is_song(&l.uri)).map(|l| link_row(l, "Recently played"));
-                // the section says they're songs: just whose
-                let songs = self.recent.iter().filter(|l| is_song(&l.uri)).map(|l| {
-                    let sub = l.sub.split_once(" · ").map_or(l.sub.as_str(), |(_, by)| by);
-                    link_row(&Link { sub: sub.into(), ..l.clone() }, "Recent songs")
-                });
-                let recent = mark_liked(lists.chain(songs).collect(), &self.liked);
+                let recent = mark_liked(recent_rows(&self.recent, &self.recent_albums), &self.liked);
                 let mine = self.playlists.iter().map(|p| {
                     let l = Link { uri: p.uri(), name: p.name.clone(), sub: "Playlist".into(), single: false, image: p.image.clone() };
                     // ⌘P lists those songs can be added to
@@ -334,5 +355,27 @@ mod liked_tests {
         assert_eq!(rows[0].split('\t').nth(9), Some("1"));
         assert_eq!(rows[1].split('\t').nth(8), Some("2004"));
         assert_eq!(rows[1].split('\t').nth(9), Some(""));
+    }
+
+    #[test]
+    fn songs_from_one_album_show_as_the_album() {
+        let link = |uri: &str, sub: &str| Link { uri: uri.into(), name: uri.into(), sub: sub.into(), single: false, image: None };
+        let song = |n: &str| link(&format!("spotify:track:{n}"), "Song · OneRepublic");
+        let native = link("spotify:album:native", "Album · OneRepublic");
+        let recent = [song("solo"), link("spotify:playlist:p", "Playlist"), song("a"), song("b"), native.clone(), song("c"), song("x"), song("y")];
+        let mut albums: HashMap<String, Link> = ["a", "b", "c"].iter().map(|n| (format!("spotify:track:{n}"), native.clone())).collect();
+        let other = link("spotify:album:other", "Album · Someone");
+        albums.insert("spotify:track:x".into(), other.clone());
+        albums.insert("spotify:track:y".into(), other);
+        let rows = recent_rows(&recent, &albums);
+        let firsts: Vec<_> = rows.iter().map(|r| r.split('\t').take(3).collect::<Vec<_>>()).collect();
+        assert_eq!(firsts, [
+            ["spotify:track:solo", "spotify:track:solo", "OneRepublic"],
+            ["spotify:playlist:p", "spotify:playlist:p", "Playlist"],
+            ["spotify:album:native", "spotify:album:native", "Album · OneRepublic"],
+            ["spotify:track:x", "spotify:track:x", "OneRepublic"],
+            ["spotify:track:y", "spotify:track:y", "OneRepublic"],
+        ]);
+        assert!(rows.iter().all(|r| r.split('\t').nth(6) == Some("Recent")));
     }
 }
