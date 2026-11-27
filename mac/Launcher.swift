@@ -3,10 +3,10 @@
 // lately; typed in, the best match among your playlists comes first, then Spotify's top result,
 // songs, an album and an artist. ↑↓ move, tab jumps to the next section, → opens an album or
 // playlist's songs, an artist's popular songs and discography, or a song's album and artists
-// (→ again goes on to one of those; ← or esc goes back), ⏎ plays, ⌘⏎ queues, ⌘C copies a link (with
-// no results, to what's playing), ⌘F inside a list finds among its songs (esc back to all of them),
-// ⌃S shuffle, ⌃R repeat, esc closes. For a keyboard without
-// media keys: space on an empty bar plays or pauses, ⌘← ⌘→ go to the previous or next song,
+// (→ again goes on to one of those), and typing inside one finds among its rows; ← or ⌫ on an empty
+// bar, or esc, goes back to what it was opened from, words and all (⌘⌫ all the way home). ⏎ plays,
+// ⌘⏎ queues, ⌘C copies a link (with no results, to what's playing), ⌃S shuffle, ⌃R repeat, esc
+// closes. For a keyboard without media keys: space on an empty bar plays or pauses, ⌘← ⌘→ go to the previous or next song,
 // ⌥⌘← ⌥⌘→ seek back or ahead 10 seconds (the foot has buttons for the first two too).
 //
 // Plain AppKit, no SwiftUI: one text field and one view that draws the rest, in the system's
@@ -199,10 +199,16 @@ struct Adding {
     let song: Hit
     var has: Set<String>?
     var back: [Hit]
-    let pages: [(parent: Hit, back: [Hit], picked: Int, scroll: Int)]
+    let pages: [Page]
     let picked, scroll: Int
     let query: String
+    let listed: [Hit]
 }
+
+/// What → opened (an album, playlist or artist), and what it was opened from: the rows, the one
+/// picked, where it was scrolled, the words in the bar, and (from inside another list) that
+/// list's rows before the words found among them.
+typealias Page = (parent: Hit, back: [Hit], picked: Int, scroll: Int, query: String, listed: [Hit])
 
 /// An action's outcome, said briefly: its words, an SF Symbol, and whether it went wrong.
 struct Toast {
@@ -261,13 +267,13 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     var playlists: [Hit] = []
     /// What → opened, innermost last (an artist, then one of their albums), each with what it
     /// was opened from.
-    var pages: [(parent: Hit, back: [Hit], picked: Int, scroll: Int)] = []
-    var inside: (parent: Hit, back: [Hit], picked: Int, scroll: Int)? { pages.last }
+    var pages: [Page] = []
+    var inside: Page? { pages.last }
     var topH: CGFloat { header != nil ? pageH : 0 }
     /// ⌘P: the song being added to playlists, while the bar searches your playlists instead.
     var adding: Adding?
-    /// ⌘F inside a list: all of its rows, while the bar finds among them instead of searching.
-    var finding: [Hit]?
+    /// Inside a list: all of its rows, while the bar finds among them instead of searching.
+    var listed: [Hit] = []
     /// Atop the list: the song being added, or the album, playlist or artist that's open.
     var header: Hit? { adding?.song ?? inside?.parent }
     /// Why the list is empty ("no results", an error), said in its place.
@@ -389,7 +395,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
 
     /// The bar's hint: what it searches.
     func setPlaceholder() {
-        let hint = adding != nil ? "Add to a playlist…" : finding != nil ? "Find in \(inside?.parent.name ?? "this list")" : "Songs, albums, artists, your playlists"
+        let hint = adding != nil ? "Add to a playlist…" : inside != nil ? "Find in \(inside?.parent.name ?? "this list")" : "Songs, albums, artists, your playlists"
         field.placeholderAttributedString = NSAttributedString(string: hint,
             attributes: [.foregroundColor: NSColor.placeholderTextColor, .font: NSFont.systemFont(ofSize: 20)])
     }
@@ -463,16 +469,15 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         field.stringValue = ""
         results = recent
         pages = []
+        listed = []
         note = nil
         busy = false
         picked = 0
         scroll = 0
         toast = nil
         hover = nil
-        if adding != nil || finding != nil {
-            (adding, finding) = (nil, nil)
-            setPlaceholder()
-        }
+        adding = nil
+        setPlaceholder()
         card.spot = .none
         card.needsDisplay = true
     }
@@ -530,7 +535,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     // MARK: searching
 
     func controlTextDidChange(_ n: Notification) {
-        if adding != nil { filterAdding() } else if finding != nil { filterFind() } else { search() }
+        if adding != nil { filterAdding() } else if inside != nil { filterList() } else { search() }
     }
 
     /// Search as you type: waits a moment for typing to stop and drops answers to older words.
@@ -619,24 +624,26 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         pick(back ? starts.last { $0 < picked } ?? starts.last! : starts.first { $0 > picked } ?? 0)
     }
 
-    /// →: the picked album, playlist or artist's page, in place.
+    /// →: the picked album, playlist or artist's page, in place, the bar emptied to find in it.
     func openPicked() -> Bool {
-        guard adding == nil, finding == nil, results.indices.contains(picked), results[picked].opens else { return false }
+        guard adding == nil, results.indices.contains(picked), results[picked].opens else { return false }
         let h = results[picked]
         generation += 1
         let g = generation
         // from a song's page to its album: that song picked there
         let song = inside.map(\.parent.uri).flatMap { $0.hasPrefix("spotify:track:") ? $0 : nil }
-        pages.append((h, results, picked, scroll))
-        results = []
+        pages.append((h, results, picked, scroll, field.stringValue, listed))
+        (results, listed) = ([], [])
+        field.stringValue = ""
+        setPlaceholder()
         (picked, scroll, note, busy) = (0, 0, nil, true)
         card.needsDisplay = true
         ask(["launcher", h.uri.hasPrefix("spotify:track:") ? "song" : "songs", h.uri]) { code, text in
             guard self.generation == g, self.inside != nil else { return }
             self.busy = false
             if code == 0 {
-                self.results = rows(text)
-                self.note = self.results.isEmpty ? "no songs" : nil
+                self.listed = rows(text)
+                self.filterList()  // what was typed while it came
                 if let song, let i = self.results.firstIndex(where: { $0.uri == song }) { self.pick(i) }
             } else {
                 self.note = text
@@ -646,51 +653,39 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         return true
     }
 
-    /// ← or esc inside: back to what it was opened from.
+    /// ←, ⌫ or esc inside: back to what it was opened from, with the words that were in the bar.
     func goBack() -> Bool {
-        if stopAdding() || stopFinding() { return true }
+        if stopAdding() { return true }
         guard let i = pages.popLast() else { return false }
         generation += 1
-        (results, picked, scroll, note, busy) = (i.back, i.picked, i.scroll, nil, false)
+        (results, listed, picked, scroll, note, busy) = (i.back, i.listed, i.picked, i.scroll, nil, false)
+        field.stringValue = i.query
+        setPlaceholder()
         card.needsDisplay = true
         return true
     }
 
-    // MARK: finding inside a list
-
-    /// ⌘F: find among the open list's songs as you type; ⌘F again stops.
-    func toggleFind() {
-        if stopFinding() { return }
-        guard adding == nil, inside != nil, !busy, !results.isEmpty else { return }
-        finding = results
-        field.stringValue = ""
-        setPlaceholder()
-        filterFind()
+    /// ⌘⌫: out of every page (and adding), to the empty bar.
+    func goHome() -> Bool {
+        guard adding != nil || !pages.isEmpty else { return false }
+        reset()
+        return true
     }
 
-    /// The list's rows that have every typed word in their name or subtitle (artists).
-    func filterFind() {
-        guard let all = finding else { return }
+    /// Inside a list: its rows that have every typed word in their name or subtitle (artists).
+    /// Emptied, the song that was picked stays picked.
+    func filterList() {
+        guard !busy, !listed.isEmpty else { return }
         let words = query.lowercased().split(separator: " ")
-        results = words.isEmpty ? all : all.filter { h in
+        let keep = results.indices.contains(picked) ? results[picked].uri : nil
+        results = words.isEmpty ? listed : listed.filter { h in
             let hay = "\(h.name) \(h.sub)".lowercased()
             return words.allSatisfy { hay.contains($0) }
         }
-        (picked, scroll) = (0, 0)
         note = results.isEmpty ? "no songs match" : nil
+        scroll = 0
+        pick(words.isEmpty ? keep.flatMap { u in results.firstIndex { $0.uri == u } } ?? 0 : 0)
         card.needsDisplay = true
-    }
-
-    /// Back from finding to the whole list, the picked song still picked; false if it wasn't finding.
-    func stopFinding() -> Bool {
-        guard let all = finding else { return false }
-        let keep = results.indices.contains(picked) ? results[picked].uri : nil
-        finding = nil
-        field.stringValue = ""
-        setPlaceholder()
-        (results, note, scroll) = (all, nil, 0)
-        pick(keep.flatMap { u in all.firstIndex { $0.uri == u } } ?? 0)
-        return true
     }
 
     // MARK: doing
@@ -767,7 +762,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
     func markLiked(_ uri: String, _ on: Bool) {
         for i in results.indices where results[i].uri == uri { results[i].liked = on }
         for i in adding?.back.indices ?? 0..<0 where adding!.back[i].uri == uri { adding!.back[i].liked = on }
-        for i in finding?.indices ?? 0..<0 where finding![i].uri == uri { finding![i].liked = on }
+        for i in listed.indices where listed[i].uri == uri { listed[i].liked = on }
         if now?.uri == uri { now?.liked = on }
         card.needsDisplay = true
         card.syncButtons()
@@ -821,8 +816,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         guard var song = Hit(Substring(line)) else { return }
         song.liked = t.liked
         generation += 1  // searches and pages on their way are moot
-        adding = Adding(song: song, has: nil, back: results, pages: pages, picked: picked, scroll: scroll, query: field.stringValue)
-        (pages, busy, note) = ([], false, nil)
+        adding = Adding(song: song, has: nil, back: results, pages: pages, picked: picked, scroll: scroll, query: field.stringValue, listed: listed)
+        (pages, listed, busy, note) = ([], [], false, nil)
         field.stringValue = ""
         setPlaceholder()
         filterAdding()
@@ -841,6 +836,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         field.stringValue = a.query
         setPlaceholder()
         (results, pages, picked, scroll, note, busy) = (a.back, a.pages, a.picked, a.scroll, nil, false)
+        listed = a.listed
         card.needsDisplay = true
         return true
     }
@@ -942,7 +938,11 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         let caretAtEnd = editor.map { $0.selectedRange.length == 0 && $0.selectedRange.location == ($0.string as NSString).length } ?? true
         let n = results.count
         switch Int(e.keyCode) {
+        // inside a list, esc first empties what finds in it
+        case kVK_Escape where inside != nil && adding == nil && !field.stringValue.isEmpty: field.stringValue = ""; filterList()
         case kVK_Escape: if !goBack() { hide() }
+        case kVK_Delete where cmd: return goHome()
+        case kVK_Delete where field.stringValue.isEmpty && inside != nil && adding == nil: return goBack()
         case kVK_DownArrow where n > 0: pick((picked + 1) % n)
         case kVK_UpArrow where n > 0: pick((picked + n - 1) % n)
         case kVK_ANSI_N where ctrl && n > 0: pick((picked + 1) % n)
@@ -955,10 +955,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextF
         case kVK_LeftArrow where cmd && !m.contains(.shift): skip(-1)
         case kVK_RightArrow where cmd && !m.contains(.shift): skip(1)
         case kVK_RightArrow where caretAtEnd && !m.contains(.shift): return openPicked()
-        case kVK_LeftArrow where inside != nil && finding == nil: return goBack()
+        case kVK_LeftArrow where inside != nil && adding == nil && field.stringValue.isEmpty: return goBack()
         case kVK_ANSI_L where cmd: toggleLike()
         case kVK_ANSI_P where cmd: startAdding()
-        case kVK_ANSI_F where cmd: toggleFind()
         case kVK_ANSI_S where ctrl: toggleShuffle()
         case kVK_ANSI_R where ctrl: cycleRepeat()
         case kVK_ANSI_C where cmd && (editor?.selectedRange.length ?? 0) == 0: copyLink()

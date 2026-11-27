@@ -20,7 +20,8 @@ minutes. To update, `git pull` and run `install.sh` again: it restarts a running
 new build, still playing.
 
 The launcher is a Spotlight-style bar on Liquid Glass: ⌥Space from any app, type, ⏎ plays (⌘⏎
-queues, → opens an album, playlist or artist, and inside one ⌘F finds among its songs, ⌘L likes the highlighted song (or the playing one)
+queues, → opens an album, playlist or artist, and typing inside one finds among its songs (← or esc
+goes back to the search you came from), ⌘L likes the highlighted song (or the playing one)
 or unlikes it, ⌘P turns the bar to your playlists to add it to (✓ where it already is; ⏎ adds,
 or takes it out of a ✓ one, and esc goes back), ⌘C copies a link, esc closes). Liked songs
 carry a small heart, and the bar at the bottom has one for the playing song. With the mouse, a
